@@ -3,6 +3,14 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.1.1 — 2026-10
+
+### diff-tour
+- The file list no longer sticks to the top of the page. It sat inside the sticky toolbar, so on a
+  change of a hundred files it covered half the screen while reading code. Now it scrolls away
+  with the page; only the one-line view toggle and legend stay pinned. A file chip still jumps to
+  its file, with the file header just below the pinned bar.
+
 ## kensei-toolkit 2.0.1 — 2026-10
 
 Closes the guard gaps and the open items listed under "Not done" in 2.0.0. No breaking change:

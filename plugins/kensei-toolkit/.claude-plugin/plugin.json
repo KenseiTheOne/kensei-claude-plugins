@@ -1,7 +1,7 @@
 {
   "name": "kensei-toolkit",
   "displayName": "Kensei Toolkit",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Skill collection — tracker task runner with a publish guard, annotated diff tour, design brainstorm, image generation through Codex, SVG diagrams for READMEs, Unity code review, session learnings to CLAUDE.md and memory, loose ends to Todoist or ClickUp",
   "author": {
     "name": "Kensei"

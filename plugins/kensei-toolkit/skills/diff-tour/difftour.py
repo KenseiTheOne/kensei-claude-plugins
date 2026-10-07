@@ -1223,8 +1223,10 @@ def render(meta, files, units, notes, drift, run_dir):
               f'<span><i class="sw mov"></i>{esc(lg["moved"])}</span>'
               f'<span><i class="sw s-note"></i>{esc(lg["note"])}</span>'
               f'<span><i class="sw s-loose"></i>{esc(lg["loose"])}</span></div>')
-    out.append(f'<div class="toolbar"><nav class="files-nav" aria-label="{esc(L["files_nav"])}">'
-               f'{page.nav()}</nav><div class="controls">{seg}{legend}</div></div>')
+    # The file list scrolls away with the page: on a big change it is dozens of rows. Only the
+    # one-line view toggle and legend stay pinned.
+    out.append(f'<nav class="files-nav" aria-label="{esc(L["files_nav"])}">{page.nav()}</nav>')
+    out.append(f'<div class="toolbar"><div class="controls">{seg}{legend}</div></div>')
     out.append("<main>" + "".join(page.card(fi) for fi in page.order) + "</main>")
 
     foot = [f'<span>{esc(L["snapshot"].format(dir=run_dir))}</span>']
