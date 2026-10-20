@@ -69,10 +69,11 @@ padding:5px 12px;cursor:pointer}
 .sw.s-note{background:var(--note-bg);border:1px solid var(--note-rule)}
 .sw.s-loose{background:var(--loose-bg);border:1px solid var(--loose-rule)}
 .file{margin-top:18px;background:var(--surface);border:1px solid var(--rule);border-radius:8px;
-overflow:hidden;scroll-margin-top:calc(var(--tb,70px) + 8px)}
+overflow:hidden;overflow:clip;scroll-margin-top:calc(var(--tb,70px) + 8px)}
 .file.loose{border-color:var(--loose-rule)}
 .file>summary{list-style:none;cursor:pointer;padding:10px 14px;display:flex;flex-wrap:wrap;
-gap:6px 12px;align-items:baseline;border-bottom:1px solid var(--rule);background:var(--surface-2)}
+gap:6px 12px;align-items:baseline;border-bottom:1px solid var(--rule);background:var(--surface-2);
+position:sticky;top:var(--tb,0px);z-index:4}
 .file>summary::-webkit-details-marker{display:none}
 .file:not([open])>summary{border-bottom:0}
 .chev{font-family:var(--mono);color:var(--muted);width:1ch}

@@ -3,6 +3,15 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.1.2 — 2026-10
+
+### diff-tour
+- The header of the file being read stays pinned under the toolbar while you scroll through its
+  code, so the file name is always on screen; the next file's header takes over at the boundary.
+  It did not stick before because the file card had `overflow:hidden`, which made the card its
+  own scroll container; it now clips with `overflow:clip`. Collapsing a file from its pinned
+  header scrolls back to that file instead of leaving you deep in the next one.
+
 ## kensei-toolkit 2.1.1 — 2026-10
 
 ### diff-tour

@@ -14,6 +14,9 @@ function(){show(b.getAttribute("data-view"),true);});});
 var bar=document.querySelector(".toolbar");
 function fit(){if(bar)root.style.setProperty("--tb",bar.offsetHeight+"px");}
 fit();window.addEventListener("resize",fit);
+document.addEventListener("toggle",function(e){var d=e.target;
+if(d.open||!d.classList||!d.classList.contains("file"))return;
+if(d.getBoundingClientRect().top<(bar?bar.offsetHeight:0))d.scrollIntoView({block:"start"});},true);
 document.addEventListener("click",function(e){var a=e.target.closest("a[data-unit]");if(!a)return;
 var sel='[data-unit="'+a.getAttribute("data-unit")+'"]';
 var t=document.querySelector("table."+root.getAttribute("data-view")+" "+sel)||
