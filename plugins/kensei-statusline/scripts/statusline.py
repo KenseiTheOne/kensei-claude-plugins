@@ -9,7 +9,8 @@ import re
 import subprocess
 import time
 import glob as glob_mod
-from datetime import datetime
+import hashlib
+from datetime import datetime, timezone
 
 # The wrapper runs this file with runpy, which leaves its directory off sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -256,10 +257,76 @@ def _extract_text(content) -> str:
     return ""
 
 
-def parse_main_transcript(filepath: str) -> tuple[dict[str, dict], list[str], int]:
-    """Parse main transcript in a single pass for tokens and active agents.
+# /effort reports a toggle as 'Ultracode on (this session only): …', 'Ultracode off. …', or a
+# ' · Ultracode on/off' tail after an effort change. Its refusals ('Ultracode needs dynamic
+# workflows enabled', 'Invalid argument: Ultracode off..') do not match.
+EFFORT_ULTRACODE = re.compile(r"^<local-command-stdout>Ultracode (on|off)\b| · Ultracode (on|off)\b")
 
-    Returns (models_dict, active_agent_types, last_input_total).
+
+def before(entry: dict, since: str | None) -> bool:
+    """Whether a transcript entry was written before `since`. Both are UTC timestamps in Claude
+    Code's one format ('2026-10-26T13:00:15.235Z'), so they compare as strings."""
+    ts = entry.get("timestamp")
+    return since is not None and isinstance(ts, str) and ts < since
+
+
+MANAGED_SETTINGS = {"darwin": "/Library/Application Support/ClaudeCode/managed-settings.json",
+                    "win32": r"C:\Program Files\ClaudeCode\managed-settings.json",
+                    }.get(sys.platform, "/etc/claude-code/managed-settings.json")
+
+
+def settings_ultracode(project_dir: str) -> bool:
+    """The `ultracode` settings key a new Claude Code process starts with: user, project, local
+    and managed settings, the later ones winning. A guess until the first reply (see
+    parse_main_transcript): --settings, --effort ultracode, managed-settings.d, MDM policy and a
+    settings.local.json at a git root above project_dir are not read here."""
+    files = [os.path.join(CONFIG_DIR, "settings.json")]
+    if project_dir:
+        files += [os.path.join(project_dir, ".claude", "settings.json"),
+                  os.path.join(project_dir, ".claude", "settings.local.json")]
+    files.append(MANAGED_SETTINGS)
+    value = False
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as f:
+                settings = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(settings, dict) and "ultracode" in settings:
+            if isinstance(settings["ultracode"], bool):  # Claude Code drops other values
+                value = settings["ultracode"]
+    return value
+
+
+def process_start(session_id: str) -> str | None:
+    """When the Claude Code process running this session started, as a transcript timestamp:
+    Claude Code keeps <config dir>/sessions/<pid>.json with the sessionId and startedAt (epoch
+    ms). None when there is no such file."""
+    started = None
+    for path in glob_mod.glob(os.path.join(glob_mod.escape(CONFIG_DIR), "sessions", "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(info, dict) and session_id and info.get("sessionId") == session_id:
+            ms = info.get("startedAt")
+            if isinstance(ms, (int, float)) and (started is None or ms > started):
+                started = ms
+    if started is None:
+        return None
+    try:
+        when = datetime.fromtimestamp(started / 1000, tz=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return when.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(started) % 1000:03d}Z"
+
+
+def parse_main_transcript(filepath: str, since: str | None = None,
+                          ultracode: bool = False) -> tuple[dict[str, dict], list[str], int, bool]:
+    """Parse main transcript in a single pass for tokens, active agents and ultracode.
+
+    Returns (models_dict, active_agent_types, last_input_total, ultracode).
     last_input_total = most recent API call's total prompt tokens (current context size).
 
     Active agent detection:
@@ -267,11 +334,27 @@ def parse_main_transcript(filepath: str) -> tuple[dict[str, dict], list[str], in
     - Background agents: tool_result arrives immediately with "Async agent launched",
       so they stay active until a queue-operation references their tool-use-id
       (completed, error, or any terminal status).
+
+    Ultracode is not in the statusline input; it is worked out the way Claude Code keeps it.
+    - `ultracode` is the state the process started with at `since` (a transcript timestamp, see
+      process_start): the settings key, read again only by a new process. Entries written before
+      `since` belong to an earlier run and change nothing.
+    - At every prompt Claude Code compares the live state with the last ultra_effort_enter /
+      ultra_effort_exit in the conversation and writes the other one when they differ. So once
+      a reply has followed, the state is that last reminder — which also settles what the
+      settings guess got wrong (a model or setup where ultracode cannot run, settings edited
+      since start, an in-session /resume). A compaction does not reset it: the live session
+      keeps the earlier reminder; a resume starts its conversation at the last compaction.
+    - A toggle through /effort is written at once as the command's output, so it shows before
+      the next prompt — except one typed while Claude is working: that is written after the
+      turn, or in fullscreen not at all, and the next prompt corrects it.
     """
     models: dict[str, dict] = {}
     agent_calls: dict[str, str] = {}  # tool_use_id -> subagent_type
     completed: set[str] = set()
     last_input_total = 0
+    last_command = ""
+    reminder = None  # the last ultra_effort_* in the conversation Claude Code holds
 
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -283,6 +366,8 @@ def parse_main_transcript(filepath: str) -> tuple[dict[str, dict], list[str], in
                 entry_type = entry.get("type")
 
                 if entry_type == "assistant":
+                    if not before(entry, since):  # a reply: its prompt settled the reminders
+                        ultracode = reminder == "ultra_effort_enter"
                     msg = entry.get("message") or {}
                     usage = add_usage(models, msg)
                     if usage:
@@ -301,7 +386,18 @@ def parse_main_transcript(filepath: str) -> tuple[dict[str, dict], list[str], in
                     msg = entry.get("message")
                     if not isinstance(msg, dict):
                         continue
-                    for block in msg.get("content", []):
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        # a slash command is one entry with its name, then one with its output
+                        if content.startswith("<command-name>"):
+                            last_command = content[len("<command-name>"):].split("<", 1)[0]
+                        elif content.startswith("<local-command-stdout>"):
+                            m = EFFORT_ULTRACODE.search(content)
+                            if m and last_command == "/effort" and not before(entry, since):
+                                ultracode = (m.group(1) or m.group(2)) == "on"
+                            last_command = ""
+                        continue
+                    for block in content or []:
                         if not isinstance(block, dict) or block.get("type") != "tool_result":
                             continue
                         tid = block.get("tool_use_id", "")
@@ -317,11 +413,23 @@ def parse_main_transcript(filepath: str) -> tuple[dict[str, dict], list[str], in
                         m = re.search(r"<tool-use-id>(.*?)</tool-use-id>", content)
                         if m and m.group(1) in agent_calls:
                             completed.add(m.group(1))
+
+                elif entry_type == "attachment":
+                    attachment = entry.get("attachment")
+                    kind = attachment.get("type") if isinstance(attachment, dict) else None
+                    if kind in ("ultra_effort_enter", "ultra_effort_exit"):
+                        reminder = kind
+                        if not before(entry, since):
+                            ultracode = kind == "ultra_effort_enter"
+
+                elif entry_type == "system" and entry.get("subtype") == "compact_boundary":
+                    if before(entry, since):  # a resumed conversation starts here
+                        reminder = None
     except OSError:
         pass
 
     active = [agent_calls[tid] for tid in agent_calls if tid not in completed]
-    return models, active, last_input_total
+    return models, active, last_input_total, ultracode
 
 
 def subagent_transcripts(transcript_path: str) -> list[str]:
@@ -336,12 +444,86 @@ def subagent_transcripts(transcript_path: str) -> list[str]:
                   if "acompact" not in os.path.basename(p))
 
 
-def get_subagent_tokens(transcript_path: str) -> dict[str, dict]:
+def get_subagent_tokens(transcript_path: str, paths: list[str] | None = None) -> dict[str, dict]:
     """Sum token usage from all subagent transcripts. Returns { model_id: {TOKEN_KEYS...} }."""
     all_models: dict[str, dict] = {}
-    for jsonl_path in subagent_transcripts(transcript_path):
+    for jsonl_path in subagent_transcripts(transcript_path) if paths is None else paths:
         all_models = merge_models(all_models, parse_transcript(jsonl_path))
     return all_models
+
+
+SESSION_CACHE = os.path.join(CONFIG_DIR, "cache", "kensei-statusline", "sessions.json")
+SESSION_CACHE_KEEP = 32     # sessions remembered; the least recently changed go first
+
+
+def transcripts_stamp(transcript_path: str, sub_paths: list[str], *extra) -> str:
+    """Size and mtime of the session's transcripts, plus the other inputs of a parse: equal
+    stamps mean nothing was written and nothing else changed."""
+    parts = [repr(extra)]
+    for p in [transcript_path, *sub_paths]:
+        try:
+            st = os.stat(p)
+            parts.append(f"{p}\0{st.st_size}\0{st.st_mtime_ns}")
+        except OSError:
+            parts.append(f"{p}\0-")
+    return hashlib.sha1("\n".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def read_session(transcript_path: str, since: str | None = None, ultracode_at_start: bool = False
+                 ) -> tuple[dict[str, dict], list[str], int, bool, dict[str, dict]]:
+    """parse_main_transcript plus the subagent tokens, cached by transcripts_stamp. Claude Code
+    re-runs the statusline every refreshInterval seconds even while the session is idle; with
+    the cache, such a run reads no transcript, and a long session's are hundreds of megabytes."""
+    sub_paths = subagent_transcripts(transcript_path)
+    stamp = transcripts_stamp(transcript_path, sub_paths, since, ultracode_at_start)
+    try:
+        with open(SESSION_CACHE, encoding="utf-8") as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    hit = cache.get(transcript_path)
+    if isinstance(hit, dict) and hit.get("stamp") == stamp:
+        try:
+            return (hit["main"], list(hit["agents"]), int(hit["input"]), bool(hit["ultracode"]),
+                    hit["sub"])
+        except (KeyError, TypeError, ValueError):
+            pass  # an odd entry: parse again and overwrite it
+
+    main_models, active, current_input, ultracode = parse_main_transcript(
+        transcript_path, since, ultracode_at_start)
+    sub_models = get_subagent_tokens(transcript_path, sub_paths)
+    cache.pop(transcript_path, None)
+    cache[transcript_path] = {"stamp": stamp, "main": main_models, "agents": active,
+                              "input": current_input, "ultracode": ultracode, "sub": sub_models}
+    for old in list(cache)[:-SESSION_CACHE_KEEP]:
+        del cache[old]
+    save_session_cache(cache)
+    return main_models, active, current_input, ultracode, sub_models
+
+
+def save_session_cache(cache: dict) -> None:
+    """Replace the cache file atomically. Claude Code kills a statusline run that a newer one
+    overtakes, which can leave a temp file behind: those older than a minute are removed."""
+    tmp = f"{SESSION_CACHE}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(SESSION_CACHE), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp, SESSION_CACHE)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return  # no cache this time; the result itself is still right
+    for stale in glob_mod.glob(f"{glob_mod.escape(SESSION_CACHE)}.*.tmp"):
+        try:
+            if time.time() - os.stat(stale).st_mtime > 60:
+                os.unlink(stale)
+        except OSError:
+            pass
 
 
 def calc_cost_from_models(models: dict[str, dict]) -> tuple[float, bool]:
@@ -388,6 +570,23 @@ def fmt_lines_changed(data: dict) -> str | None:
     if not added and not removed:
         return None
     return f"\033[32m+{added}\033[0m \033[31m-{removed}\033[0m"
+
+
+EFFORT_COLOR = {"low": "\033[2m", "medium": "\033[2m", "high": "\033[36m",
+                "xhigh": "\033[33m", "max": "\033[31m"}
+
+
+def fmt_effort(data: dict, ultracode: bool) -> str:
+    """' high ⚡ultracode' after the model name. Claude Code sends effort only for a model that
+    supports it; a level this table does not know is shown uncoloured."""
+    effort = data.get("effort") if isinstance(data.get("effort"), dict) else {}
+    level = effort.get("level")
+    out = ""
+    if isinstance(level, str) and level:
+        out += f" {EFFORT_COLOR.get(level, '')}{level}\033[0m"
+    if ultracode:
+        out += " \033[1m\033[95m⚡ultracode\033[0m"
+    return out
 
 
 PROJECT_STATS_CACHE = os.path.join(CONFIG_DIR, "cache", "kensei-statusline", "project-stats.json")
@@ -534,12 +733,17 @@ def main():
     ctx = data.get("context_window") or {}
     pct = int(ctx.get("used_percentage") or 0)
 
-    # Parse main transcript in single pass: tokens + active agents
+    # Main transcript in a single pass (tokens, active agents, ultracode) + subagent tokens
     transcript_path = data.get("transcript_path") or ""
-    main_models, active_types, current_input = (
-        parse_main_transcript(transcript_path) if transcript_path else ({}, [], 0)
+    workspace = data.get("workspace") if isinstance(data.get("workspace"), dict) else {}
+    main_models, active_types, current_input, ultracode, sub_models = (
+        read_session(transcript_path, process_start(str(data.get("session_id") or "")),
+                     settings_ultracode(str(workspace.get("project_dir") or "")))
+        if transcript_path else ({}, [], 0, False, {})
     )
-    sub_models = get_subagent_tokens(transcript_path) if transcript_path else {}
+    # Ultracode works only on a model with effort; after /model to one without, the reminders
+    # in the transcript still say on until the next prompt
+    ultracode = ultracode and isinstance(data.get("effort"), dict)
 
     # Merge all models for total tokens and cost
     all_models = merge_models(main_models, sub_models)
@@ -565,9 +769,9 @@ def main():
         if type_parts:
             agents_part += f" \033[2m({', '.join(type_parts)}){rst}"
 
-    # Line 1: model, context, tokens, cost, agents
+    # Line 1: model + effort + ultracode, context, tokens, cost, agents
     print(
-        f"{model} {dim}\u2502{rst} {bar} {pct}% "
+        f"{model}{fmt_effort(data, ultracode)} {dim}\u2502{rst} {bar} {pct}% "
         f"{dim}\u2502{rst} \033[36m\u2191{rst}{fmt_tokens(current_input)} \033[35m\u2193{rst}{fmt_tokens(total_out)} "
         f"{dim}\u2502{rst} {cost_str}"
         f"{agents_part}"

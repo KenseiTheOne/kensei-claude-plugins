@@ -3,6 +3,41 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-statusline 1.6.0 — 2026-10
+
+- Line 1 shows the session's effort level after the model name (`Opus 5.5 high`), taken from the
+  `effort.level` field Claude Code sends: `low` and `medium` dim, `high` cyan, `xhigh` yellow,
+  `max` red. Models without effort show none. Claude Code re-runs the statusline itself when
+  effort changes, so a new level shows at once.
+- `⚡ultracode` follows it while ultracode is on. The statusline input does not carry ultracode, so
+  it is worked out the way Claude Code keeps it:
+  - until the first reply of a Claude Code process, from the `ultracode` settings key (user,
+    project, local and managed settings), which a process reads once when it starts. The start
+    comes from `<config dir>/sessions/<pid>.json`, so on `--resume` the earlier run's state no
+    longer counts;
+  - after each reply, from the last `ultra_effort_enter` / `ultra_effort_exit` reminder: at every
+    prompt Claude Code compares the live state with it and writes the other one when they differ.
+    This also corrects the settings guess where ultracode cannot run (a model without it,
+    workflows off), settings edited since start, and an in-session `/resume`. A compaction does
+    not reset it;
+  - in between, from the output of an `/effort` command that toggled it ("Ultracode on (this
+    session only): …", "… · Ultracode off"). Its refusals, including an "Invalid argument" that
+    echoes the word, do not count;
+  - shown only while the model has effort: after `/model` to one without, it goes at once.
+- Claude Code does not re-run the statusline when only ultracode is toggled, so that shows on the
+  periodic refresh. Setup now sets `statusLine.refreshInterval` to 5 seconds when there is none;
+  an existing value is kept.
+- Known gaps, all corrected at the next reply: an `/effort` typed while Claude is working is
+  written to the transcript only after the turn, or in fullscreen not at all; before the first
+  reply, ultracode set by `--settings`, `--effort ultracode`, Remote Control, managed-settings.d,
+  MDM policy or a `settings.local.json` at a git root above the project is not seen, and a
+  `/clear` after a toggle starts again from the settings.
+- The transcript reading (tokens, agents, ultracode) is cached per session in
+  `<config dir>/cache/kensei-statusline/sessions.json`, keyed by the size and mtime of the main and
+  subagent transcripts. A refresh with nothing new written reads no transcript: 0.04 s instead of
+  1.9 s on a 216 MB session with 600 subagent transcripts. Temp files a killed run leaves behind
+  are removed after a minute.
+
 ## kensei-toolkit 2.1.2 — 2026-10
 
 ### diff-tour

@@ -12,7 +12,9 @@ work, so the result does not depend on retyping anything by hand. It:
   On every render the wrapper runs the installed plugin version, read from
   `plugins/installed_plugins.json`, and skips orphaned cache copies;
 - sets `statusLine.type` and `statusLine.command` in `<config dir>/settings.json`, keeping every other
-  field, including `refreshInterval`, `padding` and the rest of the user's `statusLine`;
+  field, including `refreshInterval`, `padding` and the rest of the user's `statusLine`. When there
+  is no `refreshInterval`, it sets one of 5 seconds: Claude Code does not re-run the statusline
+  when ultracode is toggled, so only the periodic refresh shows that;
 - saves a backup `settings.json.bak-<timestamp>` before changing `settings.json`;
 - removes the "don't offer setup" marker `<config dir>/.statusline-no-setup`.
 

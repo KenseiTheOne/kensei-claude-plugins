@@ -5,13 +5,15 @@ Multi-line Claude Code statusline with model info, tokens, cost, usage limits, s
 ## Display
 
 ```
-Opus 5.5 │ ▓▓▓▓░░░░░░ 42% │ ↑380.0K ↓62.0K │ $10.3 │ 3 agents (Explorex2, general-purpose)
+Opus 5.5 high ⚡ultracode │ ▓▓▓▓░░░░░░ 42% │ ↑380.0K ↓62.0K │ $10.3 │ 3 agents (Explorex2, general-purpose)
 5h 24% ↻ 18:00 · 7d 41% ↻ 16.06 · Fable 11% ↻ 28.09
 main │ ●2 +3 ?1 │ +310 -45 │ 12 files 1.2K loc
 ```
 
 **Line 1:**
 - **Model** — current model name
+- **Effort** — the session's live effort level, as Claude Code sends it (only for models that support effort): `low` and `medium` dim, `high` cyan, `xhigh` yellow, `max` red. Claude Code re-runs the statusline when it changes
+- **⚡ultracode** — shown while ultracode is on. Claude Code does not pass it to statuslines, so it is worked out the way Claude Code keeps it: until the first reply of a Claude Code process from the `ultracode` settings key (user, project, local, managed), which a process reads once at start; after each reply from the last ultracode reminder in the transcript, which Claude Code re-checks against the live state at every prompt; in between from the output of an `/effort` command that toggled it. Claude Code does not re-run the statusline when only ultracode changes, so that shows on the next periodic refresh: set `statusLine.refreshInterval` (setup sets 5 seconds when there is none). An `/effort` typed while Claude is working, and before the first reply ultracode set by `--settings`, `--effort ultracode` or Remote Control, show from the next reply on. The transcript reading is cached by the transcripts' size and mtime in `<config dir>/cache/kensei-statusline/sessions.json`, so an idle refresh reads no transcript
 - **Context bar** — green (<50%), yellow (50-80%), red (>80%)
 - **↑ / ↓** — current context size (input tokens of the last request) / output tokens of the whole session, subagents and workflow subagents included
 - **$X.XX** — session cost as Claude Code reports it; `~$X.XX` when it is estimated from the transcripts (see API Pricing)
@@ -39,7 +41,7 @@ main │ ●2 +3 ?1 │ +310 -45 │ 12 files 1.2K loc
 /plugin install kensei-statusline@kensei-claude-plugins
 ```
 
-At the start of a session where no statusline is configured yet, a `SessionStart` hook asks Claude to offer the setup; nothing changes until you agree. Setup shows what it will change, then copies a small wrapper to `~/.claude/scripts/kensei-statusline.py` and sets `statusLine` in `~/.claude/settings.json` (both under `CLAUDE_CONFIG_DIR` when that is set). Other settings, including `statusLine.refreshInterval`, are kept, and `settings.json` is backed up first as `settings.json.bak-<timestamp>`. Restart Claude Code (`/exit`) for the statusline to take effect. Declining creates `~/.claude/.statusline-no-setup`, and the offer is not repeated.
+At the start of a session where no statusline is configured yet, a `SessionStart` hook asks Claude to offer the setup; nothing changes until you agree. Setup shows what it will change, then copies a small wrapper to `~/.claude/scripts/kensei-statusline.py` and sets `statusLine` in `~/.claude/settings.json` (both under `CLAUDE_CONFIG_DIR` when that is set). Other settings, including an existing `statusLine.refreshInterval`, are kept (when there is none, setup sets 5 seconds, see ⚡ultracode), and `settings.json` is backed up first as `settings.json.bak-<timestamp>`. Restart Claude Code (`/exit`) for the statusline to take effect. Declining creates `~/.claude/.statusline-no-setup`, and the offer is not repeated.
 
 To run setup yourself (e.g. after editing `settings.json`, or to reinstall the wrapper):
 

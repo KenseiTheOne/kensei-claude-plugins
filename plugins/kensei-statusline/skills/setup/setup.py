@@ -5,8 +5,9 @@
     python3 setup.py             # do it
 
 Writes <config dir>/scripts/kensei-statusline.py (the config dir is CLAUDE_CONFIG_DIR, or ~/.claude)
-and sets statusLine.type / statusLine.command in <config dir>/settings.json. Every other field of
-settings.json, and every other statusLine field (refreshInterval, padding, ...), is kept. Before
+and sets statusLine.type / statusLine.command in <config dir>/settings.json, plus
+statusLine.refreshInterval = 5 when there is none. Every other field of settings.json, and every
+other statusLine field (an existing refreshInterval, padding, ...), is kept. Before
 settings.json changes, a copy is saved next to it as settings.json.bak-<timestamp>. A statusLine in
 settings.local.json wins over settings.json; setup does not edit that file and only reports it as
 local_override_status_line. Prints one JSON object describing what was done.
@@ -26,6 +27,10 @@ SETTINGS = os.path.join(CONFIG_DIR, "settings.json")
 LOCAL_SETTINGS = os.path.join(CONFIG_DIR, "settings.local.json")
 WRAPPER_DST = os.path.join(CONFIG_DIR, "scripts", "kensei-statusline.py")
 DISMISS = os.path.join(CONFIG_DIR, ".statusline-no-setup")
+# Claude Code re-runs the statusline when effort changes, but not when ultracode is toggled: only
+# the periodic refresh picks that up. The statusline caches its transcript reading, so an idle
+# refresh is cheap.
+DEFAULT_REFRESH_INTERVAL = 5
 
 
 def command_for(path: str) -> str:
@@ -60,6 +65,7 @@ def plan() -> dict:
     old = settings.get("statusLine")
     new = dict(old) if isinstance(old, dict) else {}
     new.update(type="command", command=command_for(WRAPPER_DST))
+    new.setdefault("refreshInterval", DEFAULT_REFRESH_INTERVAL)
     return {"settings": settings, "old_status_line": old, "new_status_line": new}
 
 

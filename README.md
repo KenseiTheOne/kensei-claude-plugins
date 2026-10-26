@@ -31,7 +31,7 @@ Inside a session the same works as `/plugin marketplace add …` and `/plugin in
 | Plugin | Description |
 |--------|-------------|
 | [kensei-toolkit](#kensei-toolkit) | Tracker task runner with a publish guard, annotated diff tour, design brainstorm, image generation through Codex, SVG diagrams for READMEs, Unity code review, session learnings and loose ends |
-| [kensei-statusline](plugins/kensei-statusline/README.md) | Multi-line statusline: model, context, tokens, cost, usage limits (incl. per-model ones like Fable), subagents, git, project stats |
+| [kensei-statusline](plugins/kensei-statusline/README.md) | Multi-line statusline: model, effort and ultracode, context, tokens, cost, usage limits (incl. per-model ones like Fable), subagents, git, project stats |
 
 Versions live in each plugin's `.claude-plugin/plugin.json`; the CHANGELOG lists what each one changed.
 

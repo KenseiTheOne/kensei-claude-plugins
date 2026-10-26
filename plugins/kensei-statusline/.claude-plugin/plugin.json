@@ -1,8 +1,8 @@
 {
   "name": "kensei-statusline",
   "displayName": "Kensei Statusline",
-  "version": "1.5.1",
-  "description": "Multi-line statusline: model, context, tokens, API cost, usage limits (incl. per-model ones like Fable), subagents, git info, project stats",
+  "version": "1.6.0",
+  "description": "Multi-line statusline: model, effort and ultracode, context, tokens, API cost, usage limits (incl. per-model ones like Fable), subagents, git info, project stats",
   "author": {
     "name": "Kensei"
   },

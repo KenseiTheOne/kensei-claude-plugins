@@ -29,6 +29,7 @@ os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()  # caches go here, not to ~
 os.environ["KENSEI_STATUSLINE_NO_USAGE_FETCH"] = "1"
 import statusline  # noqa: E402
 import usage  # noqa: E402
+statusline.MANAGED_SETTINGS = os.path.join(tempfile.mkdtemp(), "managed-settings.json")
 
 
 def write_jsonl(path, entries):
@@ -314,6 +315,241 @@ class Render(unittest.TestCase):
 
     def test_in_process_render_minimal(self):
         self.assertEqual(self.render({}), ["? │ ░░░░░░░░░░ 0% │ ↑0 ↓0 │ ~$0.00"])
+
+    def test_effort_and_ultracode(self):
+        transcript = os.path.join(tempfile.mkdtemp(), "sess.jsonl")
+        on = {"type": "attachment", "attachment": {"type": "ultra_effort_enter",
+                                                   "reminderType": "full"}}
+        off = {"type": "attachment", "attachment": {"type": "ultra_effort_exit"}}
+        compact = {"type": "system", "subtype": "compact_boundary"}
+        other = {"type": "attachment", "attachment": {"type": "date_change"}}
+        stdin = {"model": {"display_name": "Opus 5.5"}, "effort": {"level": "xhigh"},
+                 "transcript_path": transcript}
+        for entries, shown in (([], False), ([on, other], True), ([on, off], False),
+                               ([on, off, on], True), ([on, compact], True),
+                               ([on, compact, off], False)):
+            write_jsonl(transcript, entries)
+            self.assertEqual(statusline.parse_main_transcript(transcript)[3], shown, entries)
+            self.assertTrue(self.render(stdin)[0].startswith(
+                "Opus 5.5 xhigh ⚡ultracode │" if shown else "Opus 5.5 xhigh │"), entries)
+
+    def test_ultracode_toggled_by_effort_command(self):
+        transcript = os.path.join(tempfile.mkdtemp(), "sess.jsonl")
+        cmd = lambda name: {"type": "user", "message": {"role": "user", "content":  # noqa: E731
+            f"<command-name>{name}</command-name>\n<command-message>x</command-message>"}}
+        out = lambda text: {"type": "user", "message": {"role": "user", "content":  # noqa: E731
+            f"<local-command-stdout>{text}</local-command-stdout>"}}
+        on = {"type": "attachment", "attachment": {"type": "ultra_effort_enter"}}
+        cases = (
+            ([cmd("/effort"), out("Ultracode on (this session only): dynamic workflows on every "
+                                  "task. Effort stays high.")], True),
+            ([on, cmd("/effort"), out("Ultracode off. Effort stays high.")], False),
+            ([on, cmd("/effort"), out("Set effort level to max (this session only): Maximum "
+                                      "capability · Ultracode off")], False),
+            ([cmd("/effort"), out("Set effort level to xhigh: Extended · Ultracode on")], True),
+            ([on, cmd("/effort"), out("Set effort level to low: Quick")], True),
+            ([on, cmd("/effort"), out("Effort level: auto (currently high) · Ultracode on")], True),
+            ([cmd("/effort"), out("Ultracode needs dynamic workflows enabled (see /config).")], False),
+            ([cmd("/effort"), out("Ultracode isn't available for this model.")], False),
+            ([on, cmd("/status"), out("Ultracode off")], True),   # not /effort
+            ([cmd("/effort"), out("Cancelled"), out("Ultracode on")], False),  # one output
+        )
+        for entries, shown in cases:
+            write_jsonl(transcript, entries)
+            self.assertEqual(statusline.parse_main_transcript(transcript)[3], shown, entries)
+
+    def test_capitalised_invalid_effort_argument_is_not_a_toggle(self):
+        transcript = os.path.join(tempfile.mkdtemp(), "sess.jsonl")
+        write_jsonl(transcript, [
+            {"type": "attachment", "attachment": {"type": "ultra_effort_enter"}},
+            {"type": "user", "message": {"content": "<command-name>/effort</command-name>"}},
+            {"type": "user", "message": {"content": "<local-command-stdout>Invalid argument: "
+                                                    "Ultracode off.. Valid options are: low"
+                                                    "</local-command-stdout>"}}])
+        self.assertTrue(statusline.parse_main_transcript(transcript)[3])
+
+    def test_ultracode_starts_from_settings_at_process_start(self):
+        transcript = os.path.join(tempfile.mkdtemp(), "sess.jsonl")
+        at = lambda ts, e: dict(e, timestamp=ts)  # noqa: E731
+        on = {"type": "attachment", "attachment": {"type": "ultra_effort_enter"}}
+        off = {"type": "attachment", "attachment": {"type": "ultra_effort_exit"}}
+        reply = assistant("claude-opus-5-5", out=1)
+        compact = {"type": "system", "subtype": "compact_boundary"}
+        effort = {"type": "user", "message": {"content": "<command-name>/effort</command-name>"}}
+        on_out = {"type": "user", "message": {"content": "<local-command-stdout>Ultracode on "
+                                                         "(this session only)</local-command-stdout>"}}
+        off_out = {"type": "user", "message": {"content": "<local-command-stdout>Ultracode off. "
+                                                          "Effort stays high.</local-command-stdout>"}}
+        start = "2026-10-26T13:00:00.000Z"
+        old, new = "2026-10-26T12:00:00.000Z", "2026-10-26T13:00:05.000Z"
+        for entries, at_start, shown in (
+                ([at(old, on)], False, False),           # resumed: the old run's state is gone
+                ([at(old, off)], True, True),            # the settings turn it on again
+                ([at(old, on), at(new, off)], True, False),
+                ([at(old, off), at(new, on)], False, True),
+                ([on], False, True),                     # no timestamp: counted
+                # a reply settles it: Claude Code wrote no reminder because its conversation
+                # already held the one that matches the live state
+                ([at(old, on), at(new, reply)], False, True),
+                ([at(old, off), at(new, reply)], True, False),
+                ([at(new, reply)], True, False),         # e.g. a model without ultracode
+                ([at(old, on), at(old, compact), at(new, reply)], True, False),  # resumed
+                ([at(new, on), at(new, compact), at(new, reply)], False, True),  # in-session
+                ([at(old, on), at(new, reply), at(new, effort), at(new, off_out)], False, False),
+                ([at(new, reply), at(new, effort), at(new, on_out)], False, True)):
+            write_jsonl(transcript, entries)
+            self.assertEqual(statusline.parse_main_transcript(transcript, start, at_start)[3],
+                             shown, (entries, at_start))
+
+    def test_odd_attachment_does_not_break_the_line(self):
+        transcript = os.path.join(tempfile.mkdtemp(), "sess.jsonl")
+        write_jsonl(transcript, [{"type": "attachment", "attachment": "x"},
+                                 {"type": "attachment", "attachment": [1]},
+                                 {"type": "attachment"}])
+        self.assertFalse(statusline.parse_main_transcript(transcript)[3])
+        self.assertEqual(self.render({"transcript_path": transcript})[0][:1], "?")
+
+    def test_process_start_in_a_config_dir_with_glob_characters(self):
+        config = os.path.join(tempfile.mkdtemp(), "cfg[x]")
+        os.makedirs(os.path.join(config, "sessions"))
+        with open(os.path.join(config, "sessions", "1.json"), "w") as f:
+            json.dump({"sessionId": "s", "startedAt": 1793019575432}, f)
+        with mock.patch.object(statusline, "CONFIG_DIR", config):
+            self.assertEqual(statusline.process_start("s"), "2026-10-26T12:59:35.432Z")
+
+    def test_process_start(self):
+        sessions = os.path.join(statusline.CONFIG_DIR, "sessions")
+        os.makedirs(sessions, exist_ok=True)
+        for name, info in (("1.json", {"sessionId": "s1", "startedAt": 1793019575432}),
+                           ("2.json", {"sessionId": "s1", "startedAt": 1793019000000}),
+                           ("3.json", {"sessionId": "s2", "startedAt": 1793019999999}),
+                           ("4.json", {"sessionId": "s3", "startedAt": "soon"})):
+            with open(os.path.join(sessions, name), "w") as f:
+                json.dump(info, f)
+        with open(os.path.join(sessions, "5.json"), "w") as f:
+            f.write("{broken")
+        self.assertEqual(statusline.process_start("s1"), "2026-10-26T12:59:35.432Z")  # the latest
+        for sid in ("s3", "gone", ""):
+            self.assertIsNone(statusline.process_start(sid), sid)
+
+    def test_settings_ultracode(self):
+        project = tempfile.mkdtemp()
+        os.makedirs(os.path.join(project, ".claude"))
+        user = os.path.join(statusline.CONFIG_DIR, "settings.json")
+        shared = os.path.join(project, ".claude", "settings.json")
+        local = os.path.join(project, ".claude", "settings.local.json")
+        def write(path, value):
+            with open(path, "w") as f:
+                f.write(value if isinstance(value, str) else json.dumps(value))
+        try:
+            write(user, {"ultracode": True})
+            self.assertTrue(statusline.settings_ultracode(""))
+            write(shared, {"model": "opus"})            # no key: the user's value stays
+            self.assertTrue(statusline.settings_ultracode(project))
+            write(local, {"ultracode": False})          # local wins over user and project
+            self.assertFalse(statusline.settings_ultracode(project))
+            write(statusline.MANAGED_SETTINGS, {"ultracode": True})  # managed wins over all
+            self.assertTrue(statusline.settings_ultracode(project))
+            os.unlink(statusline.MANAGED_SETTINGS)
+            write(local, {"ultracode": "yes"})          # not a bool: dropped, as Claude Code does
+            self.assertTrue(statusline.settings_ultracode(project))
+            write(local, "{broken")
+            self.assertTrue(statusline.settings_ultracode(project))
+        finally:
+            os.unlink(user)
+
+    def test_render_ultracode_from_settings_and_effort_gate(self):
+        transcript = os.path.join(tempfile.mkdtemp(), "sess.jsonl")
+        write_jsonl(transcript, [])
+        user = os.path.join(statusline.CONFIG_DIR, "settings.json")
+        with open(user, "w") as f:
+            json.dump({"ultracode": True}, f)
+        try:
+            stdin = {"model": {"display_name": "Opus 5.5"}, "transcript_path": transcript,
+                     "effort": {"level": "high"}}
+            self.assertTrue(self.render(stdin)[0].startswith("Opus 5.5 high ⚡ultracode │"))
+            del stdin["effort"]                         # a model without effort: no ultracode
+            self.assertTrue(self.render(stdin)[0].startswith("Opus 5.5 │"))
+        finally:
+            os.unlink(user)
+
+    def test_render_reads_session_id_and_project_dir(self):
+        root = tempfile.mkdtemp()
+        transcript = os.path.join(root, "sess.jsonl")
+        write_jsonl(transcript, [dict({"type": "attachment",  # the earlier run's reminder
+                                       "attachment": {"type": "ultra_effort_enter"}},
+                                      timestamp="2026-10-26T12:00:00.000Z")])
+        sessions = os.path.join(statusline.CONFIG_DIR, "sessions")
+        os.makedirs(sessions, exist_ok=True)
+        with open(os.path.join(sessions, "77.json"), "w") as f:
+            json.dump({"sessionId": "e2e", "startedAt": 1793019575432}, f)  # 12:59:35Z
+        project = os.path.join(root, "project")
+        os.makedirs(os.path.join(project, ".claude"))
+        stdin = {"model": {"display_name": "Opus 5.5"}, "effort": {"level": "high"},
+                 "transcript_path": transcript, "session_id": "e2e",
+                 "workspace": {"project_dir": project}}
+        self.assertEqual(self.render(stdin)[0], self.render(dict(stdin, session_id="x"))[0]
+                         .replace("Opus 5.5 high ⚡ultracode", "Opus 5.5 high"))  # started off
+        with open(os.path.join(project, ".claude", "settings.json"), "w") as f:
+            json.dump({"ultracode": True}, f)
+        self.assertTrue(self.render(stdin)[0].startswith("Opus 5.5 high ⚡ultracode │"))
+
+    def test_session_cache_temp_files(self):
+        stale = f"{statusline.SESSION_CACHE}.1.tmp"
+        fresh = f"{statusline.SESSION_CACHE}.2.tmp"
+        os.makedirs(os.path.dirname(stale), exist_ok=True)
+        for path in (stale, fresh):
+            open(path, "w").close()
+        os.utime(stale, (time.time() - 120, time.time() - 120))
+        statusline.save_session_cache({})
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(fresh))
+        os.unlink(fresh)
+        with mock.patch("json.dump", side_effect=OSError("disk full")):
+            statusline.save_session_cache({})
+        self.assertFalse([n for n in os.listdir(os.path.dirname(stale)) if n.endswith(".tmp")])
+
+    def test_session_cache(self):
+        root = tempfile.mkdtemp()
+        transcript = os.path.join(root, "sess.jsonl")
+        write_jsonl(transcript, [assistant("claude-opus-5-5", inp=100, out=10)])
+        write_jsonl(os.path.join(root, "sess", "subagents", "agent-a.jsonl"),
+                    [assistant("claude-sonnet-5-5", out=5)])
+        first = statusline.read_session(transcript)
+        self.assertEqual(first[0]["claude-opus-5-5"]["output"], 10)
+        self.assertEqual(first[4]["claude-sonnet-5-5"]["output"], 5)
+        with mock.patch.object(statusline, "parse_main_transcript") as parse:
+            self.assertEqual(statusline.read_session(transcript), first)  # unchanged: no parse
+        parse.assert_not_called()
+        with open(transcript, "a") as f:  # appended: parsed again
+            f.write(json.dumps({"type": "attachment",
+                                "attachment": {"type": "ultra_effort_enter"}}) + "\n")
+        self.assertTrue(statusline.read_session(transcript)[3])
+        write_jsonl(os.path.join(root, "sess", "subagents", "agent-b.jsonl"),
+                    [assistant("claude-sonnet-5-5", out=7)])  # a new subagent counts too
+        self.assertEqual(statusline.read_session(transcript)[4]["claude-sonnet-5-5"]["output"], 12)
+        with open(statusline.SESSION_CACHE, "w") as f:  # an odd entry is parsed again
+            json.dump({transcript: {"stamp": statusline.transcripts_stamp(
+                transcript, statusline.subagent_transcripts(transcript))}}, f)
+        self.assertTrue(statusline.read_session(transcript)[3])
+        for bad in ("[1]", "{broken"):
+            with open(statusline.SESSION_CACHE, "w") as f:
+                f.write(bad)
+            self.assertTrue(statusline.read_session(transcript)[3])
+        with mock.patch.object(statusline, "SESSION_CACHE_KEEP", 1):
+            statusline.read_session(transcript + ".other")
+            with open(statusline.SESSION_CACHE) as f:
+                self.assertEqual(list(json.load(f)), [transcript + ".other"])
+
+    def test_effort_colours_and_odd_values(self):
+        self.assertEqual(statusline.fmt_effort({"effort": {"level": "max"}}, False),
+                         " \033[31mmax\033[0m")
+        self.assertEqual(statusline.fmt_effort({"effort": {"level": "turbo"}}, False),
+                         " turbo\033[0m")
+        for data in ({}, {"effort": None}, {"effort": "high"}, {"effort": {"level": 3}},
+                     {"effort": {"level": ""}}):
+            self.assertEqual(statusline.fmt_effort(data, False), "", data)
+        self.assertEqual(strip_ansi(statusline.fmt_effort({}, True)), " ⚡ultracode")
 
     def test_in_process_render_limits_and_lines_changed(self):
         repo = tempfile.mkdtemp()
@@ -891,7 +1127,9 @@ class Setup(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIsNone(report["backup"])
         with open(os.path.join(config, "settings.json")) as f:
-            self.assertEqual(json.load(f)["statusLine"]["type"], "command")
+            status_line = json.load(f)["statusLine"]
+        self.assertEqual(status_line["type"], "command")
+        self.assertEqual(status_line["refreshInterval"], 5)  # set only when the user had none
 
     def test_invalid_settings_is_left_alone(self):
         config = tempfile.mkdtemp()
