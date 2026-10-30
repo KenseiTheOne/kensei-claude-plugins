@@ -1,7 +1,7 @@
 # Kensei Claude Plugins
 
-Claude Code plugin marketplace: a statusline and a skill toolkit for tracker tasks, diff review,
-design brainstorms, Unity review and end-of-session capture. Release notes are in [CHANGELOG.md](CHANGELOG.md).
+Claude Code plugin marketplace: a statusline and a skill toolkit for tracker tasks, committing a
+session's own work, diff review, design brainstorms, Unity review and end-of-session capture. Release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Installation
 
@@ -17,20 +17,20 @@ Inside a session the same works as `/plugin marketplace add …` and `/plugin in
 
 - **Claude Code 2.1.286 or newer** — the version the plugins are validated with; CI pins the same
   version. Older versions are untested.
-- **`python3` 3.9 or newer** on `PATH`. The ticket guard, diff-tour and the statusline are Python
+- **`python3` 3.9 or newer** on `PATH`. The ticket guard, commit, diff-tour and the statusline are Python
   scripts; without `python3` the guard cannot run and blocks nothing.
 - **Codex CLI 0.158 or newer**, signed in with ChatGPT (a paid plan), for codex-img only.
 - **A PNG renderer** for svg-diagram only, to look at the picture before it is handed over: Google
   Chrome or Microsoft Edge (found in the usual places, or set `CHROME=<path>`), or `rsvg-convert`
   (librsvg).
-- **`git` 2.25 or newer** for diff-tour, the ticket flow and the statusline's git line (2.28 to run
+- **`git` 2.25 or newer** for commit, diff-tour, the ticket flow and the statusline's git line (2.28 to run
   the tests).
 
 ## Plugins
 
 | Plugin | Description |
 |--------|-------------|
-| [kensei-toolkit](#kensei-toolkit) | Tracker task runner with a publish guard, annotated diff tour, design brainstorm, image generation through Codex, SVG diagrams for READMEs, Unity code review, session learnings and loose ends |
+| [kensei-toolkit](#kensei-toolkit) | Tracker task runner with a publish guard, commit of only this session's work, annotated diff tour, design brainstorm, image generation through Codex, SVG diagrams for READMEs, Unity code review, session learnings and loose ends |
 | [kensei-statusline](plugins/kensei-statusline/README.md) | Multi-line statusline: model, effort and ultracode, context, tokens, cost, usage limits (incl. per-model ones like Fable), subagents, git, project stats |
 
 Versions live in each plugin's `.claude-plugin/plugin.json`; the CHANGELOG lists what each one changed.
@@ -43,12 +43,13 @@ answers in the language you write in.
 
 | Skill | Command | Invocation | Example | What it does |
 |-------|---------|------------|---------|--------------|
-| [ticket](plugins/kensei-toolkit/skills/ticket/) | `/kensei-toolkit:ticket <url\|id> [probe\|fix\|full]` | manual, model | «возьми тикет CU-86c1234, режим fix» | Runs one tracker task end to end: context agent, acceptance criteria you approve, implementation, tests, fresh-agent review, then a publish gate. Commit, merge into main, push, PR (only with the body you approved), branch deletes, task comment, status, task creation, releases, repository settings and mail, chat or calendar sends happen only on your command (typed, or an answer tagged such as `[merge-local]`, `[delete-branch]`, `[create-task]`, `[publish]`, `[repo-admin]`, `[send]`), enforced by a guard hook that also covers subagents; a comment is fact-checked and shown in full before posting. Any tracker via MCP, CLI or browser |
-| [diff-tour](plugins/kensei-toolkit/skills/diff-tour/) | `/kensei-toolkit:diff-tour [ref\|a..b]` | manual, model | «покажи дифф» | Self-review before a commit: the changes (untracked files included) as a local HTML page, side by side or unified, with notes on what and why placed under the lines they explain; every change no note explains is marked "Unexplained". Read-only: the git index and the repository are never touched |
-| [brainstorm](plugins/kensei-toolkit/skills/brainstorm/) | `/kensei-toolkit:brainstorm [topic]` | manual, model (on an explicit ask) | «давай побрейнштормим, как устроить офлайн-кэш» | Design dialogue before implementation: focused questions, honest challenge, approaches, incremental validation. Ends with a design doc and a standalone plan, saved outside the project (`~/docs/brainstorms` unless the project names a place); implementation starts only when you say so |
-| [codex-img](plugins/kensei-toolkit/skills/codex-img/) | `/kensei-toolkit:codex-img [what to draw] [--out path]` | manual, model | «нарисуй иконку огненного камня с прозрачным фоном в icons/fire.png» | Generates or edits images (icons, sprites, illustrations) through the Codex CLI's built-in image tool on your ChatGPT subscription — no API key. Saves each image under the name you choose, keeps a series in one style from reference images, checks that a transparent PNG really has alpha, runs a series from a manifest in the background after you confirm the cost, and stops on the image limit. The model, size and masks are not selectable: Codex decides |
-| [svg-diagram](plugins/kensei-toolkit/skills/svg-diagram/) | `/kensei-toolkit:svg-diagram [what to draw] [--out docs/diagrams/name.svg]` | manual, model | «замени ASCII-схему в README на картинку» | Draws an architecture, data-flow or pipeline diagram as a hand-built SVG in a dark gradient style (cards, labelled arrows, a highlighted special path, takeaway badges), one per README language, and embeds it. A small generator script with a stdlib kit copied next to it keeps the picture editable; `--strict` reports text overflowing its box, off the canvas or overlapping, and every language is rendered to PNG and looked at before it is handed over. Not for raster art (codex-img) or data charts |
-| [unity-review](plugins/kensei-toolkit/skills/unity-review/) | `/kensei-toolkit:unity-review [quick\|perf\|arch\|full] [paths\|ref\|a..b] [focus]` | manual, model | «проверь на перф» | Unity-specialist review of a change through four lenses (performance, memory and lifecycle, Unity architecture, platform), checked against the project's real platforms and packages. Read-only reviewers; a fresh agent tries to refute every finding; the report lists confirmed findings by severity with `path:line` and a failure scenario. Generic bugs and style are left to `/code-review`. In a project with its own review skill, a general review goes to that skill; a lens you name that it lacks (such as performance) runs here |
+| [ticket](plugins/kensei-toolkit/skills/ticket/) | `/kensei-toolkit:ticket <url\|id> [probe\|fix\|full]` | manual, model | "take ticket CU-86c1234, fix mode" | Runs one tracker task end to end: context agent, acceptance criteria you approve, implementation, tests, fresh-agent review, then a publish gate. Commit, merge into main, push, PR (only with the body you approved), branch deletes, task comment, status, task creation, releases, repository settings and mail, chat or calendar sends happen only on your command (typed, or an answer tagged such as `[merge-local]`, `[delete-branch]`, `[create-task]`, `[publish]`, `[repo-admin]`, `[send]`), enforced by a guard hook that also covers subagents; a comment is fact-checked and shown in full before posting. Any tracker via MCP, CLI or browser |
+| [commit](plugins/kensei-toolkit/skills/commit/) | `/kensei-toolkit:commit [plan\|local\|no-merge\|no-push]` | manual, model | "commit and merge into main" | Commits only what this session changed — its own edits and those of its subagents and workflow agents, read from the session's transcripts — and by default merges the branch into main and pushes, with one status line per step (commit, skipped files, what is left alone, merge into main, push). In a file someone else also edited, only this session's hunks are committed and the rest stays in the working tree; entangled edits skip the file with a reason. Never stages others' files, stashes, forces or publishes someone else's commits: it stops and says why. Files changed through Bash are committed when declared |
+| [diff-tour](plugins/kensei-toolkit/skills/diff-tour/) | `/kensei-toolkit:diff-tour [ref\|a..b]` | manual, model | "show the diff" | Self-review before a commit: the changes (untracked files included) as a local HTML page, side by side or unified, with notes on what and why placed under the lines they explain; every change no note explains is marked "Unexplained". Read-only: the git index and the repository are never touched |
+| [brainstorm](plugins/kensei-toolkit/skills/brainstorm/) | `/kensei-toolkit:brainstorm [topic]` | manual, model (on an explicit ask) | "let's brainstorm how to build an offline cache" | Design dialogue before implementation: focused questions, honest challenge, approaches, incremental validation. Ends with a design doc and a standalone plan, saved outside the project (`~/docs/brainstorms` unless the project names a place); implementation starts only when you say so |
+| [codex-img](plugins/kensei-toolkit/skills/codex-img/) | `/kensei-toolkit:codex-img [what to draw] [--out path]` | manual, model | "draw a fire stone icon with a transparent background to icons/fire.png" | Generates or edits images (icons, sprites, illustrations) through the Codex CLI's built-in image tool on your ChatGPT subscription — no API key. Saves each image under the name you choose, keeps a series in one style from reference images, checks that a transparent PNG really has alpha, runs a series from a manifest in the background after you confirm the cost, and stops on the image limit. The model, size and masks are not selectable: Codex decides |
+| [svg-diagram](plugins/kensei-toolkit/skills/svg-diagram/) | `/kensei-toolkit:svg-diagram [what to draw] [--out docs/diagrams/name.svg]` | manual, model | "replace the ASCII diagram in the README with a picture" | Draws an architecture, data-flow or pipeline diagram as a hand-built SVG in a dark gradient style (cards, labelled arrows, a highlighted special path, takeaway badges), one per README language, and embeds it. A small generator script with a stdlib kit copied next to it keeps the picture editable; `--strict` reports text overflowing its box, off the canvas or overlapping, and every language is rendered to PNG and looked at before it is handed over. Not for raster art (codex-img) or data charts |
+| [unity-review](plugins/kensei-toolkit/skills/unity-review/) | `/kensei-toolkit:unity-review [quick\|perf\|arch\|full] [paths\|ref\|a..b] [focus]` | manual, model | "review this for performance" | Unity-specialist review of a change through four lenses (performance, memory and lifecycle, Unity architecture, platform), checked against the project's real platforms and packages. Read-only reviewers; a fresh agent tries to refute every finding; the report lists confirmed findings by severity with `path:line` and a failure scenario. Generic bugs and style are left to `/code-review`. In a project with its own review skill, a general review goes to that skill; a lens you name that it lacks (such as performance) runs here |
 | [learn](plugins/kensei-toolkit/skills/learn/) | `/kensei-toolkit:learn [path/to/CLAUDE.md\|focus]` | manual | — | End of session: proposes durable takeaways, deduplicated against the project and global `CLAUDE.md` and the auto-memory, each routed to one of them; writes only what you tick |
 | [todo](plugins/kensei-toolkit/skills/todo/) | `/kensei-toolkit:todo [path/to/notes.md\|focus]` | manual | — | End of session: collects loose ends with evidence and, for the ones you tick, adds personal items to the Todoist Inbox (or prints a paste block) and project work to the ClickUp list you pick (the workspace comes from your project rules or `CLAUDE.md`, otherwise it asks); with a `.md` path, appends to that file instead |
 
@@ -62,7 +63,7 @@ run continues from the step it reached).
 
 | Skill | Command | Invocation | Example | What it does |
 |-------|---------|------------|---------|--------------|
-| [setup](plugins/kensei-statusline/skills/setup/) | `/kensei-statusline:setup` | manual, model | «настрой статуслайн» | Installs the statusline wrapper and sets `statusLine` in `settings.json`, keeping your other settings and backing the file up first |
+| [setup](plugins/kensei-statusline/skills/setup/) | `/kensei-statusline:setup` | manual, model | "set up the statusline" | Installs the statusline wrapper and sets `statusLine` in `settings.json`, keeping your other settings and backing the file up first |
 
 A `SessionStart` hook ([hooks/hooks.json](plugins/kensei-statusline/hooks/hooks.json)) asks Claude
 to *offer* setup when no statusline is configured yet; nothing changes until you agree. See the
@@ -80,6 +81,8 @@ plugins/kensei-toolkit/
   hooks/hooks.json                         — subagent guard while a ticket run is active
   skills/ticket/                           — SKILL.md, flow.md, publish.md, trackers.md,
                                              guard.py + guard_test.py, testdata/ (test fixtures)
+  skills/commit/                           — SKILL.md, README.md (how files are split, gaps),
+                                             sessioncommit.py + sessioncommit_test.py
   skills/diff-tour/                        — SKILL.md, README.md, difftour.py + difftour_test.py,
                                              assets/ (page template, CSS, JS),
                                              testdata/ (golden pages)
@@ -121,7 +124,7 @@ that session on the installed plugin instead.
    ```bash
    scripts/check.sh            # or one part: tests, validate, yaml
    ```
-   It runs the three script tests, `claude plugin validate --strict` on the marketplace and each
+   It runs the script tests, `claude plugin validate --strict` on the marketplace and each
    plugin (skills included), and parses every skill frontmatter, eval frontmatter and `case.yaml`
    as strict YAML, which `validate` does not. It needs `claude`, `git` and PyYAML.
 2. After a skill change, run the evals on Opus (they cost real model calls, see

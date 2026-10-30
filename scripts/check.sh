@@ -14,6 +14,7 @@ run_tests() {
   "$PYTHON" --version
   "$PYTHON" plugins/kensei-toolkit/skills/ticket/guard_test.py
   "$PYTHON" plugins/kensei-toolkit/skills/diff-tour/difftour_test.py
+  "$PYTHON" plugins/kensei-toolkit/skills/commit/sessioncommit_test.py
   "$PYTHON" plugins/kensei-toolkit/skills/codex-img/codex_img_test.py
   "$PYTHON" plugins/kensei-toolkit/skills/svg-diagram/diagram_kit_test.py
   "$PYTHON" plugins/kensei-statusline/scripts/statusline_test.py

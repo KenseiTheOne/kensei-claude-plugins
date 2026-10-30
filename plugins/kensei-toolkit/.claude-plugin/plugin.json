@@ -1,13 +1,13 @@
 {
   "name": "kensei-toolkit",
   "displayName": "Kensei Toolkit",
-  "version": "2.1.2",
-  "description": "Skill collection — tracker task runner with a publish guard, annotated diff tour, design brainstorm, image generation through Codex, SVG diagrams for READMEs, Unity code review, session learnings to CLAUDE.md and memory, loose ends to Todoist or ClickUp",
+  "version": "2.2.0",
+  "description": "Skill collection — tracker task runner with a publish guard, commit of only this session's work with merge into main and push, annotated diff tour, design brainstorm, image generation through Codex, SVG diagrams for READMEs, Unity code review, session learnings to CLAUDE.md and memory, loose ends to Todoist or ClickUp",
   "author": {
     "name": "Kensei"
   },
   "homepage": "https://github.com/KenseiTheOne/kensei-claude-plugins#kensei-toolkit",
   "repository": "https://github.com/KenseiTheOne/kensei-claude-plugins",
   "license": "MIT",
-  "keywords": ["ticket", "tracker", "workflow", "guard", "diff", "code-review", "brainstorm", "design", "unity", "claude-md", "memory", "todo", "todoist", "clickup", "image", "image-generation", "codex", "diagram", "svg", "readme"]
+  "keywords": ["ticket", "tracker", "workflow", "guard", "commit", "git", "push", "diff", "code-review", "brainstorm", "design", "unity", "claude-md", "memory", "todo", "todoist", "clickup", "image", "image-generation", "codex", "diagram", "svg", "readme"]
 }

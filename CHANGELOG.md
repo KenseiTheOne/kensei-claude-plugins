@@ -3,6 +3,90 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.2.0 — 2026-10
+
+### commit (new)
+- `/kensei-toolkit:commit` commits only what this session changed and, by default, lands it:
+  commit → merge into main (from another branch or a linked worktree) → push. No confirmation;
+  the plan is printed as status lines (`Коммит:`, `Пропуск:`, `Чужое:`, `В main:`, `Push:`, in
+  the user's language) and carried out at once, one line per step with the commit id.
+  `plan` shows the plan only; `local`, `no-merge` and `no-push` stop earlier.
+- "This session" is read from its transcripts: the main one, every subagent and every workflow
+  agent, in timestamp order. Edits come from `structuredPatch` where the transcript has it and
+  from the tool input where it does not (workflow agents record no `toolUseResult`); a workflow
+  agent's Write over an existing file is split by the agent's last whole Read of it, and skipped
+  without one or when Claude Code told the agent the file changed after it. Paths are taken as
+  spelt on disk and as git spells them (letter case; Unicode NFC on macOS), so a path typed in
+  another case or a name stored decomposed is not a second file. Files changed through Bash are committed when the model declares them
+  (`--declare`, paths relative to the repository root as plan prints them; a folder declares
+  its changed tracked files and the new files in it this session created or edited, the
+  repository root is refused, a path that is nowhere is named as not found; a case-only rename
+  declares both names and commits the old one as a deletion, and a commit that would hold two
+  paths differing only in case stops; a declared file whose only change is its exec bit is
+  committed with it); the plan lists the session's
+  newest shell commands that may have changed files in this repository (run inside it or naming
+  a path in it — failed ones, `chmod` and Unity batchmode runs included; relative paths, `cd`,
+  subshells and `git -C` followed; read-only `grep "a<b>"` and `git merge-base` left out), and
+  the left-out files they name (long lists say how many are in plan.json). Earlier session ids (after `/clear`) can be added with `--session`. Repositories in
+  temporary places (scratchpad clones) are counted, never picked or listed for a commit.
+- Edits the session already committed (by `/commit`, or its own `git commit` — `-q` ones found
+  in the HEAD reflog of the checkout the command ran in, while it ran, holding the session's
+  edits or the subject it gave; a rejected or read-only command makes nothing its own) are not
+  replayed again: only the edits made since go into the next commit — including a parallel
+  agent's edit made after that commit while the command still ran — so re-editing or reverting
+  committed lines works. A file the same as in HEAD is never reported
+  as skipped.
+- Mixed files are split by hunks: the session's edits are undone from the working tree to get
+  the file without them, and `git merge-file` puts them onto HEAD. Someone else's edits in the
+  same file stay in the working tree, unstaged. Edits that are entangled (the same or adjacent
+  lines, or the session's lines rewritten since, or lookalike code in more than one place) skip
+  the file with the reason in the user's language. CRLF files stay CRLF; files without a final
+  newline keep it that way; someone else's line-ending conversion or chmod stays uncommitted (a
+  chmod left on a committed file is counted and named, to be declared if it was the session's).
+- Everyone else's work is left alone: the commit is built in a private index, so staged changes
+  on other paths stay staged and out of the commit; only the committed paths' index entries are
+  updated. Staged changes on a path the session changed stop the run before anything happens,
+  unless they are exactly what the commit holds (the session's own `git add`, `git mv`, `git
+  rm`); index entries a locked index or a killed run kept the skill from updating are recorded
+  and put back on the next run, and only those — a stage someone made since stays.
+  Git-ignored files the session wrote are one `Пропуск:` line with a count.
+  Ignored files are skipped; edits in other repositories are reported (`Ещё:`) for a `/commit`
+  there. A created or deleted Unity asset brings its `.meta`, a new folder its folder `.meta`.
+- Merge and push follow the publish rules of the ticket skill: fetch first; rebase only
+  unpushed commits of this session and only with no uncommitted tracked changes (otherwise stop
+  after the commit); a branch takes main's new commits by rebase if never pushed, by merge if it
+  was; main moves by fast-forward in its own checkout (a `--no-ff` merge when the repository's
+  history is mostly merges); any conflict is aborted at once. Never stashes, never
+  `--autostash` (autoStash config is switched off for every merge and rebase), never forces,
+  never publishes local tags, never deletes a branch or worktree, never overwrites someone's
+  git-ignored files by a merge or rebase (spelt in another letter case, or where a folder
+  comes, included), never deletes a message prepared by `git merge
+  --squash` / `git cherry-pick -n`, and never aborts someone's unfinished merge in main's
+  checkout — it stops there. Local main ahead only by this session's
+  commits takes origin/main by merge; with no local main, main is created at the branch; an
+  orphan branch is pushed, not merged. Unpushed commits that are not this session's — not made
+  by this skill (remembered under every session id of the run) or printed by the session's own
+  `git commit` — stop the push and are named; so are teammate commits that keep the branch
+  from being pushed. Every stop names its way out (`git rebase --continue` / `--abort` for a
+  stopped rebase, `/commit no-merge` for foreign commits already on origin/<branch>, commit or
+  delete a leftover prepared message). Commits made by a rebase or merge are recorded as they
+  are made, and the commit itself is noted before `git commit`, so a run killed during a
+  post-commit hook or a slow push does not leave them looking foreign. A `--no-ff` merge into
+  main reads `Merge branch '<branch>'`; a branch already in main still pushes its own lagging
+  upstream, and the plan says so.
+- `apply` re-checks HEAD, the branch, a merge or rebase in progress, the index and every planned
+  file first and refuses a stale plan (exit 3), and checks HEAD and the merge state again right
+  before `git commit`; a commit that HEAD moved under, or that landed on another branch, is
+  taken back; one that landed as planned is kept even if HEAD switched branches right after (it
+  stops before merging). An unreadable message file is an error (exit 2). After the commit it
+  checks
+  the commit against the planned tree (a hook's extra content is named, with the undo commands,
+  and never published as the session's) and every file committed whole against the disk.
+- Started outside a repository (a session in `~`), it takes the one repository the session
+  edited, or lists them when there are several.
+- Tests: `sessioncommit_test.py` (157 cases, temp repositories, bare remotes, linked worktrees,
+  synthetic transcripts in both shapes); `scripts/check.sh` runs it.
+
 ## kensei-statusline 1.6.0 — 2026-10
 
 - Line 1 shows the session's effort level after the model name (`Opus 5.5 high`), taken from the
