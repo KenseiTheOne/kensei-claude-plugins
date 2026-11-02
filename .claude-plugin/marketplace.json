@@ -1,6 +1,6 @@
 {
   "name": "kensei-claude-plugins",
-  "description": "Kensei's Claude Code plugins: a statusline and a skill toolkit for tracker tasks, diff review, design brainstorms, image generation through Codex, SVG diagrams for READMEs, Unity review and end-of-session capture",
+  "description": "Kensei's Claude Code plugins: a statusline and a skill toolkit for tracker tasks, committing only this session's work, diff review, design brainstorms, image generation through Codex, SVG diagrams for READMEs, Unity game VFX, Unity review and end-of-session capture",
   "owner": {
     "name": "Kensei",
     "url": "https://github.com/KenseiTheOne"
