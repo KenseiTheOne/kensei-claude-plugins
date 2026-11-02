@@ -3,6 +3,23 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.2.2 — 2026-11-02
+
+### game-vfx
+- **Codex draws the concept, not the effect (new rule 3; the old rules 3–5 are now 4–6).** A
+  Codex image fixes the look for the user to approve and never goes into the game, nor is a mask
+  cut from it. The effect is textures as shader data — computed by `vfx_tex.py`, or drawn anew as
+  one flat element with the concept as Image 1 — and a shader or particle curves that build its
+  form over time. Origin: a Codex frost sheet pasted on an enemy as sprites, rejected as "a
+  reference".
+- Step 3 is now "Concept, then textures": one concept image (new template 0) after the grey
+  block-in, only when there is a look to agree on; every working texture lists what moves it. Step
+  4 checks frame against frame that a large drawn element changes form, not only fades.
+- `textures.md`: a new "From the concept to the effect" table (silhouette → coverage mask, spread →
+  growth order by distance transform, cracks → Worley F2 − F1 and a cell id, colours → `ramp`), a
+  "not a texture" row, reference numbering Image 1 concept / Image 2 style anchor / Image 3 sketch.
+  `brief.md`: the brief's texture field and the frost row in the rejected table.
+
 ## kensei-toolkit 2.2.1 — 2026-11-02
 
 ### commit

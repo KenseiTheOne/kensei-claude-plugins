@@ -24,10 +24,12 @@ Write it in the user's language; the field names below are the checklist.
 5. Colour: role → hex, alpha, blend (alpha | additive | share of additive); hue shifts from core to edge.
    White ceiling: <project value>. Check over: <backgrounds — enemies, boss, light floor>.
 6. Neighbours: <effect X> — differs on axes <shape / motion / colour temperature / scale / signature>.
-7. References: Image 1 — take <…> / do NOT take <…>; reference in the project: <clip path>.
+7. References: outside references — take <…> / do NOT take <…> (the concept from Step 3 joins them);
+   reference in the project: <clip path>.
 8. Bans, each with its reason: "no closed ring outline — rings mean an enemy telegraph"; …
-9. Textures: one sheet = one kind of element; background (black | transparent); view (front | top-down);
-   what must stay when editing.
+9. Textures: the concept (after the block-in; never imported); each working texture → what animates it
+   (growth order, cracks, dissolve); one sheet = one kind of element; background (black | transparent);
+   view (front | top-down); what must stay when editing.
 10. Build: systems (name → modules and numbers); shader knobs per phase; sorting band; budget.
 11. Do not touch: <approved effects, shared shaders>.
 12. Acceptance: clip close-up + game scale + dense fight beside the reference; timing numbers;
@@ -72,6 +74,7 @@ Write it in the user's language; the field names below are the checklist.
 | cartoon water waves, opaque walls | toy-like; hid the enemies | set manner, height and transparency up front, with bans |
 | two rounds of shader patterns on a bad cone shape | "still ugly" | patterns do not save a silhouette: fix the shape first |
 | a static texture fading in and out on the floor | not a living effect; gold on the floor read as fire cracks | animate the shape; colour temperature must not match another element |
+| a Codex sheet of frost pasted on an enemy as sprites | "fits, but it is a reference" | Codex draws the concept; frost is a texture and a shader — grows over the silhouette, cracks, crumbles |
 | pillars, a star and arcs around a hit | formed a **face** | ban symmetry and constant speed; check for pareidolia |
 | a thin closed ring on the floor | an enemy telegraph | segments with gaps, soft patches without a rim |
 | dim orange additive over violet enemies | read as pink | name the blend mode and the backgrounds to check over |

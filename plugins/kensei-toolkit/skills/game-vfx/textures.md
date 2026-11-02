@@ -1,27 +1,59 @@
-# Textures — compute or draw, prompts, cleaning, import
+# Textures — concept, then working textures; prompts, cleaning, import
 
-A VFX texture is data for a shader, not an illustration. A prompt starts with how the engine will
-read the texture, then the shape, then the style. Codex draws only what cannot be computed: an image
-costs about 1.5 minutes and 30–70 thousand tokens of the user's Codex quota (codex-img measurements),
-while a script makes a noise or a ring exactly and instantly.
+A VFX texture is data for a shader, not an illustration. Codex draws two kinds of image, and only one
+of them reaches the game:
+
+- **the concept** — a picture of the effect as the player should see it, for the user to agree on the
+  look. It is never imported;
+- **a working texture** — one element drawn as data (a shape mask, a trail strip, a variations sheet),
+  only when a script cannot compute it, with the concept as its reference.
+
+A working-texture prompt starts with how the engine will read the texture, then the shape, then the
+style. An image costs about 1.5 minutes and 30–70 thousand tokens of the user's Codex quota (codex-img
+measurements), while a script makes a noise or a ring exactly and instantly.
+
+## From the concept to the effect
+
+Read the concept as a list of jobs, not as a texture: what is the silhouette, where does the form
+start and where does it spread to, what breaks up and how, which colours sit at the core and at the
+edge. Each job goes to a texture *and* a stage that animates it:
+
+| In the concept | Texture (data) | What moves it |
+|---|---|---|
+| the silhouette of a patch, crust, splash | coverage mask — computed, a working texture drawn as one element, or the project's own mask; never cut from the concept image. Over a body: the target's own alpha in its current frame (a Sprite Mask with the particle renderer's Mask Interaction, or a stage in the target's shader) — a static mask does not follow an animated silhouette | dissolve threshold over life; edge noise |
+| where it starts and where it spreads | growth order: radial `glow`, distance from an outline (a distance transform of the shape mask, e.g. `scipy.ndimage.distance_transform_edt`, normalised and multiplied by the mask — not a blur: a blur saturates inside and bleeds outside), or the project's depth/order map | the threshold walks the order: growth, a spreading edge, drying from the rim |
+| cracks, cells, frost pattern | Worley cells — F1 from `noise --kind worley`; thin, even crack lines need F2 − F1 and pieces dropping out need a per-cell random id (constant inside a cell); `vfx_tex.py` makes neither — bake both in a short tileable script on the same jitter grid as `worley_tileable` (e.g. F2 − F1 in R, cell id in G) or compute them in the shader | cracks open along cell borders; pieces drop out by cell |
+| breaking up, crumbling, melting away | the same mask plus fbm noise | a second threshold with a different curve; debris as particles |
+| core-to-edge colours | `ramp` with the concept's hex | brightness or life → colour |
+
+Two examples. Water on the floor, approved on this shape: a drawn puddle → a depth mask; the shader
+spreads it by depth with a wobbling edge and caustics, then dries it from the rim into a wet spot.
+Frost on an enemy, after the frost sheet itself was rejected as "a reference": the sheet gives the
+look → frost grows over the silhouette by a growth order, its coverage taken from the enemy's own
+alpha so it follows the animation, the enemy stays visible, crack lines open on Worley cells, at the
+end it cracks and crumbles, plus a frost decal on the floor. The picture tells *what*; the shader
+makes it *happen*.
 
 ## Compute or draw
 
 | Texture | Used for | Make it with |
 |---|---|---|
-| soft dot, glow, radial gradient | flash core, glow | `vfx_tex.py glow` |
-| noise: fbm, Worley | dissolve, distortion, UV scroll | `vfx_tex.py noise` — seamless by construction |
-| ramp / LUT | grey → colour | `vfx_tex.py ramp` |
+| the concept | agreeing on the look | **Codex**, template 0 — never imported |
+| soft dot, glow, radial gradient | flash core, glow, radial growth order | `vfx_tex.py glow` |
+| noise: fbm, Worley | dissolve, distortion, UV scroll, cracks | `vfx_tex.py noise` — seamless by construction |
+| ramp / LUT | grey → colour | `vfx_tex.py ramp`, hex taken from the concept |
 | clean ring, simple cross star | shockwave, spark | `vfx_tex.py ring`; a mesh ring for big rings |
-| flame tongue, drop, leaf, ice shard, rock | the particle's shape | **Codex** — the best case |
-| smoke puff, dust, "poof" | smoke, appearance | **Codex**, one frame |
-| stylised ring, slash arc, sigil, lightning | drawn character | **Codex** |
+| flame tongue, drop, leaf, ice shard, rock | the particle's shape | **Codex** as one flat element (grey or in the palette, as the project says), with the concept as Image 1 — the best case |
+| smoke puff, dust, "poof" | smoke, appearance | **Codex** as one flat element (grey or in the palette, as the project says), one frame |
+| stylised ring, slash arc, sigil, lightning | drawn character | **Codex** with a gradient a threshold can reveal and erase |
 | trail strip | trails, wind | Codex draws, `vfx_tex.py tile --axis x` makes it seamless |
 | flipbook sequence (fire, explosion) | frame animation | **not Codex** — frames do not agree with each other. One frame + shader motion, or Blender / EmberGen / a free pack |
 | sheet of variations of one kind (4 rocks, 4 puffs) | random shape per particle | Codex; the script re-lays the grid |
+| a whole effect, a crust over a body, a patch meant to be shown as is | — | **not a texture** — that is a concept; build it from the rows above. A patch drawn as one element (template 4) is fine when a shader reveals it by an order or depth map, like the puddle above |
 
 At the GDC 2023 VFX roundtable artists named two useful uses of generative models: restyling a
 texture toward a reference and filling missing flipbook frames — not generating effects from scratch.
+The same split here: the model gives the look, the effect is built.
 
 ## Background: black or transparent
 
@@ -72,9 +104,12 @@ black background would become an opaque rectangle. Decide per element, as the pr
 
 ## Series and edits
 
-- Approve one anchor image, then pass it as Image 1 to every later prompt, and copy the same STYLE
-  LOCK block word for word into each prompt of the series.
-- Number references and give each a role: `Image 1: style anchor — match edge softness and value
+- A working texture gets the approved concept as Image 1: `Image 1: approved concept — take the shape
+  and edge character of <element> only; do NOT copy its background, lighting, scene or the other
+  elements`. Without the last clause the model redraws the concept.
+- Approve one anchor texture, then pass it as Image 2 to every later prompt of the series, and copy
+  the same STYLE LOCK block word for word into each prompt.
+- Number references and give each a role: `Image 2: style anchor — match edge softness and value
   distribution; do NOT copy its shape`. Without the last clause the model clones the silhouette. For
   gpt-image-2 a reference sets style, not pixels.
 - An edit redraws the whole image: write `change only X, keep everything else the same` and repeat
@@ -83,7 +118,22 @@ black background would become an opaque rectangle. Decide per element, as the pr
 
 ## Prompt templates
 
-Structure:
+**0. Concept** (not imported) — no `prep`; save as `concept.png` with its prompt
+
+```
+ASSET: concept frame of a game visual effect, to agree on the look before it is built; it will not be used in the game as an image.
+SUBJECT: <effect> at its peak, <on / around / under> <what it hits or covers>, <size against a character>; <what moves where>.
+VIEW: the game's camera — <tilted 3/4 top-down | side view>; the floor and the character as plain grey stand-ins.
+VALUES: <palette hex, core to edge with the hue shift>; <glowing additive | translucent | opaque>.
+STYLE: <the game's art style>, clean readable shapes, readable at phone size.
+EXCLUDE: no text, no UI, no frame, no logo, no background scenery.
+```
+
+An effect whose shape changes: `LAYOUT: 3 panels left to right — start, peak, end; same camera, same
+scale, same stand-ins` instead of one frame. It is a picture for agreement, so its sheet layout and
+lighting do not matter; what the user approves is the look.
+
+Templates 1–9 draw working textures. Structure:
 
 ```
 ASSET: <what it is> for a real-time particle shader in a mobile game (Unity), used as <additive sprite / alpha-blended sprite / mask>.
@@ -154,6 +204,9 @@ EXCLUDE: no perspective, no tilt, no floor tiles, no circular rim, no runes, no 
 
 A segmented ring instead: SUBJECT `6–8 separate arc segments with clear gaps of at least 10°`.
 
+The patch is drawn as data: its brightness (or the depth derived from it) is the growth order — a
+shader spreads and dries it; it never only fades in and out.
+
 **5. Slash arc** — `prep --mode glow`
 
 ```
@@ -191,7 +244,7 @@ ASSET: sheet of 4 independent shape variations for random selection per particle
 SUBJECT: four different rock-debris chunks, each a distinct angular silhouette, similar size and level of detail.
 LAYOUT: exactly 2 columns × 2 rows, one chunk centered in each quarter, wide empty space between chunks, no chunk crosses into another quarter.
 VALUES: <palette hex>, 2–3 tones.
-STYLE: same as Image 1 (style anchor), <STYLE LOCK>.
+STYLE: same as Image 2 (style anchor, when the series has one), <STYLE LOCK>.
 EXCLUDE: no grid lines, no cell borders, no numbers, no labels, no ground shadows, no background.
 ```
 
@@ -200,11 +253,12 @@ EXCLUDE: no grid lines, no cell borders, no numbers, no labels, no ground shadow
 **8. Next element of a series**
 
 ```
-Image 1: approved style anchor — match its edge softness, value distribution (bright core, dark edges), stroke character and level of detail. Do NOT copy its shape.
-Image 2: rough silhouette sketch — follow this outline only.
+Image 1: approved concept — take the shape character of <new element> only; do NOT copy its background, lighting or the other elements.
+Image 2: approved style anchor — match its edge softness, value distribution (bright core, dark edges), stroke character and level of detail. Do NOT copy its shape.
+Image 3: rough silhouette sketch — follow this outline only.
 Create: <new element>.
-Same pipeline rules as Image 1: pure flat black #000000 background, square 1:1, centered, generous padding, nothing touches the border.
-Keep identical to Image 1: brightness range, edge softness, simplicity. Do not redesign the style, do not add detail beyond Image 1.
+Same pipeline rules as Image 2: pure flat black #000000 background, square 1:1, centered, generous padding, nothing touches the border.
+Keep identical to Image 2: brightness range, edge softness, simplicity. Do not redesign the style, do not add detail beyond Image 2.
 EXCLUDE: no text, no frame, no vignette, no 3D lighting.
 ```
 

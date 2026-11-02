@@ -1,7 +1,7 @@
 {
   "name": "kensei-toolkit",
   "displayName": "Kensei Toolkit",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "Skill collection — tracker task runner with a publish guard, commit of only this session's work with the task link and a task branch, a fast-forward into main or a pull request, annotated diff tour, design brainstorm, image generation through Codex, SVG diagrams for READMEs, Unity game VFX from a brief, Unity code review, session learnings to CLAUDE.md and memory, loose ends to Todoist or ClickUp",
   "author": {
     "name": "Kensei"

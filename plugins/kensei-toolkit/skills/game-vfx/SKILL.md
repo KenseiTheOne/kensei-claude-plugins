@@ -1,6 +1,6 @@
 ---
 name: game-vfx
-description: Make or fix a game visual effect (VFX) in Unity — fire, explosion, lightning, water, wind, magic, hit, projectile, aura, ground zone — built from Particle System layers and shaders, with textures that a script computes or Codex draws. For a new effect it writes the brief first (one-line personality, three-phase timing in seconds, layers, hex palette, bans with reasons) and blocks the timing in with grey primitives; for a complaint about an existing one it films it, names the layer at fault and changes only that. Prompts Codex from templates, cleans every image with a script, films a fixed-rate clip, measures its timing and makes a numbered contact sheet, and shows each version to the user before the next change. Reads the project's own VFX rules first. Use when the user asks for a visual effect, a texture for one, or a change to one — "make a fire VFX", "the explosion feels weak", "particles for the hit", "a texture for the spark particles", «сделай эффект», «эффект взрыва», «VFX», «партиклы», «текстура для партиклов», «вспышка удара», «эффект снаряда», «эффект какой-то вялый», «фаербол вялый», «взрыв висит», «молния выгорает в белое», «переделай огонь». Not for UI animation, a post-processing setup alone, or a picture that is not part of a game effect (that is codex-img).
+description: Make or fix a game visual effect (VFX) in Unity — fire, explosion, lightning, water, wind, magic, hit, projectile, aura, ground zone — built from Particle System layers and shaders, with textures as shader data that a script computes or Codex draws as single elements after an approved concept — Codex draws only the concept the user approves, never the effect itself. For a new effect it writes the brief first (one-line personality, three-phase timing in seconds, layers, hex palette, bans with reasons) and blocks the timing in with grey primitives; for a complaint about an existing one it films it, names the layer at fault and changes only that. Prompts Codex from templates, cleans every image with a script, films a fixed-rate clip, measures its timing and makes a numbered contact sheet, and shows each version to the user before the next change. Reads the project's own VFX rules first. Use when the user asks for a visual effect, a texture for one, or a change to one — "make a fire VFX", "the explosion feels weak", "particles for the hit", "a texture for the spark particles", «сделай эффект», «эффект взрыва», «VFX», «партиклы», «текстура для партиклов», «вспышка удара», «эффект снаряда», «эффект какой-то вялый», «фаербол вялый», «взрыв висит», «молния выгорает в белое», «переделай огонь». Not for UI animation, a post-processing setup alone, or a picture that is not part of a game effect (that is codex-img).
 argument-hint: "[effect name or what to change]"
 ---
 
@@ -8,8 +8,10 @@ argument-hint: "[effect name or what to change]"
 
 A good effect is three to six simple layers with different timing, whose silhouette reads even in
 greyscale — not one beautiful texture. So the work goes in this order: what the effect says and when
-(brief, timing), then shape, then textures and colour. Codex draws only what a script cannot compute;
-particles and shaders give shape over time, rhythm and colour.
+(brief, timing), then shape, then textures and colour. Codex draws the concept — a picture of how the
+effect should look, for the user to agree on. The effect itself is textures as data for a shader
+(masks, noise, ramps, growth order, crack maps) plus the particles and shaders that build its form over
+time, its rhythm and colour.
 
 Talk to the user in the user's language: questions, progress lines, the brief and the report. Files
 you write for the project follow the project's language.
@@ -22,17 +24,25 @@ you write for the project follow the project's language.
    burnt billions of tokens while their scores never converged — the user decides what reads right.
    Before showing you may fix, once, only a *measurable* miss: a red project test, a mechanical
    texture failure (`check` problems), an impact whose `timing` note says the peak is late, a life
-   that differs from the brief. Never taste.
+   that differs from the brief, a Codex picture standing in for the effect (rule 3). Never taste.
 2. **Timing before textures.** For a new effect, no Codex image is generated before the rhythm is
    settled on grey primitives and the user has seen it (Step 2). Re-timing a grey ball is cheap; a
    texture drawn for the wrong rhythm is quota spent twice.
-3. **A complaint names its layer.** Before changing anything after feedback, decide which layer is at
+3. **Codex draws the concept, not the effect.** A Codex image is a reference: it fixes the look —
+   palette, character, amount of detail — and the user approves it. It never goes into the game as a
+   picture that only appears, fades, scales or moves. The effect is textures as shader data —
+   computed by a script, or drawn anew as one data element with the concept as reference, never cut
+   from the concept image (a shape mask, a growth order, a crack map) — and a shader or particle
+   curves that build its form over time: growth, a spreading edge, cracks, breaking up. Why: a Codex
+   sheet of frost "fits, but it is a reference" — pasted on an enemy as sprites it reads as a sticker;
+   a static texture faded in by a shader was rejected the same way.
+4. **A complaint names its layer.** Before changing anything after feedback, decide which layer is at
    fault (`brief.md`, feedback dictionary). Never regenerate a texture when a curve is the problem.
-4. **Project rules beat this skill.** Read them first (Step 0). An effect the project marks approved
+5. **Project rules beat this skill.** Read them first (Step 0). An effect the project marks approved
    or frozen is changed only when the user names that effect; then compare its reference frames before
    and after and update its guards in the same change. Shared shaders, materials and emitters an
    approved effect uses get the same before/after comparison.
-5. **Numbers are labelled.** In briefs and reports, say which timing numbers are sourced and which are
+6. **Numbers are labelled.** In briefs and reports, say which timing numbers are sourced and which are
    your heuristics (`timing.md`). Never invent a ratio and present it as a standard.
 
 ## Files of this skill
@@ -43,7 +53,8 @@ you write for the project follow the project's language.
   dictionary from user words to layers and knobs. Read before Step 1 (or before the change route).
 - `unity.md` — layers to modules, prefab structure, blend modes and traps, shaders, budget, tilted
   camera, checking on a phone. Read before Step 2 (the block-in already builds particle systems).
-- `textures.md` — compute or draw, prompt rules and templates, cleaning, import. Read before Step 3.
+- `textures.md` — concept then working textures, compute or draw, prompt rules and templates,
+  cleaning, import. Read before Step 3.
 - `project-rules-template.md` — the shape of a project's VFX rules file.
 - `vfx_tex.py` — textures: `prep`, `check`, `tile`, `noise`, `glow`, `ring`, `ramp`.
 - `vfx_clip.py` — clips: `timing` (events, onset, peak, life, peak share, bright time, near-white) and
@@ -119,15 +130,31 @@ ring. Set lifetimes, bursts, start delays and size, speed and alpha curves from 
 Film it (Step 5), run `timing` and `sheet`, check the numbers against the brief, then **open the sheet
 for the user** with the numbers and ask whether the rhythm is right. Textures wait for this answer.
 
-## Step 3 — Textures
+## Step 3 — Concept, then textures
 
-List every texture the effect needs: name, role (shape, mask, noise, ramp, trail), blend mode, size,
-and **computed or drawn** (`textures.md`, first table). Then:
+**The concept.** One Codex image through the `codex-img` skill: the effect at its peak, in the game's
+camera, over the thing it hits or covers (template 0 in `textures.md`). An effect whose shape changes
+may get a strip of its states instead — start, peak, end. Show it to the user and ask whether the look
+is right; the textures wait for this answer, as they waited for the rhythm. Save it beside the brief
+(`concept.png` and `concept.prompt.txt`). It is never imported: it is what the textures and the shader
+are checked against. A project's approved effect or reference frames can stand in for it. Draw a
+concept only when there is a look to agree on — a shape, a pattern, a manner the user has not seen.
+A request for a single texture (sparks, a noise, a ring), an effect built only from computed
+textures, or a fix to one layer of an existing effect needs none: the brief and the reference clip
+are enough, and a concept would cost a Codex image for nothing.
+
+**The working textures.** List every texture the effect needs: name, role (shape mask, noise, ramp,
+trail, growth order, crack map), blend mode, size, **how it is made** (`textures.md`, "Compute or
+draw") and what the shader or the particle curves do with it over time ("From the concept to the
+effect"). A texture with nothing moving it is the concept pasted in — rule 3. Then:
 
 - **Computed** — `vfx_tex.py noise | glow | ring | ramp`. Exact, seamless, power-of-two, instant.
-- **Drawn** — write the prompt from the templates in `textures.md` and generate through the
-  `codex-img` skill (three or more images: list and cost first, wait for a yes). For a series, get one
-  anchor approved by the user first and pass it as Image 1 to every later prompt.
+- **Drawn from the concept** — only a shape whose character a script cannot compute (a flame tongue,
+  rock chunks, a stylised arc). Write the prompt from the templates in `textures.md` with the approved
+  concept as Image 1 and generate through the `codex-img` skill (three or more images: list and cost
+  first, wait for a yes). It is drawn as data — one element, flat, unlit, grey or in the palette as
+  the project says — not as a finished picture of the effect. For a series, get one anchor approved
+  by the user first and pass it with the concept to every later prompt (numbering in `textures.md`).
 - **Retries — only mechanical.** codex-img allows automatic retries; here a retry is allowed only for
   a mechanical failure (`no_alpha`, `check` problems: touches the border, background not black, no
   transparency). Whether an image *looks* right is the user's call: show it and ask. Put possible
@@ -142,7 +169,11 @@ and **computed or drawn** (`textures.md`, first table). Then:
 Add layers in the order from `timing.md`, writing every layer's settings in the brief's language turned
 into modules (`unity.md`): bursts, lifetimes as ranges, curves by shape, the dissolve curve on the
 shader knob, blend per layer, budget. "Check each layer" means: the project's tests stay green and one
-look at a sheet for breakage (wrong place, wrong blend, missing) — not a round of taste fixes.
+look at a sheet for breakage (wrong place, wrong blend, missing) — not a round of taste fixes. Also
+check, frame against frame, that the form changes: a drawn element large enough to read as a drawing
+(a patch, a crust, a crown, a splash) that only appears, fades or scales while its drawing stays the
+same is a picture, not an effect (rule 3) — give it a shader stage before showing. Sparks and dust
+that just fade are fine.
 
 Run the project's VFX tests (all of them, by name filter, not a hand-picked list). Red is fixed before
 anything is shown.
