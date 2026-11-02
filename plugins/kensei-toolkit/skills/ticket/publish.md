@@ -107,7 +107,9 @@ whitelist (stopped before 8.4) → nothing to commit.
 7. **Stage, then commit — two Bash calls.** `git add -- <whitelist> [<note files>]`, leaving out
    a path neither on disk nor in the index (`git ls-files --error-unmatch` fails); a non-zero exit
    stops. Then a call beginning with `git commit` (no `cd`, env prefix or chain) so project hooks
-   see it, in the repository's message style (`git log --oneline -10`). One commit per task: a
+   see it, in the repository's message style (`git log --oneline -10`), naming the task as that
+   history does (e.g. `(<task id>)` at the end of the subject) and with its link as the last body
+   line before trailers — no such style in the history → the link alone. One commit per task: a
    repeated commit command on the unpushed branch amends; folding commits is the option
    «Схлопнуть в один коммит [reset] [commit]» (`git reset --soft <base_sha>` + commit); a pushed
    commit is never amended — ask "new commit on top" / "leave it". A rejected commit → `blocked`,

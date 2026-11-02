@@ -24,50 +24,23 @@ TMP = tempfile.mkdtemp(prefix="sessioncommit-test-")
 GITCONFIG = os.path.join(TMP, "gitconfig")
 with open(GITCONFIG, "w") as fh:
     fh.write("[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n")
+TASK_RUNS = os.path.join(TMP, "task-runs")  # the ticket skill's runs root, never the real one
 BASE_ENV = {k: v for k, v in os.environ.items()
-            if not k.startswith(("GIT_", "CLAUDE_"))}
+            if not k.startswith(("GIT_", "CLAUDE_", "KENSEI_"))}
 BASE_ENV.update(GIT_CONFIG_GLOBAL=GITCONFIG, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t",
-                GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
-os.environ.update(GIT_CONFIG_GLOBAL=GITCONFIG, GIT_CONFIG_NOSYSTEM="1")  # for in-process calls
+                GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
+                KENSEI_TASK_RUNS_DIR=TASK_RUNS)
+os.environ.update(GIT_CONFIG_GLOBAL=GITCONFIG, GIT_CONFIG_NOSYSTEM="1",  # in-process calls
+                  KENSEI_TASK_RUNS_DIR=TASK_RUNS)
 CLOCK = itertools.count()
 
 
 def tick():
-    n = next(CLOCK)
-    return f"2026-10-26T10:{n // 60000 % 60:02d}:{n // 1000 % 60:02d}.{n % 1000:03d}Z"
-
-
-def real_tick():
-    """The real time, as a transcript records it: for tests that need the reflog's clock."""
-    now = datetime.datetime.now(datetime.timezone.utc)
-    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
-
-
-def stamp(epoch):
-    """A transcript timestamp for this many seconds since the epoch."""
-    t = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
-    return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
-
-
-class Clock:
-    """A transcript clock set by hand (`clock.at = epoch`), each tick 10 ms on: tests that place
-    tool calls against commits made at a chosen time (commit_at)."""
-
-    def __init__(self, at):
-        self.at = at
-
-    def __call__(self):
-        self.at += 0.01
-        return stamp(self.at)
-
-
-def commit_at(repo, epoch, *args):
-    """git commit made at this time, as the reflog records it."""
-    env = dict(BASE_ENV, GIT_COMMITTER_DATE=f"@{int(epoch)} +0000")
-    proc = subprocess.run(["git", "commit", *args], cwd=repo, env=env, capture_output=True)
-    assert proc.returncode == 0, proc.stderr
-    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, env=BASE_ENV,
-                          capture_output=True, text=True).stdout.strip()
+    """The real clock, a little apart each call: the attribution compares an edit's time with
+    the time of HEAD's commits."""
+    next(CLOCK)
+    time.sleep(0.002)
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 # --- builders ----------------------------------------------------------------------------
@@ -223,19 +196,7 @@ class Transcript:
                                                  "interrupted": False}, text=output, cwd=cwd,
                   between=between, error=error)
 
-    def file_changed(self, path, snippet=""):
-        """Claude Code's note to the agent that a file it read was changed by someone."""
-        self._put({"type": "attachment", "timestamp": self.clock(), "cwd": self.cwd,
-                   "attachment": {"type": "edited_text_file", "filename": path,
-                                  "snippet": snippet}})
 
-    def read_unchanged(self, path):
-        """A Read answered with the stub Claude Code gives when the file did not change."""
-        self.call("Read", {"file_path": path}, {"type": "file_unchanged",
-                                                 "file": {"filePath": path}},
-                  text="File unchanged since last read. The content from the earlier Read "
-                       "tool_result in this conversation is still current — refer to that "
-                       "instead of re-reading.")
 
 
 class Session:
@@ -261,6 +222,7 @@ class Case:
         self.s = Session(self.cfg, self.repo)
         self.t = self.s.main
         self.remote = None
+        self.extra_env = {}
         if remote:
             self.remote = os.path.realpath(mkdir())
             g(self.remote, "init", "-q", "--bare", "-b", "main")
@@ -273,7 +235,7 @@ class Case:
 
     def env(self, sid=None):
         return dict(BASE_ENV, CLAUDE_CONFIG_DIR=self.cfg,
-                    CLAUDE_CODE_SESSION_ID=sid or self.s.sid)
+                    CLAUDE_CODE_SESSION_ID=sid or self.s.sid, **self.extra_env)
 
     def plan(self, *args, repo=None, lang="en", sid=None):
         out = mkdir()
@@ -315,6 +277,15 @@ class Case:
 
 def status_of(plan, path):
     return next(f for f in plan["files"] if f["path"] == path)
+
+
+def named_cmds(plan):
+    """commands.json: {file: the texts of every command naming it, oldest first}."""
+    if not plan["bash_commands"]:
+        return {}
+    with open(plan["bash_commands"], encoding="utf-8") as fh:
+        every = json.load(fh)
+    return {p: [every["commands"][n] for n in idx] for p, idx in every["named_by"].items()}
 
 
 # --- unit: text model --------------------------------------------------------------------
@@ -361,44 +332,6 @@ class TextModel(unittest.TestCase):
 
 # --- attribution -------------------------------------------------------------------------
 
-class ShellHintPlaces(unittest.TestCase):
-    """Which shell commands may have touched a repository (unit, no git writes)."""
-
-    def test_home_forms_pushd_and_unrecorded_cwd(self):
-        home = os.path.realpath(mkdir())
-        repo = os.path.join(home, "proj")
-        os.makedirs(os.path.join(repo, "src"))
-        away = os.path.join(home, "away")
-        os.makedirs(away)
-        old = os.environ.get("HOME")
-        os.environ["HOME"] = home
-        try:
-            cases = [
-                ("touch ~/proj/a.txt", away, True),
-                ("rm -f $HOME/proj/a.txt", away, True),
-                ("rm -f ${HOME}/away/a.txt", repo, False),
-                ("cd ~/proj && touch a.txt", away, True),
-                ("cd src && touch a.txt", repo, True),
-                ("cd ../away && touch a.txt", repo + "/src", True),  # still inside: proj/away
-                ("cd ../../away && touch a.txt", repo + "/src", False),
-                ("pushd /tmp && touch a.txt && popd && touch b.txt", repo, True),
-                ("pushd ~/away && touch a.txt", repo, False),
-                ("touch a.txt", None, True),  # no cwd recorded: cannot be told
-                ("cd ~ && touch a.txt", repo, False),
-                ("git -C ~/proj rm -q a.txt", away, True),
-                ("rsync -a ~/proj/ ~/away/", away, False),
-                ("rsync -a ~/away/ ~/proj/", away, True),
-            ]
-            for cmd, cwd, want in cases:
-                with self.subTest(cmd=cmd, cwd=cwd):
-                    self.assertEqual(sc.touches_repo(cmd, cwd, repo), want)
-        finally:
-            if old is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = old
-
-
 class Attribution(unittest.TestCase):
 
     def test_clean_single_file_edit_is_committed_whole(self):
@@ -443,27 +376,7 @@ class Attribution(unittest.TestCase):
         code, out, err, plan = c.plan()
         self.assertEqual(status_of(plan, "gen.txt")["status"], "unchanged", out)
 
-    def test_workflow_rewrite_of_a_tracked_file_keeps_later_foreign_edits_out(self):
-        c = Case({"a.txt": lines(20)})
-        wf = c.s.subagent("agent-w3", workflow=True)
-        wf.read(c.p("a.txt"))
-        wf.write(c.p("a.txt"), lines(20).replace("line 5\n", "SESSION 5\n"))
-        write_file(c.p("a.txt"), read_file(c.p("a.txt")).replace(b"line 15\n", b"FOREIGN\n"))
-        code, out, err, plan = c.plan()
-        self.assertEqual(status_of(plan, "a.txt")["status"], "partial", out)
-        self.assertEqual(c.apply()[0], 0)
-        self.assertEqual(c.show("a.txt"), lines(20).replace("line 5\n", "SESSION 5\n"))
-        self.assertIn(b"FOREIGN", read_file(c.p("a.txt")))
 
-    def test_workflow_rewrite_overwritten_by_someone_on_the_same_line_is_skipped(self):
-        c = Case({"a.txt": lines(20)})
-        wf = c.s.subagent("agent-w4", workflow=True)
-        wf.read(c.p("a.txt"))
-        wf.write(c.p("a.txt"), lines(20).replace("line 5\n", "SESSION 5\n"))
-        write_file(c.p("a.txt"), read_file(c.p("a.txt")).replace(b"SESSION 5\n", b"FOREIGN\n"))
-        code, out, err, plan = c.plan()
-        st = status_of(plan, "a.txt")
-        self.assertEqual((st["status"], st["reason"]), ("skipped", "notfound"), out)
 
     def test_foreign_hunk_above_the_session_edit_stays_in_the_working_tree(self):
         c = Case({"a.txt": lines(30)})
@@ -497,7 +410,7 @@ class Attribution(unittest.TestCase):
         self.assertEqual(status_of(plan, "a.txt")["status"], "skipped")
         self.assertEqual(status_of(plan, "a.txt")["reason"], "notfound")
         self.assertIn("Skip:     a.txt", out)
-        self.assertEqual(plan["verdict"], "nothing")
+        self.assertEqual(plan["verdict"], "skipped")
 
     def test_adjacent_session_and_foreign_hunks_are_tangled(self):
         c = Case({"a.txt": lines(20)})
@@ -506,7 +419,8 @@ class Attribution(unittest.TestCase):
         code, out, err, plan = c.plan()
         st = status_of(plan, "a.txt")
         self.assertEqual((st["status"], st["reason"]), ("skipped", "tangled"), out)
-        self.assertIn("entangled (lines", out)
+        self.assertIn("entangled with other changes — someone else's, or ones committed outside "
+                      "/commit (lines", out)
 
     def test_foreign_edit_two_lines_away_inside_the_context_is_split_off(self):
         c = Case({"a.txt": lines(20)})
@@ -663,7 +577,9 @@ class Surroundings(unittest.TestCase):
         c.t.bash("rm old.txt")
         code, out, err, plan = c.plan()
         self.assertEqual(plan["files"], [])
-        self.assertIn("$ rm old.txt", out)
+        self.assertEqual(plan["bash_named"], ["old.txt"])
+        self.assertIn("named by this session's shell commands (1 changed or untracked here", out)
+        self.assertNotIn("$ rm", out)
         code, out, err, plan = c.plan("--declare", "old.txt")
         st = status_of(plan, "old.txt")
         self.assertEqual((st["status"], st["how"]), ("commit", "delete"))
@@ -672,17 +588,20 @@ class Surroundings(unittest.TestCase):
         self.assertNotIn("old.txt", g(c.repo, "ls-files"))
         self.assertEqual(g(c.repo, "status", "--porcelain"), "")
 
-    def test_shell_commands_that_may_change_files_are_listed_as_hints(self):
-        c = Case({"a.txt": "a\n"})
-        for cmd in ("sed -i '' 's/a/b/' a.txt", "python3 - <<'EOF'\nopen('a.txt','w')\nEOF",
-                    "echo x > out.txt", "git mv a.txt b.txt", "ls -la 2>/dev/null",
-                    "git status --short", "grep -n foo a.txt | head"):
+    def test_shell_commands_name_the_changed_files_they_mention(self):
+        c = Case({"a.txt": "a\n", "src/b.txt": "b\n", "src/c.txt": "c\n"})
+        write_file(c.p("src/b.txt"), "b by sed\n")
+        write_file(c.p("src/c.txt"), "c by a script\n")
+        write_file(c.p("gen.txt"), "generated\n")
+        for cmd in ("sed -i '' 's/b/B/' src/b.txt", f"python3 gen.py > {c.repo}/gen.txt",
+                    "ls -la 2>/dev/null", "git status --short"):
             c.t.bash(cmd)
         code, out, err, plan = c.plan()
-        self.assertEqual(plan["bash_hints"], [
-            "sed -i '' 's/a/b/' a.txt", "python3 - <<'EOF'\nopen('a.txt','w')\nEOF",
-            "echo x > out.txt", "git mv a.txt b.txt"])
-        self.assertIn("  $ python3 - <<'EOF' open('a.txt','w') EOF\n", out)
+        self.assertEqual(plan["bash_named"], ["src/b.txt", "gen.txt"])  # git status order
+        self.assertEqual(named_cmds(plan), {"src/b.txt": ["sed -i '' 's/b/B/' src/b.txt"],
+                                            "gen.txt": [f"python3 gen.py > {c.repo}/gen.txt"]})
+        self.assertNotIn("$ ", out)
+
 
     def test_edited_file_deleted_later_without_declaration_is_skipped(self):
         c = Case({"a.txt": lines(5)})
@@ -690,6 +609,25 @@ class Surroundings(unittest.TestCase):
         os.remove(c.p("a.txt"))
         code, out, err, plan = c.plan()
         self.assertEqual(status_of(plan, "a.txt")["reason"], "deleted")
+
+    def test_notebook_deleted_after_the_sessions_edit_is_skipped_not_committed(self):
+        c = Case({"nb.ipynb": '{"cells": []}\n', "x.txt": "x\n"}, remote=True)
+        write_file(c.p("nb.ipynb"), '{"cells": [1]}\n')
+        c.t.call("NotebookEdit", {"notebook_path": c.p("nb.ipynb"), "new_source": "1"})
+        os.rename(c.p("nb.ipynb"), c.p("analysis.ipynb"))  # the user renames it
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "nb.ipynb")["status"], "skipped")
+        self.assertEqual(status_of(plan, "nb.ipynb")["reason"], "deleted")
+        self.assertEqual(plan["verdict"], "skipped")
+        self.assertIn("nb.ipynb", g(c.remote, "ls-tree", "--name-only", "main"))
+
+    def test_binary_file_deleted_after_the_sessions_edit_is_skipped_not_committed(self):
+        c = Case({"b.dat": "a\0b\n"})
+        c.t.edit(c.p("b.dat"), "a", "A")
+        os.remove(c.p("b.dat"))
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "b.dat")["status"], "skipped")
+        self.assertEqual(status_of(plan, "b.dat")["reason"], "deleted")
 
     def test_ignored_file_is_skipped(self):
         c = Case({".gitignore": "*.log\n", "a.txt": "a\n"})
@@ -721,6 +659,26 @@ class Surroundings(unittest.TestCase):
         self.assertEqual(c.in_commit(), {"Assets/New/Foo.cs", "Assets/New/Foo.cs.meta",
                                          "Assets/New.meta"})
         self.assertIn("?? Assets/Other.cs.meta", g(c.repo, "status", "--porcelain"))
+
+    def test_new_unity_asset_without_its_meta_is_skipped_until_unity_imports_it(self):
+        c = Case({"ProjectSettings/ProjectVersion.txt": "6000\n", "Assets/Scripts.meta": "g\n",
+                  "Assets/Scripts/Old.cs": "class Old {}\n", "Assets/Scripts/Old.cs.meta": "g\n"})
+        c.t.write(c.p("Assets/Scripts/Shield.cs"), "class Shield {}\n")
+        c.t.write(c.p("Assets/Combat/Hit.cs"), "class Hit {}\n")  # a new folder
+        write_file(c.p("Assets/Combat/Hit.cs.meta"), "g\n")  # but no Assets/Combat.meta yet
+        c.t.write(c.p("Assets/Notes~/todo.md"), "x\n")  # Unity imports nothing under a ~ folder
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "Assets/Scripts/Shield.cs")["reason"], "no-meta")
+        self.assertEqual(status_of(plan, "Assets/Combat/Hit.cs")["reason"], "no-meta")
+        self.assertIn("Skip:     Assets/Scripts/Shield.cs — a new asset with no .meta yet — Unity "
+                      "has not imported it", out)
+        self.assertEqual(status_of(plan, "Assets/Notes~/todo.md")["status"], "commit")
+        write_file(c.p("Assets/Scripts/Shield.cs.meta"), "g\n")  # Unity imported them
+        write_file(c.p("Assets/Combat.meta"), "g\n")
+        self.assertEqual(c.land()[0], 0)
+        self.assertEqual(c.in_commit(), {"Assets/Scripts/Shield.cs", "Assets/Scripts/Shield.cs.meta",
+                                         "Assets/Combat/Hit.cs", "Assets/Combat/Hit.cs.meta",
+                                         "Assets/Combat.meta", "Assets/Notes~/todo.md"})
 
     def test_declared_deletion_takes_its_meta_along(self):
         c = Case({"Assets/Gone.cs": "x\n", "Assets/Gone.cs.meta": "guid: 1\n"})
@@ -789,7 +747,8 @@ class Surroundings(unittest.TestCase):
         c.t.edit(c.p("a.txt"), "line 20", "SESSION")
         write_file(c.p("a.txt"), read_file(c.p("a.txt")).replace(b"line 1\n", b"FOREIGN\n"))
         code, ru, err, plan = c.plan(lang="ru")
-        self.assertIn("Коммит:   да — 1 файл (1 частично: a.txt — чужие правки останутся в "
+        self.assertIn("Коммит:   да — 1 файл (1 частично: a.txt — другие правки (чужие или "
+                      "твои через Bash) останутся в "
                       "рабочем дереве)", ru)
         self.assertIn("Чужое:    не трогаю 1 изменённый файл, 0 неотслеживаемых, staged: 0", ru)
         self.assertIn("В main:   нет — уже на main", ru)
@@ -827,16 +786,31 @@ class Publish(unittest.TestCase):
         self.assertIn("Push:     done — origin/main", out)
         self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
 
-    def test_origin_moved_and_clean_tree_rebases_then_pushes(self):
+    def test_origin_moved_on_main_stops_after_the_commit_and_lands_after_a_merge(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
         clone_and_push(c.remote, {"b.txt": "upstream\n"})
+        g(c.repo, "fetch", "-q")
         c.t.edit(c.p("a.txt"), "line 1", "SESSION")
-        code, out, err = c.land()
-        self.assertEqual(code, 0, out + err)
-        self.assertIn("Rebase:   done", out)
-        self.assertEqual(g(c.remote, "log", "--format=%s", "main").split("\n")[:2],
-                         ["Session work", "upstream change"])
-        self.assertEqual(read_file(c.p("b.txt")), b"upstream\n")
+        code, out, err, plan = c.plan(lang="ru")
+        self.assertIn("origin/main ушёл вперёд на 1 коммит — влей его в main (git merge "
+                      "origin/main) и снова /commit", out)
+        want = ("origin/main is 1 commit ahead — merge it into main (git merge origin/main) and "
+                "run /commit again")
+        code, out, err, plan = c.plan()
+        self.assertEqual(plan["verdict"], "go", out)
+        self.assertIn("Push:     no — will stop after the commit: " + want, out)
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Commit:   done", out)
+        self.assertIn("Push:     stop — " + want, out)
+        self.assertNotIn("Rebase", out)
+        self.assertEqual(read_file(c.p("b.txt")), b"b\n")  # nothing merged by /commit
+        self.assertEqual(g(c.remote, "log", "-1", "--format=%s", "main"), "upstream change\n")
+        g(c.repo, "merge", "-q", "--no-edit", "origin/main")  # the way out the stop names
+        code, out, err, plan = c.plan()
+        self.assertEqual(plan["verdict"], "go", out)
+        self.assertEqual(c.apply()[0], 0)
+        self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
 
     def test_origin_moved_and_dirty_tree_stops_after_commit(self):
         c = Case({"a.txt": lines(30), "b.txt": "b\n"}, remote=True)
@@ -872,20 +846,30 @@ class Publish(unittest.TestCase):
         self.assertIn(b"FEATURE", read_file(c.p("a.txt")))  # the main checkout moved too
         self.assertEqual(g(wt, "branch", "--list", "feature/x").strip(), "* feature/x")
 
-    def test_branch_behind_main_is_rebased_before_main_moves(self):
+    def test_branch_behind_main_stops_naming_the_merge_and_lands_after_it(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"})
         g(c.repo, "checkout", "-q", "-b", "feature")
         g(c.repo, "checkout", "-q", "main")
         write_file(c.p("b.txt"), "main moved\n")
         g(c.repo, "commit", "-qam", "main moved")
         g(c.repo, "checkout", "-q", "feature")
+        main = g(c.repo, "rev-parse", "main")
         c.t.edit(c.p("a.txt"), "line 3", "FEATURE")
-        code, out, err = c.land()
-        self.assertEqual(code, 0, out + err)
-        self.assertIn("Rebase:   done", out)
+        code, out, err, plan = c.plan(lang="ru")
+        self.assertIn("main ушёл вперёд на 1 коммит — влей main в ветку (git merge main) и снова "
+                      "/commit", out)
+        want = ("main is 1 commit ahead — merge main into the branch (git merge main) and run "
+                "/commit again")
+        code, out, err, plan = c.plan()
+        self.assertIn("Into main: no — will stop after the commit: " + want, out)
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Commit:   done", out)
+        self.assertIn("Into main: stop — " + want, out)
+        self.assertEqual(g(c.repo, "rev-parse", "main"), main)
+        g(c.repo, "merge", "-q", "--no-edit", "main")
+        self.assertEqual(c.land()[0], 0)
         self.assertEqual(g(c.repo, "rev-parse", "main"), g(c.repo, "rev-parse", "feature"))
-        self.assertEqual(g(c.repo, "log", "--format=%s", "main").split("\n")[:3],
-                         ["Session work", "main moved", "init"])
 
     def worktree_case(self, files):
         c = Case(files, remote=True)
@@ -914,43 +898,52 @@ class Publish(unittest.TestCase):
         self.assertEqual(read_file(c.p("a.txt")), b"uncommitted in the main checkout\n")
         self.assertEqual(g(c.repo, "rev-parse", "main"), g(c.remote, "rev-parse", "main"))
 
-    def test_repository_that_merges_with_no_ff_gets_a_merge_commit(self):
-        c = self.worktree_case({"a.txt": lines(5), "b.txt": "b\n"})
-        for n in range(2):
-            g(c.repo, "checkout", "-q", "-b", f"old{n}")
-            write_file(c.p("b.txt"), f"b{n}\n")
-            g(c.repo, "commit", "-qam", f"old work {n}")
-            g(c.repo, "checkout", "-q", "main")
-            g(c.repo, "merge", "-q", "--no-ff", "-m", f"Merge old{n}", f"old{n}")
-        g(c.repo, "push", "-q", "origin", "main")
-        g(c.wt, "merge", "-q", "--ff-only", "main")
-        c.t.edit(os.path.join(c.wt, "a.txt"), "line 2", "FEATURE")
-        code, out, err, plan = c.plan(repo=c.wt)
-        self.assertIn("merge --no-ff into main", out)
-        code, out, err = self.apply_in(c, c.wt)
-        self.assertEqual(code, 0, out + err)
-        parents = g(c.repo, "log", "-1", "--format=%P", "main").split()
-        self.assertEqual(len(parents), 2)
-        self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "main"))
 
-    def test_pushed_branch_takes_main_by_merge_not_rebase(self):
+    def test_origin_main_ahead_of_the_branch_stops_and_lands_after_a_merge(self):
         c = self.worktree_case({"a.txt": lines(5), "b.txt": "b\n"})
-        write_file(os.path.join(c.wt, "c.txt"), "earlier own work\n")
-        g(c.wt, "add", "c.txt")
-        g(c.wt, "commit", "-qm", "earlier own work")
-        sha = g(c.wt, "rev-parse", "--short", "HEAD").strip()
-        c.t.bash("git commit -m 'earlier own work'", f"[feature {sha}] earlier own work")
-        g(c.wt, "push", "-q", "-u", "origin", "feature")
         clone_and_push(c.remote, {"b.txt": "upstream\n"})
+        g(c.wt, "fetch", "-q")
         c.t.edit(os.path.join(c.wt, "a.txt"), "line 2", "FEATURE")
+        want = ("origin/main is 1 commit ahead — merge it into the branch (git merge origin/main) "
+                "and run /commit again")
         code, out, err, plan = c.plan(repo=c.wt)
-        self.assertEqual(code, 0, out + err)
+        self.assertIn("Into main: no — will stop after the commit: " + want, out)
+        main = g(c.repo, "rev-parse", "main")
+        code, out, err = self.apply_in(c, c.wt)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Into main: stop — " + want, out)
+        self.assertEqual(g(c.repo, "rev-parse", "main"), main)
+        g(c.wt, "merge", "-q", "--no-edit", "origin/main")
+        c.plan(repo=c.wt)
         code, out, err = self.apply_in(c, c.wt)
         self.assertEqual(code, 0, out + err)
-        self.assertIn("Merge:    done — main merged into branch feature", out)
-        self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.wt, "rev-parse", "HEAD"))
-        self.assertEqual(g(c.remote, "rev-parse", "feature"), g(c.wt, "rev-parse", "HEAD"))
-        self.assertEqual(read_file(c.p("b.txt")), b"upstream\n")
+        tip = g(c.wt, "rev-parse", "HEAD")
+        self.assertEqual((g(c.repo, "rev-parse", "main"), g(c.remote, "rev-parse", "main")),
+                         (tip, tip))
+        self.assertEqual(read_file(c.p("b.txt")), b"upstream\n")  # main's checkout moved too
+
+    def test_main_and_origin_main_both_ahead_name_both_merges(self):
+        c = self.worktree_case({"a.txt": lines(5), "b.txt": "b\n", "c.txt": "c\n"})
+        clone_and_push(c.remote, {"b.txt": "upstream\n"})
+        c.t.edit(c.p("c.txt"), "c\n", "on main\n")  # this session's, committed on main
+        c.plan("--no-push", repo=c.repo)
+        self.assertEqual(c.apply("--no-push")[0], 0)
+        g(c.wt, "fetch", "-q")
+        c.t.edit(os.path.join(c.wt, "a.txt"), "line 2", "FEATURE")
+        code, out, err, plan = c.plan(repo=c.wt)
+        self.assertIn("Into main: no — will stop after the commit: main and origin/main diverged "
+                      "and are both ahead (2 commits) — merge both into the branch (git merge "
+                      "origin/main, then git merge main) and run /commit again", out)
+        code, out, err = self.apply_in(c, c.wt)
+        self.assertEqual(code, 1, out + err)
+        g(c.wt, "merge", "-q", "--no-edit", "origin/main")
+        g(c.wt, "merge", "-q", "--no-edit", "main")
+        c.plan(repo=c.wt)
+        code, out, err = self.apply_in(c, c.wt)
+        self.assertEqual(code, 0, out + err)
+        tip = g(c.wt, "rev-parse", "HEAD")
+        self.assertEqual((g(c.repo, "rev-parse", "main"), g(c.remote, "rev-parse", "main")),
+                         (tip, tip))
 
     def test_no_merge_pushes_the_branch_only(self):
         c = Case({"a.txt": lines(5)}, remote=True)
@@ -984,17 +977,30 @@ class Publish(unittest.TestCase):
         self.assertIn("someone else", out)
         self.assertNotEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
 
-    def test_own_commit_from_a_bash_git_commit_is_published(self):
-        c = Case({"a.txt": lines(5)}, remote=True)
-        write_file(c.p("a.txt"), "committed by the session through bash\n")
-        g(c.repo, "commit", "-qam", "bash commit")
-        sha = g(c.repo, "rev-parse", "--short", "HEAD").strip()
-        c.t.bash("git commit -am 'bash commit'", f"[main {sha}] bash commit\n 1 file changed")
-        code, out, err, plan = c.plan()
-        self.assertEqual(plan["verdict"], "go", out)
-        code, out, err = c.apply()
-        self.assertEqual(code, 0, out + err)
-        self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
+    def test_own_bash_git_commit_is_not_published_and_the_stop_says_why(self):
+        for quiet in (False, True):
+            with self.subTest(quiet=quiet):
+                c = Case({"a.txt": lines(5), "b.txt": "x\ny\n"}, remote=True)
+                c.t.edit(c.p("a.txt"), "line 2", "LINE 2")
+                g(c.repo, "commit", "-qam", "bash commit")
+                sha = g(c.repo, "rev-parse", "--short", "HEAD").strip()
+                c.t.bash("git commit -qam 'bash commit'" if quiet else
+                         "git commit -am 'bash commit'",
+                         "" if quiet else f"[main {sha}] bash commit\n 1 file changed")
+                c.t.edit(c.p("b.txt"), "y", "Y")
+                code, out, err, plan = c.plan()
+                self.assertEqual(plan["verdict"], "go", out)
+                self.assertEqual([f["path"] for f in plan["files"] if f["status"] == "commit"],
+                                 ["b.txt"])
+                self.assertIn("will stop after the commit: main has unpushed commits not made "
+                              "by this session's /commit: " + sha, out)
+                code, out, err = c.apply()
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("Commit:   done", out)
+                self.assertIn("bash commit — not publishing them; review and push them "
+                              "yourself, then run /commit again, or drop them", out)
+                self.assertFalse(has_object(c.remote, sha))
+
 
     def test_unborn_repository_gets_its_first_commit(self):
         c = Case()
@@ -1048,42 +1054,28 @@ def apply_in_process(c, *args, before_commit=None, on_git=None, after_commit=Non
 class WorkflowWrites(unittest.TestCase):
     """A Write over an existing file leaves no patch in a workflow agent's transcript."""
 
-    def test_workflow_write_over_a_file_with_foreign_edits_commits_only_the_agents_change(self):
-        c = Case({"a.txt": lines(20)})
-        write_file(c.p("a.txt"), lines(20).replace("line 15\n", "FOREIGN 15\n"))
-        wf = c.s.subagent("agent-w9", workflow=True)
-        wf.read(c.p("a.txt"))
-        wf.write(c.p("a.txt"), read_file(c.p("a.txt")).decode().replace("line 5\n", "SESSION 5\n"))
-        code, out, err, plan = c.plan()
-        st = status_of(plan, "a.txt")
-        self.assertEqual((st["status"], st["how"]), ("partial", "computed"), out)
-        self.assertEqual(c.apply()[0], 0)
-        self.assertEqual(c.show("a.txt"), lines(20).replace("line 5\n", "SESSION 5\n"))
-        self.assertIn(b"FOREIGN 15", read_file(c.p("a.txt")))
-
-    def test_workflow_write_after_its_own_edits_is_split_from_the_read(self):
-        c = Case({"a.txt": lines(20)})
-        write_file(c.p("a.txt"), lines(20).replace("line 18\n", "FOREIGN 18\n"))
-        wf = c.s.subagent("agent-w8", workflow=True)
-        wf.read(c.p("a.txt"))
-        wf.edit(c.p("a.txt"), "line 2\n", "EDIT 2\n")
-        wf.write(c.p("a.txt"), read_file(c.p("a.txt")).decode().replace("line 9\n", "WRITE 9\n"))
-        code, out, err, plan = c.plan()
-        self.assertEqual(status_of(plan, "a.txt")["status"], "partial", out)
-        self.assertEqual(c.apply()[0], 0)
-        self.assertEqual(c.show("a.txt"), lines(20).replace("line 2\n", "EDIT 2\n")
-                         .replace("line 9\n", "WRITE 9\n"))
-
-    def test_workflow_write_over_an_existing_file_it_never_read_is_skipped(self):
-        c = Case({"a.txt": lines(20)})
-        write_file(c.p("a.txt"), lines(20).replace("line 15\n", "FOREIGN 15\n"))
-        wf = c.s.subagent("agent-w7", workflow=True)
-        wf.write(c.p("a.txt"), read_file(c.p("a.txt")).decode().replace("line 5\n", "SESSION 5\n"))
-        code, out, err, plan = c.plan(lang="ru")
-        st = status_of(plan, "a.txt")
-        self.assertEqual((st["status"], st["reason"]), ("skipped", "rewrite-unknown"), out)
-        self.assertEqual(plan["verdict"], "nothing")
-        self.assertIn("агент переписал файл целиком", out)
+    def test_workflow_write_over_an_existing_file_is_skipped_with_the_reason(self):
+        for how in ("read first", "edited first", "never read"):
+            with self.subTest(how=how):
+                c = Case({"a.txt": lines(20)})
+                write_file(c.p("a.txt"), lines(20).replace("line 15\n", "FOREIGN 15\n"))
+                wf = c.s.subagent("agent-w9", workflow=True)
+                if how == "read first":
+                    wf.read(c.p("a.txt"))
+                elif how == "edited first":
+                    wf.edit(c.p("a.txt"), "line 2\n", "EDIT 2\n")
+                wf.write(c.p("a.txt"),
+                         read_file(c.p("a.txt")).decode().replace("line 5\n", "SESSION 5\n"))
+                code, out, err, plan = c.plan(lang="ru")
+                st = status_of(plan, "a.txt")
+                self.assertEqual((st["status"], st["reason"]), ("skipped", "rewrite-unknown"), out)
+                self.assertEqual(plan["verdict"], "skipped")
+                self.assertIn("Коммит:   нет — правки сессии пропущены (1), см. Пропуск", out)
+                self.assertIn("Чужое:    не трогаю 0 изменённых файлов", out)
+                self.assertIn("Пропуск:  a.txt — агент перезаписал файл целиком, не знаю, что в "
+                              "нём было до этого — передай --declare, если весь файл твой", out)
+                code, out, err, plan = c.plan("--declare", "a.txt")
+                self.assertEqual(status_of(plan, "a.txt")["status"], "commit", out)
 
     def test_workflow_write_over_someone_elses_untracked_file_is_skipped(self):
         c = Case({"a.txt": "a\n"})
@@ -1102,16 +1094,6 @@ class WorkflowWrites(unittest.TestCase):
         self.assertEqual(status_of(plan, "new.txt")["status"], "commit", out)
         self.assertEqual(c.apply()[0], 0)
         self.assertEqual(c.show("new.txt"), "one\ntwo\n")
-
-    def test_read_output_is_parsed_only_when_it_shows_the_whole_file(self):
-        self.assertEqual(sc.read_content({}, "1\ta\n2\tb\n3\t", None), "a\nb\n")
-        self.assertEqual(sc.read_content({}, "     1\ta\n     2\tb", None), "a\nb")
-        self.assertEqual(sc.read_content({}, "1\ta\n2\t\n\n<system-reminder>x</system-reminder>",
-                                         None), "a\n")
-        self.assertIsNone(sc.read_content({"offset": 10}, "10\ta\n", None))
-        self.assertIsNone(sc.read_content({"limit": 5}, "1\ta\n", None))
-        self.assertIsNone(sc.read_content({}, "1\ta\n3\tc\n", None))
-        self.assertIsNone(sc.read_content({}, "1\ta\n... (truncated)", None))
 
 
 class AlreadyCommitted(unittest.TestCase):
@@ -1164,6 +1146,33 @@ class AlreadyCommitted(unittest.TestCase):
         self.assertEqual(c.apply()[0], 0)
         self.assertIn("S2", c.show("a.txt"))
 
+    def test_edits_made_after_the_sessions_own_bash_commit_are_committed(self):
+        body = "".join(f"l{i}\n" for i in range(1, 15))
+        c = Case({"a.txt": body, "b.txt": "x\n"})
+        agent = c.s.subagent("agent-a1")
+        c.t.edit(c.p("a.txt"), "l2\n", "L2 main\n")
+        c.t.bash("git commit -qam wip && npm test", "tests ok\n", between=lambda: (
+            g(c.repo, "commit", "-qam", "wip"), agent.edit(c.p("a.txt"), "l12\n", "L12 agent\n")))
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "a.txt")["status"], "commit", out)
+        self.assertIn("leaving alone 0 modified files", out)
+        self.assertEqual(c.apply()[0], 0)
+        self.assertEqual(c.show("a.txt"), body.replace("l2\n", "L2 main\n")
+                         .replace("l12\n", "L12 agent\n"))
+
+    def test_re_edit_after_a_bash_commit_next_to_a_foreign_change_is_skipped_saying_why(self):
+        c = Case({"a.txt": lines(30)})
+        c.t.edit(c.p("a.txt"), "line 5\n", "S1\n")
+        g(c.repo, "commit", "-qam", "by the session through bash")
+        c.t.bash("git commit -qam x")
+        write_file(c.p("a.txt"), read_file(c.p("a.txt")).replace(b"line 6\n", b"FOREIGN\n"))
+        c.t.edit(c.p("a.txt"), "S1\n", "S2\n")
+        code, out, err, plan = c.plan()
+        st = status_of(plan, "a.txt")
+        self.assertEqual((st["status"], st["reason"]), ("skipped", "tangled"), out)
+        self.assertIn("entangled with other changes — someone else's, or ones committed "
+                      "outside /commit", out)
+
     def test_workflow_deletion_committed_then_a_new_edit_is_committed(self):
         c = Case({"a.txt": lines(20)})
         wf = c.s.subagent("agent-w2", workflow=True)
@@ -1185,15 +1194,6 @@ class AlreadyCommitted(unittest.TestCase):
         self.assertIn("SESSION A", c.show("a.txt"))
         self.assertIn("SESSION B", c.show("a.txt"))
 
-    def test_commit_rebased_by_the_skill_still_counts_as_committed(self):
-        c = Case({"a.txt": lines(10), "b.txt": "b\n"}, remote=True)
-        clone_and_push(c.remote, {"b.txt": "upstream\n"})
-        c.t.edit(c.p("a.txt"), "line 5\n", "SESSION A\n")
-        code, out, err = c.land()
-        self.assertIn("Rebase:   done", out)
-        c.t.edit(c.p("a.txt"), "SESSION A\n", "SESSION B\n")
-        code, out, err, plan = c.plan()
-        self.assertEqual(status_of(plan, "a.txt")["status"], "commit", out)
 
 
 class Lookalikes(unittest.TestCase):
@@ -1264,6 +1264,28 @@ class PathCase(unittest.TestCase):
         st = status_of(plan, "Assets/Scripts/Foo.cs")
         self.assertEqual(st["status"], "commit", out)
 
+    def test_file_or_folder_whose_case_on_disk_differs_from_git_is_skipped_truthfully(self):
+        if not case_insensitive_fs():
+            self.skipTest("case-sensitive filesystem")
+        for lang, want in (("en", "Skip:     Assets/Scripts/A.cs — git tracks it as "
+                                  "Assets/scripts/A.cs — the letter case on disk differs"),
+                           ("ru", "git хранит его как Assets/scripts/A.cs — на диске другой "
+                                  "регистр букв")):
+            c = Case({"Assets/scripts/A.cs": lines(10), "Assets/scripts/B.cs": lines(10),
+                      "pc.cs": lines(5)})
+            os.rename(c.p("Assets/scripts"), c.p("Assets/Scripts"))  # a folder renamed on disk
+            os.rename(c.p("pc.cs"), c.p("PC.cs"))  # a file renamed on disk to its class name
+            self.assertEqual(g(c.repo, "status", "--porcelain"), "")
+            c.t.edit(c.p("Assets/Scripts/A.cs"), "line 3\n", "SESSION 3\n")
+            c.t.edit(c.p("PC.cs"), "line 2\n", "SESSION 2\n")
+            code, out, err, plan = c.plan(lang=lang)
+            self.assertEqual(plan["verdict"], "skipped", out)
+            self.assertEqual((status_of(plan, "PC.cs")["reason"], status_of(plan, "PC.cs")[
+                "detail"]), ("case-disk", "pc.cs"), out)
+            self.assertIn(want, out)
+            self.assertNotIn("untracked before", out)
+            self.assertEqual(plan["foreign"], {"modified": 0, "untracked": 0, "staged": 0}, out)
+
     def test_repository_root_spelt_in_another_case_is_this_repository(self):
         if not case_insensitive_fs():
             self.skipTest("case-sensitive filesystem")
@@ -1290,6 +1312,54 @@ class LineEndings(unittest.TestCase):
         # HEAD's lines all end in LF, so the session's line does too: the CRLF on it came
         # from the conversion, not from the session.
         self.assertEqual(blob.count(b"\r\n"), 0)
+
+    def crlf_case(self):
+        return Case({"a.cs": lines(30).replace("\n", "\r\n"), "b.txt": "b\n"})
+
+    def test_crlf_blob_under_text_auto_is_skipped_not_renormalised(self):
+        c = self.crlf_case()
+        write_file(c.p(".gitattributes"), "* text=auto\n")
+        g(c.repo, "add", ".gitattributes")
+        g(c.repo, "commit", "-qm", "attrs")
+        c.t.edit(c.p("a.cs"), "line 5\n", "SESSION 5\n")
+        c.t.edit(c.p("b.txt"), "b", "B")
+        code, out, err, plan = c.plan()
+        self.assertEqual((status_of(plan, "a.cs")["status"], status_of(plan, "a.cs")["reason"]),
+                         ("skipped", "eol"), out)
+        self.assertIn("Skip:     a.cs — committing it here would rewrite every line ending", out)
+        self.assertEqual(c.apply()[0], 0)
+        self.assertEqual(c.in_commit(), {"b.txt"})
+
+    def test_crlf_blob_under_autocrlf_is_skipped_not_renormalised(self):
+        c = self.crlf_case()
+        g(c.repo, "config", "core.autocrlf", "true")
+        c.t.edit(c.p("a.cs"), "line 5\n", "SESSION 5\n")
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "a.cs")["reason"], "eol", out)
+
+    def test_crlf_blob_under_autocrlf_input_is_skipped_lf_file_still_committed(self):
+        c = self.crlf_case()
+        g(c.repo, "config", "core.autocrlf", "input")
+        c.t.edit(c.p("a.cs"), "line 5\n", "SESSION 5\n")
+        c.t.edit(c.p("b.txt"), "b", "B")
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "a.cs")["reason"], "eol", out)
+        self.assertEqual(c.apply()[0], 0)
+        self.assertEqual(c.in_commit(), {"b.txt"})
+
+
+class HiddenFromStatus(unittest.TestCase):
+
+    def test_assume_unchanged_or_skip_worktree_file_edited_by_session_is_skipped_by_name(self):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            c = Case({"a.txt": lines(5)})
+            g(c.repo, "update-index", flag, "a.txt")
+            c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+            code, out, err, plan = c.plan()
+            self.assertEqual((status_of(plan, "a.txt")["status"], plan["verdict"]),
+                             ("skipped", "skipped"), out)
+            self.assertIn("Skip:     a.txt — marked assume-unchanged/skip-worktree in git", out)
+            self.assertNotIn("no new changes", out)
 
 
 class ForeignSafety(unittest.TestCase):
@@ -1361,7 +1431,7 @@ class ForeignSafety(unittest.TestCase):
         code, out, err, plan = c.plan()
         code, out, err = c.apply()
         self.assertNotIn("FOREIGN 18", g(c.remote, "show", "main:a.txt"))
-        self.assertIn("not this session's", out)
+        self.assertIn("not made by this session's /commit", out)
 
     def test_merge_started_between_plan_and_apply_makes_the_plan_stale(self):
         c = Case({"a.txt": lines(10), "b.txt": lines(10)})
@@ -1449,6 +1519,26 @@ class ForeignSafety(unittest.TestCase):
                          read_file(c.p("src/gen/new.cs")).decode())
         self.assertEqual(g(c.repo, "status", "--porcelain"), "?? src/gen/notes.txt\n")
 
+    def test_new_files_of_a_declared_folder_get_a_skip_line_not_a_foreign_count(self):
+        for lang, want, foreign in (
+                ("en", "Skip:     new files in declared folders not taken (2: gen/x.txt, "
+                       "gen/y.txt) — not created by this session's edits; --declare each of yours "
+                       "by its path", "Foreign:  leaving alone 0 modified files, 1 untracked"),
+                ("ru", "Пропуск:  не взяты новые файлы в объявленных папках (2: gen/x.txt, "
+                       "gen/y.txt) — их создала не правка сессии; передай --declare каждого "
+                       "своего по пути", "Чужое:    не трогаю 0 изменённых файлов, 1 "
+                                         "неотслеживаемый")):
+            with self.subTest(lang=lang):
+                c = Case({"gen/a.txt": "a\n"})
+                c.t.edit(c.p("gen/a.txt"), "a", "A")
+                write_file(c.p("gen/x.txt"), "x\n")
+                write_file(c.p("gen/y.txt"), "y\n")
+                write_file(c.p("other.txt"), "someone\n")
+                code, out, err, plan = c.plan("--declare", "gen", lang=lang)
+                self.assertEqual(code, 0, out + err)
+                self.assertIn(want, out)
+                self.assertIn(foreign, out)
+
     def test_declared_folder_of_only_untracked_session_files_is_not_reported_unchanged(self):
         c = Case({"a.txt": "a\n"})
         c.t.write(c.p("tools/gen.py"), "print(1)\n")
@@ -1525,21 +1615,25 @@ class BranchFlows(unittest.TestCase):
         self.assertNotIn("Traceback", err)
         self.assertTrue(os.path.exists(os.path.join(c.run_dir, "result.json")))
 
-    def test_local_main_ahead_by_own_commits_and_behind_origin_is_published(self):
+    def test_local_main_ahead_by_own_commits_and_behind_origin_stops_then_lands(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
         g(c.repo, "checkout", "-q", "-b", "feature")
         c.t.edit(c.p("a.txt"), "line 3", "FEATURE")
         self.assertEqual(c.land("--no-push")[0], 0)
         clone_and_push(c.remote, {"b.txt": "upstream\n"})
+        g(c.repo, "fetch", "-q")
         code, out, err, plan = c.plan()
-        self.assertEqual(plan["verdict"], "go", out)
-        code, out, err = c.apply()
+        self.assertEqual((code, plan["verdict"]), (1, "stop"), out)
+        self.assertIn("Push:     no — stop: origin/main is 1 commit ahead — merge it into the "
+                      "branch (git merge origin/main) and run /commit again", out)
+        g(c.repo, "merge", "-q", "--no-edit", "origin/main")
+        code, out, err = c.land()
         self.assertEqual(code, 0, out + err)
         self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "main"))
         self.assertIn("FEATURE", g(c.remote, "show", "main:a.txt"))
         self.assertEqual(g(c.remote, "show", "main:b.txt"), "upstream\n")
 
-    def test_push_that_lost_a_race_lands_on_the_rerun_it_asks_for(self):
+    def test_push_that_lost_a_race_names_the_way_out_and_lands_after_it(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
         other = os.path.realpath(mkdir())
         g(other, "clone", "-q", c.remote, ".")
@@ -1554,7 +1648,12 @@ class BranchFlows(unittest.TestCase):
         c.t.edit(c.p("a.txt"), "line 3", "FEATURE")
         code, out, err = c.land()
         self.assertEqual(code, 1, out + err)
-        self.assertIn("run /commit again", out)
+        self.assertIn("origin got new commits meanwhile; run /commit again", out)
+        code, out, err, plan = c.plan()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("origin/main is 1 commit ahead — merge it into the branch (git merge "
+                      "origin/main) and run /commit again", out)
+        g(c.repo, "merge", "-q", "--no-edit", "origin/main")
         code, out, err = c.land()
         self.assertEqual(code, 0, out + err)
         self.assertEqual(g(c.remote, "show", "main:b.txt"), "teammate\n")
@@ -1565,10 +1664,8 @@ class BranchFlows(unittest.TestCase):
         clone_and_push(c.remote, {"b.txt": "upstream\n"})
         g(c.repo, "fetch", "-q")
         g(c.repo, "checkout", "-q", "-b", "feature", "--no-track", "origin/main")
-        write_file(c.p("a.txt"), lines(5).replace("line 1", "own"))
-        g(c.repo, "commit", "-qam", "own via bash")
-        sha = g(c.repo, "rev-parse", "--short", "HEAD").strip()
-        c.t.bash("git commit -am 'own via bash'", f"[feature {sha}] own via bash")
+        c.t.edit(c.p("a.txt"), "line 1", "own")
+        self.assertEqual(c.land("--no-merge", "--no-push")[0], 0)
         code, out, err, plan = c.plan()
         self.assertEqual(code, 0, out + err)
         self.assertNotIn("upstream change", out)
@@ -1601,15 +1698,22 @@ class BranchFlows(unittest.TestCase):
         self.assertEqual(code, 0, out + err)
         self.assertEqual(plan["verdict"], "nothing")
 
-    def test_branch_without_a_local_main_creates_main(self):
+    def test_branch_without_a_local_main_stops_naming_how_to_create_it(self):
         c = Case({"a.txt": lines(5)}, remote=True)
         g(c.repo, "checkout", "-q", "-b", "feature")
         g(c.repo, "branch", "-q", "-D", "main")
         c.t.edit(c.p("a.txt"), "line 3", "FEATURE")
-        code, out, err = c.land("--no-push")
-        self.assertEqual(code, 0, out + err)
-        self.assertIn("Into main: done — created main", out)
-        self.assertEqual(g(c.repo, "rev-parse", "main"), g(c.repo, "rev-parse", "feature"))
+        want = ("there is no local main branch — create it (git branch main origin/main) and run "
+                "/commit again; or /commit no-merge")
+        code, out, err, plan = c.plan()
+        self.assertIn("Into main: no — will stop after the commit: " + want, out)
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Into main: stop — " + want, out)
+        self.assertEqual(g(c.repo, "branch", "--list", "main"), "")
+        g(c.repo, "branch", "main", "origin/main")
+        self.assertEqual(c.land()[0], 0)
+        self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "feature"))
 
     def test_no_merge_with_teammate_commits_on_the_origin_branch_says_to_pull(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
@@ -1649,41 +1753,13 @@ class BranchFlows(unittest.TestCase):
         self.assertEqual(code, 0, out + err)
         self.assertNotIn("after a rebase", out)
 
-    def test_branch_pushed_without_upstream_takes_main_by_merge(self):
-        c = Case({"a.txt": lines(5), "b.txt": "b\n", "c.txt": "c\n"}, remote=True)
-        g(c.repo, "checkout", "-q", "-b", "feature")
-        write_file(c.p("c.txt"), "earlier own work\n")
-        g(c.repo, "commit", "-qam", "earlier own work")
-        sha = g(c.repo, "rev-parse", "HEAD").strip()
-        c.t.bash("git commit -am 'earlier own work'", f"[feature {sha[:7]}] earlier own work")
-        g(c.repo, "push", "-q", "origin", "feature")
-        clone_and_push(c.remote, {"b.txt": "upstream\n"})
-        c.t.edit(c.p("a.txt"), "line 2", "FEATURE")
-        c.plan()
-        code, out, err = c.apply()
-        self.assertEqual(code, 0, out + err)
-        self.assertNotIn("Rebase:", out)
-        g(c.repo, "merge-base", "--is-ancestor", sha, "main")  # the published commit kept its id
 
-    def test_rebase_blocked_by_an_untracked_file_shows_gits_reason(self):
-        c = Case({"a.txt": lines(5)}, remote=True)
-        clone_and_push(c.remote, {"new.txt": "from upstream\n"})
-        write_file(c.p("new.txt"), "someone's untracked draft\n")
-        c.t.edit(c.p("a.txt"), "line 1", "SESSION")
-        c.plan()
-        code, out, err = c.apply()
-        self.assertEqual(code, 1, out + err)
-        self.assertIn("untracked working tree files would be overwritten", out)
-        self.assertNotIn("conflict", out)
-        self.assertEqual(read_file(c.p("new.txt")), b"someone's untracked draft\n")
 
-    def test_sessions_own_bash_merge_of_origin_main_is_not_foreign(self):
+    def test_merge_of_origin_main_into_the_branch_is_not_foreign(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
         g(c.repo, "checkout", "-q", "-b", "feature")
-        write_file(c.p("a.txt"), lines(5).replace("line 1", "own earlier"))
-        g(c.repo, "commit", "-qam", "own earlier")
-        sha = g(c.repo, "rev-parse", "--short", "HEAD").strip()
-        c.t.bash("git commit -am 'own earlier'", f"[feature {sha}] own earlier\n 1 file changed")
+        c.t.edit(c.p("a.txt"), "line 1", "own earlier")
+        self.assertEqual(c.land("--no-merge", "--no-push")[0], 0)
         clone_and_push(c.remote, {"b.txt": "upstream\n"})
         g(c.repo, "fetch", "-q")
         c.t.bash("git merge --no-edit origin/main", g(c.repo, "merge", "--no-edit", "origin/main"))
@@ -1692,6 +1768,7 @@ class BranchFlows(unittest.TestCase):
         code, out, err = c.apply()
         self.assertEqual(code, 0, out + err)
         self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "feature"))
+
 
     def test_commits_are_recorded_under_every_session_id(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
@@ -1716,7 +1793,7 @@ class BranchFlows(unittest.TestCase):
         c.t.edit(c.p("a.txt"), "line 3", "FEATURE")
         code, out, err = c.land("--no-push")
         self.assertEqual(code, 1, out + err)
-        self.assertIn("Into main: stop — no network", out)
+        self.assertIn("Into main: stop — fetch failed (", out)
         self.assertIn("Push:     no — as asked", out)
 
     def test_plan_names_foreign_history_before_pushing_to_a_new_origin(self):
@@ -1726,14 +1803,14 @@ class BranchFlows(unittest.TestCase):
         g(c.repo, "remote", "add", "origin", remote)
         c.t.edit(c.p("a.txt"), "line 1", "SESSION")
         code, out, err, plan = c.plan()
-        self.assertIn("will stop after the commit: main has unpushed commits that are not this "
-                      "session's", out)
+        self.assertIn("will stop after the commit: main has unpushed commits not made by "
+                      "this session's /commit", out)
         g(c.repo, "checkout", "-q", "-b", "feature")  # the same from a branch going into main
         code, out, err, plan = c.plan()
-        self.assertIn("will stop after the commit: main has unpushed commits that are not this "
-                      "session's", out)
+        self.assertIn("will stop after the commit: main has unpushed commits not made by "
+                      "this session's /commit", out)
         code, out, err = c.apply()
-        self.assertIn("main has unpushed commits that are not this session's", out)
+        self.assertIn("main has unpushed commits not made by this session's /commit", out)
         self.assertEqual(g(remote, "branch", "--list"), "")
 
     def test_orphan_branch_is_committed_and_pushed_without_merging(self):
@@ -1753,64 +1830,43 @@ class BranchFlows(unittest.TestCase):
 
 class SkillOutput(unittest.TestCase):
 
-    def test_shell_hints_keep_the_newest_commands_whole_and_name_files_left_out(self):
-        c = Case({"a.txt": "a\n", "scripts/check.sh": "echo 1\n"})
+    def test_shell_commands_of_every_agent_name_files_left_out(self):
+        c = Case({"a.txt": "a\n", "scripts/check.sh": "echo 1\n", "docs/notes.md": "n\n"})
         for n in range(45):
             c.t.bash(f"echo {n} > /dev/null; touch /tmp/x{n}")
-        agent = c.s.subagent("agent-a0")  # sorts before nothing in particular; runs last
+        agent = c.s.subagent("agent-a0")
         write_file(c.p("scripts/check.sh"), "echo 1\necho 2\n")
         agent.bash("python3 - <<'EOF'\n" + "x = 1\n" * 60 +
                    "p = \"scripts/check.sh\"\nopen(p, 'a').write('echo 2\\n')\nEOF")
+        wf = c.s.subagent("agent-w1", workflow=True)
+        write_file(c.p("docs/notes.md"), "n2\n")
+        wf.bash("sed -i '' s/n/n2/ notes.md && false", "Exit code 1", error=True)
+        rejected = c.s.subagent("agent-a2")
+        write_file(c.p("untouched.txt"), "someone's\n")
+        rejected.bash("rm untouched.txt", "The user doesn't want to proceed with this tool use.",
+                      error=True)
         c.t.edit(c.p("a.txt"), "a", "A")
         code, out, err, plan = c.plan()
-        self.assertIn('p = "scripts/check.sh"', plan["bash_hints"][-1])
-        self.assertEqual(plan["bash_named"], ["scripts/check.sh"])
-        self.assertIn("named by this session's shell commands", out)
+        # the refused rm never ran: untouched.txt is not named; the failed sed is, marked
+        self.assertEqual(plan["bash_named"], ["docs/notes.md", "scripts/check.sh"])
+        self.assertEqual(named_cmds(plan)["docs/notes.md"],
+                         ["[failed] sed -i '' s/n/n2/ notes.md && false"])
+        self.assertEqual(sorted(named_cmds(plan)), plan["bash_named"])
+        self.assertIn('p = "scripts/check.sh"', named_cmds(plan)["scripts/check.sh"][0])
+        self.assertIn("named by this session's shell commands (2 changed or untracked here", out)
 
-    def test_shell_hints_list_only_commands_that_may_touch_this_repository(self):
-        c = Case({"a.txt": "a\n", "src/a.txt": "a\n"})
-        repo, away = c.repo, os.path.realpath(mkdir())
-        write_file(c.p("notes.txt"), "someone's notes\n")
-        inside = [
-            (f"cd {repo}/src && sed -i '' 's/a/b/' a.txt", away),
-            (f"echo x > {repo}/gen.txt", away),
-            ("git mv a.txt b.txt", repo),
-            (f"S={repo}/src; touch $S/new.txt", away),
-            (f"python3 - <<'EOF'\nopen('{repo}/y.txt', 'w')\nEOF", away),
-            (f"cd {away}; cd {repo} && rm -f stale.txt", repo),
-        ]
-        outside = [
-            ("rm -rf build && touch notes.txt", away),
-            (f"cd {away} && sed -i '' 's/a/b/' notes.txt", repo),
-            (f"cp {repo}/a.txt {away}/copy.txt", away),
-            (f"rm -rf {away}/tmp", repo),
-            (f"cat > {away}/s.py <<'EOF'\nprint('{repo}/x')\nEOF", repo),
-            ("ls -la | tee /dev/null; grep -n a a.txt | head", repo),
-            (f'cd "$(mktemp -d)" && git init && echo x > a.txt', repo),
-        ]
-        for cmd, cwd in inside + outside:
-            c.t.bash(cmd, cwd=cwd)
-        code, out, err, plan = c.plan()
-        self.assertEqual(plan["bash_hints"], [cmd for cmd, _ in inside])
-        self.assertEqual(plan["bash_hints_elsewhere"], len(outside))
-        self.assertIn(f"bash_hints ({len(inside)} run in this repository or naming a path in "
-                      f"it; {len(outside)} run elsewhere left out;", out)
-        self.assertNotIn("notes.txt", plan["bash_named"])
-        self.assertNotIn(away + "/tmp", out)
 
-    def test_shell_hints_print_only_the_newest_few(self):
+    def test_named_files_are_listed_up_to_twenty_with_the_total(self):
         c = Case({"a.txt": "a\n"})
-        for n in range(sc.SHOW_HINTS + 5):
-            c.t.bash(f"touch gen{n}.txt")
-        c.t.bash(f"touch gen1.txt")  # run again: listed once, at its newest run
+        for n in range(25):
+            write_file(c.p(f"gen/f{n:02d}.txt"), "x\n")
+            c.t.bash(f"python3 make.py > gen/f{n:02d}.txt")
         code, out, err, plan = c.plan()
-        total = sc.SHOW_HINTS + 5
-        self.assertEqual(plan["bash_hints_total"], total)
-        self.assertEqual(plan["bash_hints"][-1], "touch gen1.txt")
-        self.assertIn(f"bash_hints ({total} run in this repository or naming a path in it, "
-                      f"newest {sc.SHOW_HINTS} shown, {total} in plan.json;", out)
-        self.assertEqual(sum(1 for ln in out.split("\n") if ln.startswith("  $ ")),
-                         sc.SHOW_HINTS)
+        self.assertEqual(len(plan["bash_named"]), 25)
+        self.assertEqual(len(named_cmds(plan)), 25)
+        self.assertIn("gen/f19.txt … (20 of 25 shown; all in plan.json bash_named)", out)
+
+
 
     def test_skip_reasons_read_in_the_users_language(self):
         c = Case({"a.txt": "a\n"})
@@ -1872,52 +1928,6 @@ def plan_in_process(cwd, c, *args, temp=None):
     return code, out.getvalue(), err.getvalue()
 
 
-class StaleReads(unittest.TestCase):
-    """A workflow agent's Write is split by its last view of the file: that view must be one
-    that still shows the file."""
-
-    def test_workflow_write_after_a_file_changed_reminder_is_skipped(self):
-        c = Case({"a.txt": lines(20)})
-        wf = c.s.subagent("agent-w1", workflow=True)
-        wf.read(c.p("a.txt"))
-        foreign = lines(20).replace("line 15\n", "FOREIGN 15\n")
-        write_file(c.p("a.txt"), foreign)
-        wf.file_changed(c.p("a.txt"), "15\tFOREIGN 15")
-        wf.write(c.p("a.txt"), foreign.replace("line 5\n", "SESSION 5\n"))
-        code, out, err, plan = c.plan()
-        st = status_of(plan, "a.txt")
-        self.assertEqual((st["status"], st["reason"]), ("skipped", "rewrite-unknown"), out)
-        self.assertEqual(plan["verdict"], "nothing")
-
-    def test_full_reread_mentioning_unchanged_since_is_the_view_the_write_is_split_by(self):
-        head = "# Changelog\n\n" + lines(20)
-        c = Case({"CHANGELOG.md": head})
-        wf = c.s.subagent("agent-w1", workflow=True)
-        wf.read(c.p("CHANGELOG.md"))
-        foreign = head.replace("# Changelog\n", "# Changelog\n\n- config format unchanged since "
-                                                "1.4\n")
-        write_file(c.p("CHANGELOG.md"), foreign)
-        wf.read(c.p("CHANGELOG.md"))
-        wf.write(c.p("CHANGELOG.md"), foreign.replace("line 10\n", "SESSION 10\n"))
-        code, out, err, plan = c.plan()
-        self.assertEqual(status_of(plan, "CHANGELOG.md")["status"], "partial", out)
-        self.assertEqual(c.apply("--no-push")[0], 0)
-        self.assertEqual(c.show("CHANGELOG.md"), head.replace("line 10\n", "SESSION 10\n"))
-        self.assertIn(b"unchanged since 1.4", read_file(c.p("CHANGELOG.md")))
-
-    def test_read_saying_unchanged_since_last_read_falls_back_to_the_read_before_it(self):
-        c = Case({"a.txt": lines(20)})
-        write_file(c.p("a.txt"), lines(20).replace("line 15\n", "FOREIGN 15\n"))
-        wf = c.s.subagent("agent-w1", workflow=True)
-        wf.read(c.p("a.txt"))
-        wf.read_unchanged(c.p("a.txt"))
-        wf.write(c.p("a.txt"), read_file(c.p("a.txt")).decode().replace("line 5\n", "SESSION 5\n"))
-        code, out, err, plan = c.plan()
-        self.assertEqual(status_of(plan, "a.txt")["status"], "partial", out)
-        self.assertEqual(c.apply("--no-push")[0], 0)
-        self.assertEqual(c.show("a.txt"), lines(20).replace("line 5\n", "SESSION 5\n"))
-
-
 class GitSpelling(unittest.TestCase):
     """Paths as git spells them: NFC on macOS, git's letter case for a deleted file."""
 
@@ -1975,56 +1985,10 @@ class GitSpelling(unittest.TestCase):
 
 
 class OwnWork(unittest.TestCase):
-    """What the session did itself is the session's: quiet commits, failed shell commands,
-    its own staging, its own chmod."""
+    """What the session did itself: its own staging and its own chmod."""
 
-    def test_quiet_bash_git_commit_is_the_sessions_own(self):
-        c = Case({"a.txt": "one\ntwo\nthree\n", "b.txt": "x\ny\n"}, remote=True)
-        c.t.clock = real_tick
-        c.t.edit(c.p("a.txt"), "two", "TWO")
-        c.t.bash("git commit -qam 'session commit quiet'", "",
-                 between=lambda: g(c.repo, "commit", "-qam", "session commit quiet"))
-        time.sleep(0.01)
-        c.t.edit(c.p("b.txt"), "y", "Y")
-        code, out, err, plan = c.plan()
-        self.assertEqual(plan["verdict"], "go", out)
-        self.assertIn("Push:     yes — origin/main", out)
-        self.assertEqual(sorted(f["path"] for f in plan["files"] if f["status"] == "commit"),
-                         ["b.txt"])
-        self.assertEqual(c.apply()[0], 0)
-        self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
 
-    def test_fast_forward_in_a_quiet_command_does_not_make_the_commit_own(self):
-        c = Case({"a.txt": "a\n", "b.txt": "b\n"})
-        g(c.repo, "checkout", "-q", "-b", "other")
-        write_file(c.p("b.txt"), "someone's\n")
-        g(c.repo, "commit", "-qam", "someone's commit")
-        g(c.repo, "checkout", "-q", "main")
-        time.sleep(1.1)  # the reflog keeps whole seconds: someone's commit, then the session's run
-        c.t.clock = real_tick
-        c.t.bash("git merge -q other", "", between=lambda: g(c.repo, "merge", "-q", "other"))
-        sha = g(c.repo, "rev-parse", "HEAD").strip()
-        code, out, err, plan = c.plan()
-        self.assertNotIn(sha, plan["own_commits"])
 
-    def test_failed_shell_command_still_gives_hints_and_commit_ids(self):
-        c = Case({"a.txt": "one\ntwo\n", "b.txt": "x\ny\n"}, remote=True)
-        c.t.edit(c.p("a.txt"), "two", "TWO")
-        write_file(c.p("b.txt"), "x\nY\n")
-        c.t.bash("sed -i '' s/y/Y/ b.txt && grep -c zzz b.txt", "Exit code 1\n0", error=True)
-        code, out, err, plan = c.plan()
-        self.assertIn("sed -i '' s/y/Y/ b.txt && grep -c zzz b.txt", plan["bash_hints"])
-        self.assertIn("b.txt", plan["bash_named"])
-        c = Case({"a.txt": "one\ntwo\n", "b.txt": "x\ny\n"}, remote=True)
-        c.t.edit(c.p("a.txt"), "two", "TWO")
-        g(c.repo, "commit", "-qam", "session work")
-        sha = g(c.repo, "rev-parse", "--short", "HEAD").strip()
-        c.t.bash("git commit -am 'session work' && git push", f"Exit code 1\n[main {sha}] session "
-                 "work\n 1 file changed\n ! [rejected] main -> main (fetch first)", error=True)
-        c.t.edit(c.p("b.txt"), "y", "Y")
-        code, out, err, plan = c.plan()
-        self.assertEqual(plan["verdict"], "go", out)
-        self.assertNotIn("not this session's", out)
 
     def test_sessions_own_git_mv_rm_and_add_do_not_block(self):
         for how in ("mv", "rm", "add"):
@@ -2057,7 +2021,7 @@ class OwnWork(unittest.TestCase):
         os.chmod(c.p("run.sh"), 0o755)
         c.t.bash("chmod +x run.sh")
         code, out, err, plan = c.plan()
-        self.assertEqual(plan["bash_hints"], ["chmod +x run.sh"])
+        self.assertEqual(named_cmds(plan), {"run.sh": ["chmod +x run.sh"]})
         self.assertEqual(plan["bash_named"], ["run.sh"])
         self.assertEqual(plan["mode_left"], ["run.sh"])
         self.assertIn("Foreign:  leaving alone 1 modified file", out)
@@ -2078,19 +2042,6 @@ class OwnWork(unittest.TestCase):
         self.assertNotIn("Skip:", out)
         self.assertEqual(plan["verdict"], "nothing")
 
-    def test_bash_commit_rebased_by_the_skill_still_counts_as_committed(self):
-        c = Case({"a.txt": lines(10), "b.txt": "b\n", "c.txt": "c\n"}, remote=True)
-        c.t.edit(c.p("a.txt"), "line 5\n", "S1\n")
-        g(c.repo, "commit", "-qam", "bash commit")
-        sha = g(c.repo, "rev-parse", "--short", "HEAD").strip()
-        c.t.bash("git commit -am 'bash commit'", f"[main {sha}] bash commit\n 1 file changed")
-        clone_and_push(c.remote, {"c.txt": "upstream\n"})
-        c.t.edit(c.p("b.txt"), "b\n", "B\n")
-        code, out, err = c.land()
-        self.assertIn("Rebase:   done", out)
-        c.t.edit(c.p("a.txt"), "S1\n", "S2\n")
-        code, out, err, plan = c.plan()
-        self.assertEqual(status_of(plan, "a.txt")["status"], "commit", out)
 
     def test_session_line_stays_lf_when_someone_converts_the_file_to_crlf(self):
         c = Case({"a.txt": lines(20)})
@@ -2105,25 +2056,14 @@ class OwnWork(unittest.TestCase):
 
 class SafeFlows(unittest.TestCase):
 
-    def test_rebase_never_overwrites_an_ignored_file(self):
-        c = Case({"a.txt": lines(5), ".gitignore": "local.env\n"}, remote=True)
-        write_file(c.p("local.env"), "TOKEN=secret\n")
-        clone_and_push(c.remote, {".gitignore": "", "local.env": "TOKEN=template\n"})
-        c.t.edit(c.p("a.txt"), "line 1", "SESSION")
-        c.plan()
-        code, out, err = c.apply()
-        self.assertEqual(code, 1, out + err)
-        self.assertIn("Rebase:   stop — origin/main starts tracking files that are git-ignored "
-                      "here: local.env", out)
-        self.assertEqual(read_file(c.p("local.env")), b"TOKEN=secret\n")
-        self.assertEqual(g(c.repo, "log", "-1", "--format=%s"), "Session work\n")
 
     def test_main_fast_forward_never_overwrites_an_ignored_file_in_mains_checkout(self):
         c = Case({"a.txt": lines(5), ".gitignore": ".vscode/\n"}, remote=True)
         write_file(c.p(".vscode/settings.json"), '{"personal":"mine"}\n')
         clone_and_push(c.remote, {".gitignore": "", ".vscode/settings.json": '{"team":1}\n'})
+        g(c.repo, "fetch", "-q")
         wt = os.path.join(os.path.realpath(mkdir()), "wt")
-        g(c.repo, "worktree", "add", "-q", "-b", "feat", wt)
+        g(c.repo, "worktree", "add", "-q", "-b", "feat", wt, "origin/main")
         c.s = Session(c.cfg, wt)
         c.t = c.s.main
         c.t.edit(os.path.join(wt, "a.txt"), "line 2", "FEATURE")
@@ -2136,20 +2076,6 @@ class SafeFlows(unittest.TestCase):
         self.assertIn("main not moved", proc.stdout)
         self.assertEqual(read_file(c.p(".vscode/settings.json")), b'{"personal":"mine"}\n')
 
-    def test_rebased_commits_are_recorded_before_the_push(self):
-        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
-        clone_and_push(c.remote, {"b.txt": "upstream\n"})
-        c.t.edit(c.p("a.txt"), "line 1", "SESSION")
-        c.plan()
-        seen = {}
-
-        def at_push(a):
-            if "push" in a and not seen:
-                seen["records"] = sc.load_records(c.cfg, [c.s.sid])
-                seen["head"] = g(c.repo, "rev-parse", "HEAD").strip()
-        self.assertEqual(apply_in_process(c, on_git=at_push), 0)
-        self.assertIn(seen["head"], seen["records"]["commits"])
-        self.assertIn(seen["head"], seen["records"]["rewritten"].values())
 
     def test_index_left_stale_by_a_locked_commit_is_put_back_on_the_next_run(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
@@ -2173,6 +2099,23 @@ class SafeFlows(unittest.TestCase):
         g(c.repo, "add", "b.txt")
         g(c.repo, "commit", "-qm", "person's commit")
         self.assertIn("LINE 3", c.show("a.txt"))
+
+    def test_new_files_left_out_of_a_locked_index_are_not_counted_foreign(self):
+        c = Case({"a.txt": lines(5)})
+        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+        c.t.write(c.p("n1.txt"), "n1\n")
+        c.t.write(c.p("n2.txt"), "n2\n")
+        c.plan()
+        write_file(c.p(".git/index.lock"), "")
+        try:
+            self.assertEqual(c.apply()[0], 1)
+        finally:
+            os.remove(c.p(".git/index.lock"))
+        code, out, err, plan = c.plan()
+        self.assertEqual(plan["foreign"], {"modified": 0, "untracked": 0, "staged": 0}, out)
+        self.assertEqual(plan["bash_named"], [])
+        self.assertEqual(c.apply()[0], 0)
+        self.assertEqual(g(c.repo, "status", "--porcelain"), "")
 
     def test_stale_index_alone_is_still_put_back_without_a_remote(self):
         c = Case({"a.txt": lines(5)})
@@ -2200,27 +2143,6 @@ class SafeFlows(unittest.TestCase):
         self.assertEqual(g(c.repo, "rev-parse", "main"), head)
         self.assertEqual(g(c.remote, "rev-parse", "main"), head)
 
-    def test_branch_push_blocked_by_teammate_commits_names_them(self):
-        c = Case({"a.txt": lines(5), "b.txt": "b\n", "c.txt": "c\n"}, remote=True)
-        g(c.repo, "checkout", "-q", "-b", "feat")
-        g(c.repo, "push", "-q", "-u", "origin", "feat")
-        other = os.path.realpath(mkdir())
-        g(other, "clone", "-q", c.remote, ".")
-        g(other, "checkout", "-q", "feat")
-        write_file(os.path.join(other, "c.txt"), "teammate\n")
-        g(other, "commit", "-qam", "teammate on feat")
-        g(other, "push", "-q", "origin", "feat")
-        g(other, "checkout", "-q", "main")
-        write_file(os.path.join(other, "b.txt"), "upstream\n")
-        g(other, "commit", "-qam", "upstream main")
-        g(other, "push", "-q", "origin", "main")
-        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
-        c.plan()
-        code, out, err = c.apply()
-        self.assertEqual(code, 0, out + err)
-        self.assertIn("origin/feat has 1 commit that are not in the branch: ", out)
-        self.assertIn("teammate on feat — pull them into the branch", out)
-        self.assertNotIn("after a rebase", out)
 
     def test_prepared_squash_or_cherry_pick_message_is_never_deleted(self):
         for how in ("squash", "cherry"):
@@ -2271,21 +2193,22 @@ class Surfaces(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("edited files only in 1 temporary clone (left alone)", err)
 
-    def test_unity_batchmode_run_on_the_project_is_a_shell_hint(self):
-        repo = os.path.realpath(mkdir())
-        cmd = ("/Applications/Unity/Hub/Editor/6000.0.1f1/Unity.app/Contents/MacOS/Unity "
-               f"-batchmode -quit -projectPath {repo} -executeMethod Build.Tables")
-        self.assertTrue(sc.HINT_RE.search(cmd))
-        self.assertTrue(sc.touches_repo(cmd, mkdir(), repo))
 
-    def test_file_names_are_matched_as_whole_words(self):
-        cmds = ["sed -i '' s/a/b/ src/check.sh", "touch ~/x/notes.txt.bak", "rm -f my file.txt"]
-        words = sc.name_words(cmds)
-        for rel, want in (("scripts/check.sh", True), ("check.sh", True), ("notes.txt", False),
-                          ("eck.sh", False), ("my file.txt", True), ("file.txt", True)):
-            with self.subTest(rel=rel):
-                self.assertEqual(sc.named_in(cmds, rel, words), want)
-                self.assertEqual(sc.named_in(cmds, rel), want)
+    def test_shell_names_match_paths_and_unique_file_names_as_whole_words(self):
+        cmds = ["sed -i '' s/a/b/ src/check.sh", "touch ~/x/notes.txt.bak",
+                "rm -f 'my file.txt'", "cat /Users/me/app/Assets/Big.cs | head",
+                "rm -f other\\ name.txt", "git add Docs/Readme.MD"]
+        same = lambda t: t  # noqa: E731
+        folded = lambda t: unicodedata.normalize("NFC", t).casefold()  # noqa: E731
+        paths = ["scripts/check.sh", "notes.txt", "eck.sh", "my file.txt", "Assets/Big.cs",
+                 "a/dup.txt", "b/dup.txt", "other name.txt", "docs/readme.md"]
+        named, by = sc.shell_named(cmds + ["cat dup.txt"], paths, same)
+        self.assertEqual(named, ["scripts/check.sh", "my file.txt", "Assets/Big.cs",
+                                 "other name.txt"])
+        self.assertNotIn("cat dup.txt", by)
+        named, by = sc.shell_named(cmds, paths, folded)
+        self.assertIn("docs/readme.md", named)
+
 
     def test_ignored_files_fold_into_one_skip_line(self):
         c = Case({".gitignore": ".tmp/\nbuild/\n", "a.txt": "a\n"})
@@ -2336,87 +2259,6 @@ def captured(fn):
     with contextlib.redirect_stdout(buf):
         res = fn()
     return res, buf.getvalue()
-
-
-class SessionCommits(unittest.TestCase):
-    """Which commits made while a shell command of the session ran are the session's."""
-
-    def test_commits_others_make_while_a_session_command_runs_stay_foreign(self):
-        for how in ("rejected", "read-only", "after-the-end", "not-the-sessions-files"):
-            with self.subTest(how=how):
-                c = Case({"a.txt": "a\n", "b.txt": "x\ny\n", "c.txt": "c\n"}, remote=True)
-                e = int(time.time()) - 600
-                c.t.clock = Clock(e - 20)
-                c.t.edit(c.p("b.txt"), "y", "Y")
-                c.t.edit(c.p("a.txt"), "a", "A")
-                made = {}
-
-                def theirs(at, *paths):
-                    write_file(c.p("c.txt"), "theirs\n")
-                    made["theirs"] = commit_at(c.repo, at, "-qm", "user's own", *paths) \
-                        if paths else commit_at(c.repo, at, "-qam", "user's own")
-
-                def during(*steps):
-                    def run():
-                        for step in steps:
-                            step()
-                        c.t.clock.at = e + 3.8  # the command's result
-                    return run
-                c.t.clock.at = e + 0.2
-                if how == "rejected":
-                    c.t.bash("git commit -am 'session b'", "The user doesn't want to proceed with "
-                             "this tool use. The tool use was rejected.", error=True,
-                             between=during(lambda: theirs(e + 2)))
-                elif how == "read-only":
-                    c.t.bash("git merge-base --is-ancestor HEAD origin/main && git log -1",
-                             "", between=during(lambda: theirs(e + 2)))
-                else:
-                    own = during(lambda: made.update(own=commit_at(
-                        c.repo, e + 1, "-qm", "session a", "a.txt")),
-                        *([lambda: theirs(e + 2, "c.txt")] if how == "not-the-sessions-files"
-                          else []))
-                    c.t.bash("git commit -qm 'session a' a.txt", "", between=own)
-                    if how == "after-the-end":
-                        theirs(e + 4)  # the second after the result
-                code, out, err, plan = c.plan()
-                self.assertNotIn(made["theirs"], plan["own_commits"], out)
-                self.assertIn("not this session's: ", out)
-                self.assertIn("user's own", out)
-                if "own" in made:
-                    self.assertIn(made["own"], plan["own_commits"])
-                c.apply()
-                self.assertFalse(has_object(c.remote, made["theirs"]))
-
-    def test_edit_a_parallel_agent_makes_after_the_sessions_own_commit_is_still_to_commit(self):
-        body = "".join(f"l{i}\n" for i in range(1, 15))
-        for quiet in (True, False):
-            with self.subTest(quiet=quiet):
-                c = Case({"a.txt": body, "b.txt": "x\n"})
-                e = int(time.time()) - 600
-                c.t.clock = Clock(e - 20)
-                agent = c.s.subagent("agent-a1")
-                agent.clock = Clock(e + 2)
-                c.t.edit(c.p("a.txt"), "l2\n", "L2 main\n")
-                c.t.clock.at = e + 0.2
-
-                def agent_edits():
-                    agent.edit(c.p("a.txt"), "l12\n", "L12 agent\n")
-                    c.t.clock.at = e + 3.8
-                if quiet:
-                    def run():
-                        commit_at(c.repo, e + 1, "-qam", "wip")
-                        agent_edits()
-                    c.t.bash("git commit -qam wip && npm test", "tests ok\n", between=run)
-                else:
-                    sha = commit_at(c.repo, e + 1, "-qam", "wip")
-                    c.t.bash("git commit -am wip && npm test", f"[main {sha[:7]}] wip\n 1 file "
-                             "changed\ntests ok\n", between=agent_edits)
-                code, out, err, plan = c.plan()
-                st = status_of(plan, "a.txt")
-                self.assertEqual((st["status"], st.get("committed_events")), ("commit", 1), out)
-                self.assertIn("leaving alone 0 modified files", out)
-                self.assertEqual(c.apply()[0], 0)
-                self.assertIn("L12 agent", c.show("a.txt"))
 
 
 class DeclaredFiles(unittest.TestCase):
@@ -2600,11 +2442,13 @@ class StopsSayTheWayOut(unittest.TestCase):
                 if where == "branch, pushed":
                     g(wt, "push", "-q", "-u", "origin", "feature/x")
                 c.t.edit(os.path.join(wt, "a.txt"), "a", "a2")
-                want = {"branch, pushed": "; to push the branch alone: /commit no-merge",
-                        "branch, local": "; merge them into main yourself or drop them from the "
-                                         "branch",
-                        "local main": "; push or drop them yourself, or /commit no-merge to push "
-                                      "the branch alone"}[where]
+                want = {"branch, pushed": "; if the branch is yours, to push the branch alone: "
+                                          "/commit no-merge",
+                        "branch, local": "; review them, merge them into main and push it "
+                                         "yourself, or drop them from the branch",
+                        # the branch holds main's commit too: no-merge would stop on it as well
+                        "local main": "; review and push them yourself, then run /commit "
+                                      "again\n"}[where]
                 code, out, err, plan = c.plan(repo=wt)
                 self.assertIn(want, out)
                 code, out, err = c.apply()
@@ -2633,113 +2477,1579 @@ class StopsSayTheWayOut(unittest.TestCase):
 
 class PublishingSafely(unittest.TestCase):
 
-    def test_rebase_stops_for_an_ignored_file_in_another_case_or_where_a_folder_comes(self):
-        cases = [("folder", "/notes\n", "notes", "my notes\n",
-                  {".gitignore": "", "notes/README.md": "team\n"})]
-        if case_insensitive_fs():
-            cases.append(("case", "*.env\n", "Secrets.env", "TOKEN=mine\n",
-                          {".gitignore": "", "secrets.env": "TOKEN=team\n"}))
-        for name, ignore, rel, data, upstream in cases:
-            with self.subTest(name=name):
-                c = Case({"a.txt": lines(5), ".gitignore": ignore}, remote=True)
-                write_file(c.p(rel), data)
-                clone_and_push(c.remote, upstream)
-                c.t.edit(c.p("a.txt"), "line 1", "SESSION")
-                c.plan()
-                code, out, err = c.apply()
-                self.assertEqual(code, 1, out + err)
-                self.assertIn("Rebase:   stop — origin/main starts tracking files that are "
-                              "git-ignored here: " + rel, out)
-                self.assertEqual(read_file(c.p(rel)), data.encode())
 
-    def test_branch_already_in_main_still_pushes_its_own_upstream_and_says_so(self):
+    def test_branch_already_in_main_pushes_main_left_unpushed_earlier(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
         wt = worktree_session(c, "feat")
         g(wt, "push", "-q", "-u", "origin", "feat")
+        before = g(c.remote, "rev-parse", "feat")
         c.t.edit(os.path.join(wt, "a.txt"), "line 3", "LINE 3")
         c.plan("--no-push", repo=wt)
         self.assertEqual(c.apply("--no-push")[0], 0)
         code, out, err, plan = c.plan(repo=wt)
-        self.assertIn("Push:     yes — origin/main, origin/feat", out)
+        self.assertIn("Into main: no — branch feat is already in main", out)
+        self.assertIn("Push:     yes — origin/main\n", out)
         code, out, err = c.apply()
         self.assertEqual(code, 0, out + err)
-        self.assertIn("Push:     done — origin/feat", out)
-        tip = g(wt, "rev-parse", "HEAD")
-        self.assertEqual((g(c.remote, "rev-parse", "main"), g(c.remote, "rev-parse", "feat")),
-                         (tip, tip))
-        # main pushed by hand, the branch not yet
-        c.t.edit(os.path.join(wt, "b.txt"), "b\n", "B\n")
-        c.plan("--no-push", repo=wt)
-        self.assertEqual(c.apply("--no-push")[0], 0)
-        g(c.repo, "push", "-q", "origin", "main")
-        code, out, err, plan = c.plan(repo=wt)
-        self.assertEqual(plan["verdict"], "go", out)
-        self.assertIn("Push:     yes — origin/feat", out)
-        code, out, err = c.apply()
-        self.assertEqual(code, 0, out + err)
-        self.assertEqual(g(c.remote, "rev-parse", "feat"), g(wt, "rev-parse", "HEAD"))
+        self.assertEqual(g(c.remote, "rev-parse", "main"), g(wt, "rev-parse", "HEAD"))
+        self.assertEqual(g(c.remote, "rev-parse", "feat"), before)  # the branch is not pushed
 
-    def test_no_ff_merge_into_main_names_the_branch_plainly(self):
+
+
+# --- regressions from the 2.2.1 review, round 1 -------------------------------------------
+
+def teammate_merge(c, cwd, extra):
+    """A merge of origin/main into the checkout at cwd with changes of its own (a hand-resolved
+    `git pull`): `extra` maps files to content added inside the merge; "-s ours" makes it a
+    merge that keeps the branch's tree and drops origin's change."""
+    if extra == "-s ours":
+        g(cwd, "merge", "-q", "-s", "ours", "--no-edit", "origin/main")
+        return
+    g(cwd, "merge", "-q", "--no-commit", "--no-ff", "origin/main")
+    for rel, data in extra.items():
+        write_file(os.path.join(cwd, rel), data)
+        g(cwd, "add", rel)
+    g(cwd, "commit", "-q", "--no-edit")
+
+
+class SessionsAndOwnCommits(unittest.TestCase):
+
+    def test_earlier_sessions_edits_left_out_of_a_commit_are_committed_when_it_is_added(self):
+        c = Case({"a.txt": lines(30)})
+        earlier = Session(c.cfg, c.repo)
+        earlier.main.edit(c.p("a.txt"), "line 2\n", "FROM EARLIER\n")
+        c.t.edit(c.p("a.txt"), "line 25\n", "FROM THIS\n")
+        self.assertEqual(c.land("--no-push")[0], 0)  # this session alone: its line only
+        self.assertNotIn("FROM EARLIER", c.show("a.txt"))
+        code, out, err, plan = c.plan("--session", c.s.sid, "--session", earlier.sid)
+        st = status_of(plan, "a.txt")
+        self.assertEqual((st["status"], st["events"]), ("commit", 1), out)
+        self.assertIn("Commit:   yes — 1 file", out)
+        self.assertIn("Foreign:  leaving alone 0 modified files", out)
+        self.assertEqual(c.apply()[0], 0)
+        self.assertIn("FROM EARLIER", c.show("a.txt"))
+        self.assertIn("FROM THIS", c.show("a.txt"))
+
+    def test_file_a_bash_commit_left_unsplittable_is_skipped_naming_declare(self):
+        def deletion_after_it(c, p, wf):
+            wf.edit(p, "line 8\n", "")
+
+        def re_edit_next_to_someones_change(c, p, wf):
+            write_file(p, read_file(p).replace(b"line 190\n", b"FOREIGN\n"))
+            c.t.edit(p, "S1\n", "S2\n")
+        for setup in (deletion_after_it, re_edit_next_to_someones_change):
+            with self.subTest(setup=setup.__name__):
+                c = Case({"a.txt": lines(200)})
+                p = c.p("a.txt")
+                c.t.edit(p, "line 5\n", "S1\n")
+                c.t.bash("git commit -qam x", between=lambda: g(c.repo, "commit", "-qam", "x"))
+                setup(c, p, c.s.subagent("agent-w3", workflow=True))
+                code, out, err, plan = c.plan()
+                self.assertEqual((status_of(plan, "a.txt")["status"], plan["verdict"]),
+                                 ("skipped", "skipped"), out)
+                self.assertIn(" — --declare it if the whole file is yours", out)
+                code, out, err, plan = c.plan(lang="ru")
+                self.assertIn(" — передай --declare, если весь файл твой", out)
+
+
+    def test_agent_write_over_a_file_the_session_created_and_committed_is_committed(self):
+        for creator in ("main session", "workflow agent"):
+            with self.subTest(creator=creator):
+                c = Case({"a.txt": "a\n"})
+                wf = c.s.subagent("agent-w4", workflow=True)
+                (c.t if creator == "main session" else wf).write(c.p("new.txt"), "one\n")
+                self.assertEqual(c.land("--no-push")[0], 0)
+                wf.write(c.p("new.txt"), "one\ntwo\n")
+                code, out, err, plan = c.plan()
+                st = status_of(plan, "new.txt")
+                self.assertEqual((st["status"], st.get("reason")), ("commit", "unverified"), out)
+                self.assertEqual(c.apply()[0], 0)
+                self.assertEqual(c.show("new.txt"), "one\ntwo\n")
+
+    def test_created_file_committed_by_hand_never_reverts_a_committed_foreign_line(self):
+        """The session creates Foo.cs, a person commits it by hand; a teammate commits a line
+        into it, then removes it on disk (not committed yet). The commit must not take that
+        removal: HEAD's change since the create is not this session's work undone."""
+        S = "class Foo {\n  void A() {}\n  void B() {}\n}\n"
+        DEBUG = S.replace("  void B", "  // debug: remove me\n  void B")
+        for lang, want in (("en", "Foo.cs — this session's edits are entangled with other "
+                                  "changes"),
+                           ("ru", "Foo.cs — правки сессии сцеплены с другими")):
+            for later_edit in (False, True):
+                with self.subTest(lang=lang, later_edit=later_edit):
+                    c = Case({"README.md": "readme\n"})
+                    c.t.write(c.p("Foo.cs"), S)
+                    time.sleep(1.1)  # the hand commit comes later than the Write, by the second
+                    g(c.repo, "add", "Foo.cs")
+                    g(c.repo, "commit", "-qm", "add Foo")  # by hand, outside /commit
+                    write_file(c.p("Foo.cs"), DEBUG)
+                    g(c.repo, "commit", "-qam", "teammate: debug line")
+                    write_file(c.p("Foo.cs"), S)  # the teammate removes it, not committed
+                    if later_edit:
+                        c.t.edit(c.p("Foo.cs"), "void A() {}", "void A() { Run(); }")
+                    c.t.edit(c.p("README.md"), "readme\n", "readme v2\n")
+                    code, out, err, plan = c.plan(lang=lang)
+                    self.assertEqual(code, 0, out + err)
+                    st = status_of(plan, "Foo.cs")
+                    self.assertEqual((st["status"], st.get("reason")), ("skipped", "tangled"), out)
+                    self.assertIn(want, out)
+                    self.assertEqual(c.apply()[0], 0)
+                    self.assertIn("// debug: remove me", c.show("Foo.cs"))
+                    self.assertEqual(c.show("README.md"), "readme v2\n")
+
+    def test_created_file_committed_by_hand_then_edited_by_the_session_is_committed(self):
+        c = Case({"README.md": "readme\n"})
+        S = "class Foo {\n  void A() {}\n  void B() {}\n}\n"
+        c.t.write(c.p("Foo.cs"), S)
+        time.sleep(1.1)
+        g(c.repo, "add", "Foo.cs")
+        g(c.repo, "commit", "-qm", "add Foo")  # by hand
+        write_file(c.p("Foo.cs"), S + "// teammate\n")
+        g(c.repo, "commit", "-qam", "teammate line")  # kept on disk too
+        c.t.edit(c.p("Foo.cs"), "void A() {}", "void A() { Run(); }")
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "Foo.cs")["status"], "commit", out)
+        self.assertEqual(c.apply()[0], 0)
+        self.assertEqual(c.show("Foo.cs"), S.replace("void A() {}", "void A() { Run(); }")
+                         + "// teammate\n")
+
+    def test_agent_rewrite_of_a_file_the_session_created_is_marked_unverified(self):
+        c = Case({"a.txt": "a\n"})
+        wf = c.s.subagent("agent-w5", workflow=True)
+        wf.write(c.p("docs/plan.md"), "# plan\n")
+        write_file(c.p("docs/plan.md"), "# plan\nUSER NOTE: do not ship\n")  # someone, between
+        wf.read(c.p("docs/plan.md"))
+        wf.write(c.p("docs/plan.md"), "# plan\nUSER NOTE: do not ship\n- step\n")
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "docs/plan.md")["reason"], "unverified", out)
+        self.assertIn("Commit:   yes — 1 file (1 whole, unverified: docs/plan.md)", out)
+
+
+class SkippedWork(unittest.TestCase):
+
+    def test_session_work_that_is_all_skipped_is_reported_as_skipped_not_as_nothing(self):
+        c = Case({"a.txt": lines(10)})
+        wf = c.s.subagent("agent-w6", workflow=True)
+        wf.write(c.p("a.txt"), lines(10).replace("line 5\n", "AGENT 5\n"))
+        code, out, err, plan = c.plan()
+        self.assertEqual((code, plan["verdict"]), (0, "skipped"), out)
+        self.assertIn("Commit:   no — this session's changes are skipped (1), see Skip", out)
+        self.assertNotIn("no new changes", out)
+        self.assertIn("Foreign:  leaving alone 0 modified files", out)
+
+
+
+class EvilMerges(unittest.TestCase):
+    """A merge commit with changes of its own is someone's work, whoever made it."""
+
+    def test_merge_commit_with_changes_of_its_own_is_not_published(self):
+        for extra in ({"c.txt": "TEAMMATE CHANGE INSIDE THE MERGE\n"}, "-s ours"):
+            with self.subTest(extra=extra):
+                c = Case({"a.txt": lines(5), "b.txt": "b\n", "c.txt": "c\n"}, remote=True)
+                g(c.repo, "checkout", "-q", "-b", "feature")
+                c.t.edit(c.p("a.txt"), "line 1", "own earlier")
+                self.assertEqual(c.land("--no-merge", "--no-push")[0], 0)
+                clone_and_push(c.remote, {"b.txt": "upstream\n"})
+                g(c.repo, "fetch", "-q")
+                teammate_merge(c, c.repo, extra)
+                c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+                code, out, err, plan = c.plan()
+                self.assertIn("will stop after the commit: branch feature has commits not made "
+                              "by this session's /commit", out)
+                code, out, err = c.apply()
+                self.assertEqual(code, 1, out + err)
+                self.assertEqual(g(c.remote, "show", "main:c.txt"), "c\n")
+                self.assertEqual(g(c.remote, "show", "main:b.txt"), "upstream\n")
+
+    def test_merge_commit_with_changes_of_its_own_on_main_is_not_published(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n", "c.txt": "c\n", "d.txt": "d\n"},
+                 remote=True)
+        c.t.edit(c.p("a.txt"), "line 1", "own earlier")
+        self.assertEqual(c.land("--no-push")[0], 0)
+        clone_and_push(c.remote, {"b.txt": "upstream\n"})
+        g(c.repo, "fetch", "-q")
+        teammate_merge(c, c.repo, {"c.txt": "TEAMMATE\n"})
+        clone_and_push(c.remote, {"d.txt": "upstream again\n"})
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        c.plan()
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("not made by this session's /commit", out)
+        self.assertEqual(c.show("c.txt"), "TEAMMATE\n")
+        self.assertEqual(read_file(c.p("c.txt")), b"TEAMMATE\n")
+        self.assertEqual(g(c.remote, "show", "main:c.txt"), "c\n")
+
+    def test_clean_merge_of_the_origin_branch_does_not_stop_no_merge(self):
         c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
-        for n in range(2):
-            g(c.repo, "checkout", "-q", "-b", f"old{n}")
-            write_file(c.p("b.txt"), f"b{n}\n")
-            g(c.repo, "commit", "-qam", f"old work {n}")
-            g(c.repo, "checkout", "-q", "main")
-            g(c.repo, "merge", "-q", "--no-ff", "-m", f"Merge old{n}", f"old{n}")
-        g(c.repo, "push", "-q", "origin", "main")
+        g(c.repo, "checkout", "-q", "-b", "topic")
+        g(c.repo, "push", "-q", "-u", "origin", "topic")
+        other = os.path.realpath(mkdir())
+        g(other, "clone", "-q", "-b", "topic", c.remote, ".")
+        write_file(os.path.join(other, "b.txt"), "teammate\n")
+        g(other, "commit", "-qam", "teammate on topic")
+        g(other, "push", "-q", "origin", "topic")
+        g(c.repo, "fetch", "-q")
+        c.t.edit(c.p("a.txt"), "line 3", "TOPIC")
+        c.plan("--no-merge")
+        self.assertEqual(c.apply("--no-merge")[0], 1)  # origin/topic has a commit it lacks
+        g(c.repo, "pull", "-q", "--no-rebase", "--no-edit")  # the way out the stop names
+        code, out, err, plan = c.plan("--no-merge")
+        self.assertEqual(plan["verdict"], "go", out)
+        code, out, err = c.apply("--no-merge")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(g(c.remote, "rev-parse", "topic"), g(c.repo, "rev-parse", "HEAD"))
+
+
+class RacesDuringApply(unittest.TestCase):
+
+    def test_commit_someone_made_on_top_of_mine_during_the_commit_is_not_taken_back(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+        c.plan()
+
+        def on_top():
+            write_file(c.p("other.txt"), "other\n")
+            g(c.repo, "add", "other.txt")
+            g(c.repo, "commit", "-qm", "someone else: other.txt", "--", "other.txt")
+        code, out = captured(lambda: apply_in_process(c, after_commit=on_top))
+        self.assertEqual(code, 1, out)
+        self.assertIn("nothing taken back", out)
+        self.assertEqual(g(c.repo, "log", "-2", "--format=%s"),
+                         "someone else: other.txt\nSession work\n")
+        mine = g(c.repo, "rev-parse", "HEAD~1").strip()
+        code, out, err, plan = c.plan()  # the next plan finds mine below theirs
+        self.assertIn(mine, sc.load_records(c.cfg, [c.s.sid])["commits"])
+        self.assertIn("Index:", out)
+        self.assertEqual(c.apply()[0], 1)  # theirs is not published
+        self.assertEqual(g(c.repo, "status", "--porcelain"), "")  # the index is put back
+        self.assertEqual(g(c.remote, "log", "--format=%s", "main"), "init\n")
+
+
+
+class WaysOut(unittest.TestCase):
+
+    def test_no_merge_pushes_a_branch_whose_upstream_is_not_its_origin_branch(self):
+        for how in ("pushed without -u", "tracking origin/main"):
+            with self.subTest(how=how):
+                c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+                if how == "pushed without -u":
+                    g(c.repo, "checkout", "-q", "-b", "feature")
+                else:
+                    g(c.repo, "fetch", "-q")
+                    g(c.repo, "checkout", "-q", "-b", "feature", "--track", "origin/main")
+                write_file(c.p("b.txt"), "by hand\n")
+                g(c.repo, "commit", "-qam", "bash commit X")
+                g(c.repo, "push", "-q", "origin", "feature")
+                c.t.edit(c.p("a.txt"), "line 3", "FEATURE")
+                code, out, err, plan = c.plan()
+                self.assertIn("if the branch is yours, to push the branch alone: /commit no-merge", out)
+                code, out, err, plan = c.plan("--no-merge")
+                self.assertEqual(plan["verdict"], "go", out)
+                self.assertIn("Push:     yes — origin/feature\n", out)
+                code, out, err = c.apply("--no-merge")
+                self.assertEqual(code, 0, out + err)
+                self.assertEqual(g(c.remote, "rev-parse", "feature"),
+                                 g(c.repo, "rev-parse", "HEAD"))
+
+    def test_no_merge_is_offered_for_foreign_main_commits_only_when_the_branch_is_clean(self):
+        c = Case({"a.txt": "a\n", "b.txt": "b\n"}, remote=True)
+        write_file(c.p("b.txt"), "someone's on main\n")
+        g(c.repo, "commit", "-qam", "someone's on main")
+        wt = os.path.join(os.path.realpath(mkdir()), "wt")
+        g(c.repo, "worktree", "add", "-q", "-b", "feature/x", wt, "origin/main")
+        c.s = Session(c.cfg, wt)
+        c.t = c.s.main
+        c.t.edit(os.path.join(wt, "a.txt"), "a", "a2")
+        code, out, err, plan = c.plan(repo=wt)
+        self.assertIn("review and push them yourself, then run /commit again, or /commit "
+                      "no-merge to push the branch alone", out)
+
+    def test_branch_with_foreign_commits_stops_before_main_is_moved(self):
+        c = Case({"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"}, remote=True)
+        clone_and_push(c.remote, {"c.txt": "upstream\n"})
+        write_file(c.p("c.txt"), "someone's uncommitted work on main\n")  # blocks a fast-forward
         wt = worktree_session(c, "feature/x")
-        c.t.edit(os.path.join(wt, "a.txt"), "line 2", "FEATURE")
+        write_file(os.path.join(wt, "b.txt"), "foreign\n")
+        g(wt, "commit", "-qam", "foreign: X")
+        c.t.edit(os.path.join(wt, "a.txt"), "a", "a2")
+        main = g(c.repo, "rev-parse", "main")
         c.plan(repo=wt)
         code, out, err = c.apply()
-        self.assertEqual(code, 0, out + err)
-        self.assertEqual(g(c.remote, "log", "-1", "--format=%s", "main"),
-                         "Merge branch 'feature/x'\n")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("branch feature/x has commits not made by this session's /commit", out)
+        self.assertNotIn("not moved", out)
+        self.assertEqual(g(c.repo, "rev-parse", "main"), main)
+
+    def test_stacked_branch_names_foreign_commits_as_on_origin_not_unpushed(self):
+        c = Case({"a.txt": "a\n", "b.txt": "b\n"}, remote=True)
+        g(c.repo, "checkout", "-q", "-b", "colleague")
+        write_file(c.p("b.txt"), "teammate\n")
+        g(c.repo, "commit", "-qam", "teammate work")
+        g(c.repo, "push", "-q", "origin", "colleague")
+        g(c.repo, "checkout", "-q", "-b", "mine")
+        c.t.edit(c.p("a.txt"), "a", "a2")
+        code, out, err, plan = c.plan("--no-merge")
+        self.assertIn("mine carries commits not made by this session's /commit from other "
+                      "branches of origin", out)
+        self.assertIn("git push -u origin mine", out)
+        self.assertNotIn("unpushed", out)
+        code, out, err = c.apply("--no-merge")
+        self.assertEqual(code, 1, out + err)
+        self.assertNotIn("mine", g(c.remote, "branch"))
 
 
-class ShellHintsRead(unittest.TestCase):
+class Evidence(unittest.TestCase):
 
-    def test_relative_paths_from_outside_quoted_spaces_and_subshells(self):
-        home = os.path.realpath(mkdir())
-        repo = os.path.join(home, "Projects", "app")
-        spaced = os.path.join(home, "My project")
-        for d in (repo, os.path.join(spaced, "Assets")):
-            os.makedirs(d)
-        old = os.environ.get("HOME")
-        os.environ["HOME"] = home
-        try:
-            cases = [
-                ("sed -i '' s/a/b/ Projects/app/config.yml", home, repo, True),
-                ("rm -f Projects/other/x.txt", home, repo, False),
-                (f'rm "{spaced}/Assets/Old.cs"', home, spaced, True),
-                ("(cd /tmp && tar xzf a.tgz) && rm out.txt", repo, repo, True),
-                ("(cd /tmp && rm out.txt)", repo, repo, False),
-                ("git -C Projects/app mv a.txt b.txt", home, repo, True),
-                ("x=$(cd /tmp && pwd) && rm out.txt", repo, repo, True),
-            ]
-            for cmd, cwd, root, want in cases:
-                with self.subTest(cmd=cmd):
-                    self.assertEqual(sc.touches_repo(cmd, cwd, root), want)
-        finally:
-            if old is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = old
-
-    def test_read_only_commands_are_not_shell_hints(self):
-        c = Case({"Assets/Scripts/Foo.cs": "class Foo {}\n",
-                  "Assets/Scripts/Bar.cs": "class Bar {}\n"})
-        write_file(c.p("Assets/Scripts/Foo.cs"), "class Foo { /* someone's WIP */ }\n")
-        c.t.edit(c.p("Assets/Scripts/Bar.cs"), "Bar {}", "Bar { int x; }")
-        wf = c.s.subagent(workflow=True)
-        wf.bash('grep -n "List<Ship>" Assets/Scripts/Foo.cs')
-        wf.bash("git merge-base HEAD origin/main && git log --oneline -- Assets/Scripts/Foo.cs")
+    def test_every_named_file_keeps_the_commands_that_named_it(self):
+        c = Case({"a.txt": "a\n"})
+        for n in range(50):
+            write_file(c.p(f"gen/f{n:02d}.txt"), "y\n")
+            c.t.bash(f"sed -i '' s/x/y/ gen/f{n:02d}.txt")
+        for n in range(60):
+            c.t.bash(f"echo {n}")
         code, out, err, plan = c.plan()
-        self.assertEqual((plan["bash_hints"], plan["bash_named"]), ([], []), out)
-        for cmd in ("echo x > out.txt", "git merge -q other", 'echo "a > b" >> log.txt'):
-            with self.subTest(cmd=cmd):
-                self.assertTrue(sc.may_write(cmd))
+        self.assertEqual(sorted(named_cmds(plan)), plan["bash_named"])
+        self.assertEqual(named_cmds(plan)["gen/f00.txt"], ["sed -i '' s/x/y/ gen/f00.txt"])
+        self.assertTrue(all(named_cmds(plan).values()))
 
+    def test_files_git_status_does_not_list_are_not_read_or_replayed(self):
+        files = {f"f{n}.txt": lines(5) for n in range(6)}
+        files[".gitattributes"] = "* text=auto\n"
+        c = Case(files)
+        for n in range(6):
+            c.t.edit(c.p(f"f{n}.txt"), "line 2", f"EDIT {n}")
+        g(c.repo, "commit", "-qam", "committed by hand")
+        c.t.edit(c.p("f0.txt"), "line 3", "NEW")
+        calls = []
+        from unittest import mock
+        real = sc.git
+        with mock.patch.object(sc, "git", lambda cwd, *a, **kw: (calls.append(a),
+                                                                   real(cwd, *a, **kw))[1]):
+            code, out, err = plan_in_process(c.repo, c)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(sum(1 for a in calls if "cat-file" in a), 1, calls)
+        self.assertIn("unchanged (already in HEAD or reverted): 5", out)
+        for n in range(1, 6):
+            c.t.edit(c.p(f"f{n}.txt"), "line 3", f"NEW {n}")
+        c.plan()
+        calls.clear()
+        with mock.patch.object(sc, "git", lambda cwd, *a, **kw: (calls.append(a),
+                                                                   real(cwd, *a, **kw))[1]):
+            code, out = captured(lambda: apply_in_process(c, "--no-push"))
+        self.assertEqual(code, 0, out)
+        blobs = [a for a in calls if "hash-object" in a and "tree" not in a]
+        self.assertEqual(blobs, [("hash-object", "-w", "--stdin-paths"),
+                                 ("hash-object", "--stdin-paths")])
+        self.assertEqual(g(c.repo, "status", "--porcelain"), "")
+
+
+# --- regressions from the 2.2.1 review, round 2 -------------------------------------------
+
+WORDS = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+         "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+         "sierra", "tango", "uniform", "victor", "whiskey", "xray", "yankee", "zulu"]
+USINGS = ("using System.Collections;\nusing UnityEngine;\n\npublic class A : MonoBehaviour\n{\n"
+          + "".join(f"    int f{i} = {i};\n" for i in range(1, 21)) + "}\n")
+
+
+def block(i):
+    """Ten lines that look the same in every method but its name."""
+    return (f"  void M{i}() {{\n    a();\n    b();\n    c();\n    if (x == null)\n    Run();\n"
+            "    d();\n    e();\n    f();\n  }\n")
+
+
+LOOKALIKES = "class A {\n" + "".join(block(i) for i in range(1, 6)) + "}\n"
+M2_OLD = "  void M2() {\n    a();\n    b();\n    c();\n    if (x == null)\n"
+M2_NEW = M2_OLD + "      return;\n"
+
+
+class OlderEditsHeldInHead(unittest.TestCase):
+    """An older session edit counts as committed only when HEAD has its new side and not its old
+    one: a deletion's new side (context only) is in any HEAD."""
+
+    def test_older_deletion_next_to_a_foreign_change_is_skipped_not_dropped(self):
+        cases = {
+            "agent deletes a line": ({"a.txt": "".join(w + "\n" for w in WORDS)}, "a.txt",
+                                     ("delta\necho\n", "echo\n"), (b"charlie\n", b"CHARLIE\n"),
+                                     ("yankee\n", "YANKEE\n"), "delta\n"),
+            "first line deleted": ({"a.txt": "x\n" + lines(30)}, "a.txt",
+                                   ("x\nline 1\n", "line 1\n"), (b"", b"FOREIGN\n"),
+                                   ("line 25\n", "S25\n"), "x\n"),
+            "first using removed": ({"A.cs": USINGS}, "A.cs",
+                                    ("using System.Collections;\nusing UnityEngine;\n",
+                                     "using UnityEngine;\n"), (b"", b"using System.Linq;\n"),
+                                    ("    int f15 = 15;\n", "    int f15 = 150;\n"),
+                                    "System.Collections"),
+        }
+        for name, (files, rel, first, foreign, later, gone) in cases.items():
+            with self.subTest(name=name):
+                c = Case(files)
+                who = c.s.subagent("agent-w1", workflow=True) if name.startswith("agent") \
+                    else c.t
+                who.edit(c.p(rel), *first)
+                data = read_file(c.p(rel))
+                write_file(c.p(rel), foreign[1] + data if not foreign[0] else
+                           data.replace(*foreign))
+                c.t.edit(c.p(rel), *later)
+                code, out, err, plan = c.plan()
+                st = status_of(plan, rel)
+                self.assertEqual((st["status"], st.get("reason")), ("skipped", "tangled"), out)
+                self.assertNotIn(gone, read_file(c.p(rel)).decode())  # still on disk only
+
+
+class ForwardFromHead(unittest.TestCase):
+    """Replaying an undo-less edit on HEAD is checked against the disk."""
+
+    def test_replay_from_head_that_the_disk_disagrees_with_is_skipped(self):
+        # someone put the deleted line back
+        c = Case({"a.txt": lines(30)})
+        wf = c.s.subagent("agent-w1", workflow=True)
+        wf.edit(c.p("a.txt"), "line 4\n", "")
+        data = read_file(c.p("a.txt")).replace(b"line 3\n", b"line 3\nline 4\n")
+        write_file(c.p("a.txt"), data.replace(b"line 25\n", b"FOREIGN\n"))
+        code, out, err, plan = c.plan()
+        self.assertEqual((status_of(plan, "a.txt")["status"], status_of(plan, "a.txt")["reason"]),
+                         ("skipped", "ambiguous"), out)
+        # the deleted text is HEAD's line 3 there, but the agent deleted a later copy of it
+        h = "a\nb\nx\nc\n" + lines(20) + "z\n"
+        c = Case({"a.txt": h})
+        write_file(c.p("a.txt"), h.replace("a\nb\nx\nc\n", "a\nb\ny\nc\n").replace("z\n",
+                                                                                 "x\nz\n"))
+        wf = c.s.subagent("agent-w1", workflow=True)
+        wf.edit(c.p("a.txt"), "x\n", "")
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "a.txt")["status"], "skipped", out)
+
+    def test_replay_from_head_that_matches_the_disk_is_split(self):
+        c = Case({"a.txt": lines(30)})
+        wf = c.s.subagent("agent-w1", workflow=True)
+        wf.edit(c.p("a.txt"), "line 4\n", "")
+        write_file(c.p("a.txt"), read_file(c.p("a.txt")).replace(b"line 25\n", b"FOREIGN\n"))
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "a.txt")["status"], "partial", out)
+        self.assertEqual(c.apply()[0], 0)
+        self.assertEqual(c.show("a.txt"), lines(30).replace("line 4\n", ""))
+
+
+class LookalikesOnTheirOwnLine(unittest.TestCase):
+
+    def test_created_file_edit_shifted_onto_a_lookalike_block_is_skipped(self):
+        c = Case({"README": "r\n"})
+        c.t.write(c.p("A.cs"), LOOKALIKES)
+        note = "".join(f"  // note {i}\n" for i in range(10))  # one block's height, above
+        write_file(c.p("A.cs"), LOOKALIKES.replace("class A {\n", "class A {\n" + note, 1))
+        c.t.edit(c.p("A.cs"), M2_OLD, M2_NEW)
+        code, out, err, plan = c.plan()
+        st = status_of(plan, "A.cs")
+        self.assertEqual((st["status"], st.get("detail")), ("skipped", "repeated"), out)
+
+    def test_created_file_edit_in_repeated_code_is_committed_when_the_disk_is_the_sessions(self):
+        c = Case({"README": "r\n"})
+        c.t.write(c.p("A.cs"), LOOKALIKES)
+        c.t.edit(c.p("A.cs"), M2_OLD, M2_NEW)
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "A.cs")["status"], "commit", out)
+        self.assertEqual(c.apply()[0], 0)
+        self.assertEqual(c.show("A.cs"), LOOKALIKES.replace(M2_OLD, M2_NEW))
+
+
+class ShellEvidence(unittest.TestCase):
+
+    def test_refused_shell_command_does_not_name_a_foreign_file(self):
+        refusals = ["Permission for this action was denied by the Claude Code auto mode "
+                    "classifier. Reason: [Interfere With Workloads] … attempt to accomplish "
+                    "this action using other tools",
+                    "The user doesn't want to proceed with this tool use.",
+                    "PreToolUse:Bash hook error: [guard] Blocked."]
+        for text in refusals:
+            with self.subTest(text=text[:30]):
+                c = Case({"src/Foo.cs": lines(30)})
+                write_file(c.p("src/Foo.cs"),
+                           read_file(c.p("src/Foo.cs")).replace(b"line 25\n", b"FOREIGN 25\n"))
+                wf = c.s.subagent("agent-w1", workflow=True)
+                wf.bash("sed -i '' 's/line 5/SESSION 5/' src/Foo.cs", text, error=True)
+                wf.edit(c.p("src/Foo.cs"), "line 5\n", "SESSION 5\n")
+                code, out, err, plan = c.plan()
+                self.assertEqual(status_of(plan, "src/Foo.cs")["status"], "partial", out)
+                self.assertEqual(plan["bash_named"], [], out)
+                self.assertEqual(named_cmds(plan), {})
+                self.assertNotIn("named by this session's shell commands", out)
+
+    def test_file_name_shared_with_the_sessions_own_file_names_nothing(self):
+        for extra in (None, "--declare", "untracked c/SKILL.md"):
+            with self.subTest(extra=extra):
+                c = Case({"a/SKILL.md": "x\n", "b/SKILL.md": "b\n"})
+                c.t.edit(c.p("a/SKILL.md"), "x\n", "x2\n")
+                c.t.bash("cd a && sed -i '' s/x/y/ SKILL.md")
+                write_file(c.p("b/SKILL.md"), "someone's\n")
+                if extra == "untracked c/SKILL.md":
+                    write_file(c.p("c/SKILL.md"), "someone else's\n")
+                code, out, err, plan = c.plan(*(["--declare", "a/SKILL.md"]
+                                                if extra == "--declare" else []))
+                self.assertEqual(status_of(plan, "a/SKILL.md")["status"], "commit", out)
+                self.assertEqual(plan["bash_named"], [], out)
+
+class RecordsAcrossRepositories(unittest.TestCase):
+
+    def test_pending_commit_of_another_repository_waits_for_a_plan_there(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        other = make_repo({"o.txt": "o\n"})
+        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+        c.t.edit(os.path.join(other, "o.txt"), "o", "O")
+        c.plan()
+
+        def killed():
+            raise SystemExit(143)
+        with self.assertRaises(SystemExit):
+            captured(lambda: apply_in_process(c, after_commit=killed))
+        self.assertEqual(len(sc.load_records(c.cfg, [c.s.sid])["pending"]), 1)
+        c.plan(repo=other)  # the same session, the other repository first
+        self.assertEqual(len(sc.load_records(c.cfg, [c.s.sid])["pending"]), 1)
+        code, out, err, plan = c.plan()
+        self.assertIn("Index:    will put back the entries my commit", out)
+        self.assertIn("Push:     yes — origin/main", out)
+        self.assertEqual(sc.load_records(c.cfg, [c.s.sid])["pending"], [])
+
+    def test_other_repository_with_nothing_left_gets_no_elsewhere_line(self):
+        c = Case({"a.txt": "a\n"})
+        other = make_repo({"o.txt": "o\n", "p.txt": "p\n"})
+        c.t.edit(os.path.join(other, "o.txt"), "o", "O")
+        c.t.edit(os.path.join(other, "p.txt"), "p", "P")
+        c.t.edit(c.p("a.txt"), "a", "A")
+        code, out, err, plan = c.plan()
+        self.assertIn(f"Elsewhere: this session also edited {other} (2 files)", out)
+        g(other, "commit", "-qm", "landed there", "--", "o.txt")
+        code, out, err, plan = c.plan()
+        self.assertIn(f"Elsewhere: this session also edited {other} (1 file)", out)
+        g(other, "commit", "-qam", "all landed there")
+        code, out, err, plan = c.plan()
+        self.assertNotIn("Elsewhere:", out)
+        self.assertEqual(plan["other_repos"], {})
+
+
+class DiskDuringApply(unittest.TestCase):
+
+    def test_save_between_the_stale_check_and_the_hashing_makes_the_plan_stale(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+        c.plan()
+        head = g(c.repo, "rev-parse", "HEAD")
+
+        def save(args):
+            if "read-tree" in args:
+                write_file(c.p("a.txt"), read_file(c.p("a.txt")) + b"SOMEONE'S UNFINISHED\n")
+        code, out = captured(lambda: apply_in_process(c, on_git=save))
+        self.assertEqual(code, 3, out)
+        self.assertEqual(g(c.repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(g(c.remote, "rev-parse", "main"), head)
+        self.assertEqual(sc.load_records(c.cfg, [c.s.sid])["pending"], [])
+
+
+def orphan_case():
+    c = Case({"a.txt": lines(5)}, remote=True)
+    g(c.repo, "checkout", "-q", "--orphan", "gh-pages")
+    g(c.repo, "rm", "-rfq", "--cached", ".")
+    os.remove(c.p("a.txt"))
+    return c
+
+
+class BranchesAndRemotes(unittest.TestCase):
+
+    def test_orphan_branch_is_pushed_alone_on_every_run(self):
+        for first in ("local", "default"):
+            with self.subTest(first=first):
+                c = orphan_case()
+                c.t.write(c.p("index.html"), "<h1>one</h1>\n")
+                args = ("--no-merge", "--no-push") if first == "local" else ()
+                self.assertEqual(c.land(*args)[0], 0)
+                c.t.edit(c.p("index.html"), "one", "two")
+                code, out, err, plan = c.plan()
+                self.assertIn("Into main: no — a new branch with no history", out)
+                self.assertIn("Push:     yes — origin/gh-pages", out)
+                code, out, err = c.apply()
+                self.assertEqual(code, 0, out + err)
+                self.assertIn("Into main: no — a new branch with no history", out)
+                self.assertEqual(g(c.remote, "rev-parse", "gh-pages"),
+                                 g(c.repo, "rev-parse", "gh-pages"))
+                self.assertEqual(g(c.remote, "log", "--format=%s", "main"), "init\n")
+                self.assertEqual(g(c.repo, "log", "--format=%s", "main"), "init\n")
+                self.assertEqual(g(c.repo, "ls-tree", "--name-only", "gh-pages"),
+                                 "index.html\n")
+
+    def test_stale_origin_head_after_a_rename_is_not_followed(self):
+        for how in ("old ref kept", "old ref pruned"):
+            with self.subTest(how=how):
+                c = Case({"a.txt": lines(5)}, remote=True)
+                if how == "old ref kept":
+                    g(c.repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+                g(c.repo, "symbolic-ref", "refs/remotes/origin/HEAD",
+                  "refs/remotes/origin/master")
+                c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+                code, out, err, plan = c.plan()
+                self.assertIn("Into main: no — already on main", out)
+                self.assertIn("Push:     yes — origin/main\n", out)
+                code, out, err = c.apply()
+                self.assertEqual(code, 0, out + err)
+                self.assertEqual(g(c.remote, "for-each-ref", "--format=%(refname)").split(),
+                         ["refs/heads/main"])
+        c = Case({"a.txt": lines(5)}, remote=True)
+        g(c.repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+        g(c.repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master")
+        g(c.repo, "checkout", "-q", "-b", "feature")
+        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+        code, out, err, plan = c.plan()
+        self.assertIn("if origin's default branch was renamed (there is main) — git remote "
+                      "set-head origin -a", out)
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Into master: stop — there is no local master branch", out)
+        self.assertEqual(g(c.repo, "branch", "--list", "master"), "")
+        self.assertEqual(g(c.remote, "for-each-ref", "--format=%(refname)").split(),
+                         ["refs/heads/main"])
+
+    def test_no_merge_is_not_offered_when_the_origin_branch_has_commits_the_branch_lacks(self):
+        for where in ("local main", "branch"):
+            with self.subTest(where=where):
+                c = Case({"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"}, remote=True)
+                if where == "local main":
+                    write_file(c.p("b.txt"), "someone's on main\n")
+                    g(c.repo, "commit", "-qam", "someone's on main")
+                wt = os.path.join(os.path.realpath(mkdir()), "wt")
+                g(c.repo, "worktree", "add", "-q", "-b", "feature/x", wt, "origin/main")
+                c.s = Session(c.cfg, wt)
+                c.t = c.s.main
+                if where == "branch":
+                    write_file(os.path.join(wt, "b.txt"), "foreign\n")
+                    g(wt, "commit", "-qam", "foreign: earlier work")
+                g(wt, "push", "-q", "-u", "origin", "feature/x")
+                other = os.path.realpath(mkdir())
+                g(other, "clone", "-q", "-b", "feature/x", c.remote, ".")
+                write_file(os.path.join(other, "c.txt"), "teammate\n")
+                g(other, "commit", "-qam", "teammate on feature/x")
+                g(other, "push", "-q", "origin", "feature/x")
+                g(wt, "fetch", "-q")
+                c.t.edit(os.path.join(wt, "a.txt"), "a", "a2")
+                code, out, err, plan = c.plan(repo=wt)
+                self.assertNotIn("/commit no-merge to push the branch alone", out)
+                self.assertNotIn("to push the branch alone: /commit no-merge", out)
+                if where == "branch":
+                    g(wt, "merge", "-q", "--no-edit", "origin/feature/x")
+                    c.plan("--no-merge", repo=wt)
+                    code, out, err = c.apply("--no-merge")
+                    self.assertEqual(code, 0, out + err)
+
+    def test_stop_advice_names_commands_that_work(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        g(c.repo, "checkout", "-q", "-b", "topic")
+        g(c.repo, "push", "-q", "-u", "origin", "topic")
+        other = os.path.realpath(mkdir())
+        g(other, "clone", "-q", "-b", "topic", c.remote, ".")
+        write_file(os.path.join(other, "b.txt"), "teammate\n")
+        g(other, "commit", "-qam", "teammate on topic")
+        g(other, "push", "-q", "origin", "topic")
+        g(c.repo, "fetch", "-q")
+        c.t.edit(c.p("a.txt"), "line 3", "TOPIC")
+        for lang, want in (("en", "merge origin/topic into the branch first (git merge "
+                                  "origin/topic)"),
+                           ("ru", "сначала влей origin/topic в ветку (git merge origin/topic)")):
+            code, out, err, plan = c.plan("--no-merge", lang=lang)
+            self.assertIn(want, out)
+            self.assertNotIn("git pull", out)
+
+    def test_push_rejected_by_a_protected_main_names_the_way_out(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        hook = os.path.join(c.remote, "hooks", "pre-receive")
+        write_file(hook, "#!/bin/sh\nwhile read old new ref; do\n  if [ \"$ref\" = "
+                   "refs/heads/main ]; then echo 'main is protected' >&2; exit 1; fi\ndone\n")
+        os.chmod(hook, 0o755)
+        wt = worktree_session(c, "feature")
+        c.t.edit(os.path.join(wt, "a.txt"), "line 3", "FEATURE")
+        c.plan(repo=wt)
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("— if main is protected: /commit no-merge pushes the branch for a pull "
+                      "request; local main stays ahead of origin/main by 1 commit of this "
+                      "session's", out)
+        c.plan("--no-merge", repo=wt)
+        code, out, err = c.apply("--no-merge")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(g(c.remote, "rev-parse", "feature"), g(wt, "rev-parse", "HEAD"))
+
+    def test_push_failed_by_a_pre_push_hook_is_not_called_a_refusal_by_origin(self):
+        for lang, want in (("en", "Push:     stop — push failed: tests failed: 3 failing"),
+                           ("ru", "Push:     стоп — push не прошёл: tests failed: 3 failing")):
+            c = Case({"a.txt": lines(5)}, remote=True)
+            hook = c.p(".git/hooks/pre-push")
+            write_file(hook, "#!/bin/sh\necho 'tests failed: 3 failing' >&2\nexit 1\n")
+            os.chmod(hook, 0o755)
+            c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+            c.plan(lang=lang)
+            code, out, err = c.apply("--lang", lang)
+            self.assertEqual(code, 1, out + err)
+            self.assertIn(want, out)
+            self.assertNotIn("rejected", out)
+            self.assertNotIn("protected", out)
+            self.assertNotIn("отклонил", out)
+
+    def test_fetch_failing_on_a_bad_origin_url_is_not_called_no_network(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        g(c.repo, "remote", "set-url", "origin", "/nonexistent/repo.git")
+        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+        c.plan()
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Push:     stop — fetch failed (", out)
+        self.assertIn("the commit stays local", out)
+        self.assertNotIn("no network", out)
+
+    def test_remote_not_named_origin_is_named_in_the_push_line(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        g(c.repo, "remote", "rename", "origin", "github")
+        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+        want = "Push:     no — no remote named origin (remotes: github); push it yourself"
+        code, out, err, plan = c.plan()
+        self.assertIn(want, out)
+        code, out, err = c.apply()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(want, out)
+
+
+    def test_stop_before_the_push_still_prints_the_push_line(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        wt = worktree_session(c, "feature")
+        write_file(os.path.join(wt, "b.txt"), "by hand\n")
+        g(wt, "commit", "-qam", "bash commit on the branch")
+        c.t.edit(os.path.join(wt, "a.txt"), "line 3", "LINE 3")
+        c.plan(repo=wt)
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Into main: stop — branch feature has commits", out)
+        self.assertTrue(out.rstrip("\n").endswith("Push:     no — stopped before"), out)
+
+    def test_dirty_main_checkout_in_the_way_is_foreseen_and_named(self):
+        c = Case({"CHANGELOG.md": "# log\n", "a.txt": "a\n"}, remote=True)
+        wt = worktree_session(c, "feature")
+        write_file(c.p("CHANGELOG.md"), "# log\n- someone's line\n")
+        c.t.edit(os.path.join(wt, "CHANGELOG.md"), "# log\n", "# log\n- session's line\n")
+        want = (f"the checkout of main ({c.repo}) has uncommitted changes in CHANGELOG.md that "
+                "the merge would overwrite; commit or remove them there and run /commit again, "
+                "or /commit no-merge to push the branch alone")
+        code, out, err, plan = c.plan(repo=wt)
+        self.assertEqual(plan["verdict"], "go", out)
+        self.assertIn("Into main: no — will stop after the commit: " + want, out)
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Into main: stop — main not moved: " + want, out)
+        self.assertNotIn("stash", out)
+        self.assertEqual(read_file(c.p("CHANGELOG.md")), b"# log\n- someone's line\n")
+        c.plan("--no-merge", repo=wt)
+        self.assertEqual(c.apply("--no-merge")[0], 0)
+
+
+
+# --- regressions from the 2.2.1 review, round 3 -------------------------------------------
+
+def yaml_entry(name, enabled):
+    """Eight lines that look the same in every entry but its name and flag."""
+    return (f"- name: {name}\n  a: 1\n  b: 1\n  c: 1\n  enabled: {enabled}\n  d: 1\n  e: 1\n"
+            "  f: 1\n")
+
+
+class HeldEditsAreChecked(unittest.TestCase):
+    """A file the replay cannot split is skipped, never committed without an older edit of the
+    session's; an undo at a hunk's own line among lookalikes counts only when the result is the
+    disk."""
+
+    def test_older_edit_next_to_someones_uncommitted_change_is_not_taken_as_committed(self):
+        def next_to_a_foreign_deletion(p, wf):  # the conflict path
+            write_file(p, read_file(p).replace(b"line 12\n", b""))
+            wf.edit(p, "line 11\nline 13\n", "line 11\n")
+            wf.edit(p, "line 3\n", "line 3 changed\n")
+
+        def deleting_a_foreign_line_too(p, wf):  # the replay from HEAD
+            write_file(p, read_file(p).replace(b"line 2\n", b"line 2\nFOREIGN\n"))
+            wf.edit(p, "line 2\nFOREIGN\n", "")
+            wf.edit(p, "line 10\n", "line 10 changed\n")
+
+        def anchored_on_the_line_above(p, wf):  # the conflict path, a non-empty new side
+            write_file(p, read_file(p).replace(b"line 2\n", b"line 2\nFOREIGN\n"))
+            wf.edit(p, "line 1\nline 2\nFOREIGN\n", "line 1\n")
+            wf.edit(p, "line 10\n", "line 10 changed\n")
+        for setup in (next_to_a_foreign_deletion, deleting_a_foreign_line_too,
+                      anchored_on_the_line_above):
+            with self.subTest(setup=setup.__name__):
+                c = Case({"a.txt": lines(14)})
+                setup(c.p("a.txt"), c.s.subagent("agent-w1", workflow=True))
+                code, out, err, plan = c.plan()
+                self.assertEqual(status_of(plan, "a.txt")["status"], "skipped", out)
+                self.assertEqual(plan["verdict"], "skipped", out)
+                self.assertIn("Skip:     a.txt — ", out)
+
+
+    def test_undo_on_a_lookalike_block_moved_onto_the_hunks_line_is_skipped(self):
+        head = "items:\n" + yaml_entry("alpha", "true") + yaml_entry("beta", "false") + \
+            yaml_entry("gamma", "true") + yaml_entry("delta", "true")
+        c = Case({"list.yaml": head})
+        p = c.p("list.yaml")
+        c.t.edit(p, "  enabled: false\n", "  enabled: true\n")  # the session turns beta on
+        write_file(p, read_file(p).decode().replace("items:\n", "items:\n" +
+                                                    yaml_entry("zeta", "true"), 1))
+        code, out, err, plan = c.plan()
+        st = status_of(plan, "list.yaml")
+        self.assertEqual((st["status"], st.get("detail")), ("skipped", "repeated"), out)
+        self.assertNotIn("no new changes of this session here", out)
+        self.assertIn("Skip:     list.yaml — cannot locate this session's change for sure — the "
+                      "text occurs more than once in the file", out)
+
+
+class BranchPushes(unittest.TestCase):
+
+
+
+
+
+    def test_git_hints_are_left_out_of_status_lines(self):
+        proc = subprocess.CompletedProcess([], 1, b"", b"hint: Diverging branches can't be "
+                                           b"fast-forwarded\nhint: git rebase\nfatal: Not possible "
+                                           b"to fast-forward, aborting.\n")
+        self.assertEqual(sc.errtext(proc), "fatal: Not possible to fast-forward, aborting.")
+
+    def test_default_branch_with_no_local_copy_stops_naming_both_ways_out(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        g(c.repo, "push", "-q", "origin", "main:develop")
+        g(c.remote, "symbolic-ref", "HEAD", "refs/heads/develop")
+        g(c.repo, "fetch", "-q")
+        g(c.repo, "remote", "set-head", "origin", "-a")
+        g(c.repo, "checkout", "-q", "-b", "feature", "origin/develop")
+        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+        main = g(c.remote, "rev-parse", "main")
+        want = ("there is no local develop branch — create it (git branch develop origin/develop) "
+                "and run /commit again; if origin's default branch was renamed (there is main) — "
+                "git remote set-head origin -a; or /commit no-merge")
+        code, out, err, plan = c.plan()
+        self.assertIn("Into develop: no — will stop after the commit: " + want, out)
+        code, out, err = c.apply()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Into develop: stop — " + want, out)
+        g(c.repo, "branch", "develop", "origin/develop")
+        self.assertEqual(c.land()[0], 0)
+        self.assertEqual(g(c.remote, "rev-parse", "develop"), g(c.repo, "rev-parse", "feature"))
+        self.assertEqual(g(c.remote, "rev-parse", "main"), main)
+
+
+class StopsAfterTheCommit(unittest.TestCase):
+
+    def test_mismatch_after_the_commit_still_prints_the_merge_and_push_lines(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        wt = worktree_session(c, "feature")
+        a = os.path.join(wt, "a.txt")
+        c.t.edit(a, "line 3", "LINE 3")
+        c.plan(repo=wt)
+        code, out = captured(lambda: apply_in_process(
+            c, after_commit=lambda: write_file(a, read_file(a) + b"SOMEONE\n")))
+        self.assertEqual(code, 1, out)
+        self.assertIn("still differ from the commit: a.txt (changed during the commit) — the "
+                      "commit is made, but not merging or pushing; check those files and run "
+                      "/commit again to merge and push it", out)
+        self.assertIn("Into main: no — stopped before", out)
+        self.assertTrue(out.rstrip("\n").endswith("Push:     no — stopped before"), out)
+
+    def test_stop_for_foreign_commits_names_them_in_the_users_language(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        write_file(c.p("b.txt"), "by hand\n")
+        g(c.repo, "commit", "-qam", "bash commit")
+        c.t.edit(c.p("a.txt"), "line 3", "LINE 3")
+        for lang, want in (("en", "bash commit — not publishing them; review and push them "
+                                  "yourself, then run /commit again, or drop them"),
+                           ("ru", "bash commit — их не публикую; проверь и запушь их сам, потом "
+                                  "снова /commit, или убери их")):
+            code, out, err, plan = c.plan(lang=lang)
+            self.assertIn(want, out)
+            self.assertNotIn("<id>", out)
+
+
+class ShellEvidenceInFull(unittest.TestCase):
+
+    def test_every_command_naming_a_partly_committed_file_is_in_commands_json(self):
+        c = Case({"a.txt": lines(30)})
+        p = c.p("a.txt")
+        c.t.bash("cat a.txt")
+        write = ("python3 - <<'EOF'\np = 'a.txt'; s = open(p).read()\n"
+                 "open(p, 'w').write(s.replace('line 25', 'BASH 25'))\nEOF")
+        c.t.bash(write, between=lambda: write_file(p, read_file(p).replace(b"line 25",
+                                                                           b"BASH 25")))
+        for n in range(4):
+            c.t.bash(f"grep -n 'line {n}' a.txt")
+        c.t.edit(p, "line 5\n", "SESSION 5\n")
+        code, out, err, plan = c.plan()
+        self.assertEqual(status_of(plan, "a.txt")["status"], "partial", out)
+        self.assertIn("every naming command, uncut, oldest first: " + plan["bash_commands"], out)
+        named = named_cmds(plan)["a.txt"]
+        self.assertEqual(len(named), 6)
+        self.assertEqual(named[1], write)
+
+
+class OutsideARepository(unittest.TestCase):
+
+    def test_repository_line_outside_a_repository_does_not_claim_it_was_the_only_one_edited(self):
+        c = Case({"a.txt": lines(5)})
+        other = make_repo({"o.txt": "o\n"})
+        c.t.edit(c.p("a.txt"), "line 1", "SESSION")
+        c.t.edit(os.path.join(other, "o.txt"), "o", "O")
+        g(other, "commit", "-qam", "landed there by hand")
+        home = os.path.realpath(mkdir())
+        for lang, want in (("en", "the current directory is not in git; this is the only "
+                                  "repository with this session's work left"),
+                           ("ru", "текущая папка не в git; несделанное этой сессии есть только "
+                                  "в нём")):
+            proc = subprocess.run([sys.executable, SCRIPT, "plan", "--out", mkdir(), "--lang",
+                                   lang], cwd=home, env=c.env(), capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(want, proc.stdout)
+            self.assertNotIn("only this one", proc.stdout)
+
+    def test_repositories_with_nothing_of_the_session_left_are_not_listed(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        other = make_repo({"o.txt": "o\n"})
+        c.t.edit(c.p("a.txt"), "line 1", "SESSION")
+        c.t.edit(os.path.join(other, "o.txt"), "o", "O")
+        home = os.path.realpath(mkdir())
+
+        def plan_here():
+            return subprocess.run([sys.executable, SCRIPT, "plan", "--out", mkdir()], cwd=home,
+                                  env=c.env(), capture_output=True, text=True)
+        proc = plan_here()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn(other, proc.stderr)
+        g(other, "commit", "-qam", "landed there by hand")
+        proc = plan_here()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"Repository: {c.repo}", proc.stdout)
+        c.plan("--no-push")  # committed by /commit, not pushed yet: still listed
+        self.assertEqual(c.apply("--no-push")[0], 0)
+        proc = plan_here()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"Repository: {c.repo}", proc.stdout)
+        self.assertIn("Push:     yes — origin/main", proc.stdout)
+        self.assertEqual(c.land()[0], 0)
+        proc = plan_here()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("nothing of this session's is left to commit or push in the repositories "
+                      "it edited (2 with nothing of it left to commit or push)", proc.stderr)
+
+
+# --- tasks, /ticket runs and PR repositories ---------------------------------------------
+
+def ticket_marker(sid, task="LOCAL-17"):
+    """The ticket guard's marker of a session in a /ticket run (skills/ticket/guard.py)."""
+    os.makedirs(os.path.join(TASK_RUNS, ".guard"), exist_ok=True)
+    with open(os.path.join(TASK_RUNS, ".guard", sid), "w") as fh:
+        fh.write(f"ticket session\nrun: {os.path.join(TASK_RUNS, 'repo', task)}\n")
+
+
+def fake_gh(c):
+    """A gh on PATH for the case that only logs its calls: /commit must never run it. -> the log
+    path (absent while gh never ran)."""
+    d = os.path.realpath(mkdir())
+    log = os.path.join(d, "calls.log")
+    with open(os.path.join(d, "gh"), "w") as fh:
+        fh.write(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n")
+    os.chmod(os.path.join(d, "gh"), 0o755)
+    c.extra_env["PATH"] = d + os.pathsep + BASE_ENV.get("PATH", "")
+    return log
+
+
+def pr_history(c, n=4):
+    """Main's first-parent history of a PR repository: n merges of pull requests, pushed."""
+    for i in range(1, n + 1):
+        g(c.repo, "checkout", "-q", "-b", f"f{i}")
+        write_file(c.p(f"f{i}.txt"), f"{i}\n")
+        g(c.repo, "add", f"f{i}.txt")
+        g(c.repo, "commit", "-qm", f"feature {i}")
+        g(c.repo, "checkout", "-q", "main")
+        g(c.repo, "merge", "-q", "--no-ff", "-m", f"Merge pull request #{i} from o/f{i}", f"f{i}")
+    g(c.repo, "push", "-q", "origin", "main")
+
+
+class TicketRuns(unittest.TestCase):
+
+    def test_plan_and_apply_stop_inside_a_ticket_run(self):
+        c = Case({"a.txt": lines(5)})
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        code, out, err, plan = c.plan()
+        self.assertEqual(code, 0, out + err)
+        ticket_marker(c.s.sid)
+        code, out, err = c.apply()  # a plan made before the run began does not slip through
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Commit:   no — stop: a /ticket run LOCAL-17 is on — its gate makes the "
+                      "commit", out)
+        code, out, err, plan = c.plan(lang="ru")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Коммит:   нет — стоп: идёт прогон /ticket LOCAL-17 — коммит делает шлюз "
+                      "тикета", out)
+        self.assertIn("verdict: stop", out)
+        self.assertEqual(g(c.repo, "rev-list", "--count", "HEAD"), "1\n")
+
+    def test_earlier_session_of_a_ticket_run_passed_with_session_is_named_as_bypassing_the_gate(
+            self):
+        c = Case({"a.txt": lines(5)})
+        earlier = Session(c.cfg, c.repo)
+        earlier.main.edit(c.p("a.txt"), "line 3", "TICKET WORK")
+        ticket_marker(earlier.sid)
+        code, out, err, plan = c.plan("--session", c.s.sid, "--session", earlier.sid)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"Task:     session {earlier.sid} ran /ticket LOCAL-17 — its work bypasses "
+                      f"the ticket gate (/resume {earlier.sid} to go through it)", out)
+
+    def test_ticket_invocation_in_the_transcript_stops_without_the_marker(self):
+        c = Case({"a.txt": lines(5)})
+        c.t._put({"type": "user", "origin": {"kind": "human"}, "message": {
+            "role": "user", "content": "<command-message>kensei-toolkit:ticket</command-message>"
+            "\n<command-name>/kensei-toolkit:ticket</command-name>\n<command-args>"
+            "https://app.clickup.com/t/9012/869fejukt fix</command-args>"}})
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        code, out, err, plan = c.plan()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("a /ticket run 869fejukt is on", out)
+
+    def test_ticket_text_in_a_command_output_is_no_run(self):
+        c = Case({"a.txt": lines(5)})
+        c.t.bash("grep -r command-name ~/.claude/projects",
+                 "<command-message>kensei-toolkit:ticket</command-message>\n"
+                 "<command-name>/kensei-toolkit:ticket</command-name>")
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        self.assertEqual(c.plan()[0], 0)
+
+
+class Tasks(unittest.TestCase):
+    URL = "https://app.clickup.com/t/9012/869fejukt"
+
+    def test_task_ids_are_read_from_tracker_links(self):
+        for ref, tid in [(self.URL, "869fejukt"), ("https://app.clickup.com/t/869fejukt",
+                                                   "869fejukt"),
+                         ("https://acme.atlassian.net/browse/ENG-12", "ENG-12"),
+                         ("https://linear.app/acme/issue/ENG-3/fix-the-thing", "ENG-3"),
+                         ("https://github.com/o/r/issues/45", "45"), ("#45", "45"),
+                         ("869fejukt", "869fejukt")]:
+            self.assertEqual(sc.task_of(ref)[0], tid, ref)
+        self.assertIsNone(sc.task_of("not an id!"))
+
+    def test_task_id_from_a_board_link_is_the_opened_issue_not_the_board(self):
+        for ref, tid in [
+                ("https://acme.atlassian.net/jira/software/projects/ENG/boards/3"
+                 "?selectedIssue=ENG-12", "ENG-12"),
+                ("https://acme.atlassian.net/jira/software/projects/ENG/issues/?jql=x"
+                 "&selectedIssue=ENG-12", "ENG-12"),
+                ("https://yt.acme.com/agiles/1-2/current?issue=PROJ-7", "PROJ-7"),
+                ("https://yt.acme.com/issue/PROJ-7/some-title", "PROJ-7"),
+                ("https://www.notion.so/acme/Fix-it-0123456789abcdef0123456789abcdef",
+                 "0123456789abcdef0123456789abcdef"),
+                ("https://app.asana.com/0/1200000000000001/1200000000000002",
+                 "1200000000000002")]:
+            self.assertEqual(sc.task_of(ref)[0], tid, ref)
+        for ref in ("https://acme.atlassian.net/jira/software/projects/ENG/boards/3",
+                    "https://yt.acme.com/agiles/1-2/current"):
+            self.assertIsNone(sc.task_of(ref), ref)
+
+    def test_task_link_without_an_id_stops_and_asks_for_the_id(self):
+        c = Case({"a.txt": lines(5)})
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        code, out, err, plan = c.plan("--task", "https://acme.atlassian.net/jira/software/"
+                                      "projects/ENG/boards/3")
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("no task id in it — pass --task <id>", out + err)
+        self.assertTrue(sc.mentions_task("Fix (869fejukt)\n", {"id": "869fejukt", "url": None}))
+        self.assertFalse(sc.mentions_task("Fix 869fejuktx\n", {"id": "869fejukt", "url": None}))
+        self.assertFalse(sc.mentions_task("Fix 45 items\n", {"id": "45", "url": None}))
+        self.assertTrue(sc.mentions_task("Fix (#45)\n", {"id": "45", "url": None}))
+
+    def test_task_on_main_gets_its_branch_and_main_follows_it(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        write_file(c.p("b.txt"), "foreign\n")
+        args = ("--task", self.URL, "--branch", "task/869fejukt-shield-hit")
+        code, out, err, plan = c.plan(*args, lang="ru")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Ветка:    task/869fejukt-shield-hit — создам от main", out)
+        self.assertIn("Задача:   869fejukt — ссылка в сообщении коммита", out)
+        self.assertIn("В main:   да — ветка task/869fejukt-shield-hit → fast-forward main", out)
+        code, out, err = c.apply(msg="Shield hit effect (869fejukt)\n\n" + self.URL + "\n")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Ветка:    task/869fejukt-shield-hit — создана от main", out)
+        self.assertIn("Задача:   869fejukt — ссылка в сообщении коммита", out)
+        self.assertEqual(g(c.repo, "branch", "--show-current"), "task/869fejukt-shield-hit\n")
+        self.assertEqual(g(c.repo, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
+        self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
+        self.assertIn("SHIELD", c.show("a.txt"))
+        self.assertEqual(read_file(c.p("b.txt")), b"foreign\n")  # someone's change stays
+
+    def test_message_without_the_task_is_refused_before_any_write(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        c.plan("--task", self.URL, "--branch", "task/869fejukt-shield-hit")
+        code, out, err = c.apply(msg="Shield hit effect\n")
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("does not name task 869fejukt", err)
+        self.assertEqual(g(c.repo, "branch", "--show-current"), "main\n")
+        self.assertEqual(g(c.repo, "branch", "--list", "task/*"), "")
+        self.assertEqual(g(c.repo, "rev-list", "--count", "HEAD"), "1\n")
+
+    def test_existing_branch_of_the_task_stops_naming_it(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        g(c.repo, "checkout", "-q", "-b", "task/869fejukt-old")
+        g(c.repo, "commit", "-q", "--allow-empty", "-m", "earlier work (869fejukt)")
+        g(c.repo, "checkout", "-q", "main")
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        code, out, err, plan = c.plan("--task", "869fejukt", "--branch", "task/869fejukt-new")
+        self.assertEqual((code, plan["verdict"]), (1, "stop"), out + err)
+        self.assertIn("Branch:   no — stop: branch task/869fejukt-old already exists — not "
+                      "switching onto it", out)
+        self.assertEqual(c.apply(msg="x (869fejukt)\n")[0], 1)
+        self.assertEqual(g(c.repo, "branch", "--show-current"), "main\n")
+
+    def test_task_line_says_named_and_is_left_out_of_a_stopped_plan(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        code, out, err, plan = c.plan("--task", "869fejukt", "--no-push")
+        self.assertIn("Task:     869fejukt — named in the commit message (checked at apply)", out)
+        code, out, err = c.apply(msg="Shield (869fejukt)\n")
+        self.assertIn("Task:     869fejukt — named in the commit message\n", out)
+        g(c.repo, "checkout", "-q", "main")
+        c.t.edit(c.p("a.txt"), "line 4", "MORE")
+        code, out, err, plan = c.plan("--task", "869fejukt")  # its branch is there: a stop
+        self.assertEqual(plan["verdict"], "stop", out + err)
+        self.assertNotIn("Task:", out)
+
+    def test_existing_task_branch_already_in_main_is_offered_for_deletion(self):
+        for lang, want in (("en", "Branch:   no — stop: branch task/869fejukt-old is already in "
+                                  "main — delete it (git branch -d task/869fejukt-old) and run "
+                                  "/commit again"),
+                           ("ru", "Ветка:    нет — стоп: ветка task/869fejukt-old уже в main — "
+                                  "удали её (git branch -d task/869fejukt-old) и снова /commit")):
+            with self.subTest(lang=lang):
+                c = Case({"a.txt": lines(5)})
+                g(c.repo, "branch", "task/869fejukt-old")  # landed: main holds all of it
+                c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+                code, out, err, plan = c.plan("--task", "869fejukt", lang=lang)
+                self.assertEqual((code, plan["verdict"]), (1, "stop"), out + err)
+                self.assertIn(want, out)
+                self.assertNotIn("git switch", out)
+
+    def test_another_branch_of_the_task_does_not_offer_another_branch_name(self):
+        c = Case({"a.txt": lines(5)})
+        g(c.repo, "branch", "task/869fejukt-old")
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        code, out, err, plan = c.plan("--task", "869fejukt", "--branch", "task/869fejukt-new")
+        self.assertNotIn("--branch", out)
+        g(c.repo, "branch", "task/869fejukt-new")
+        code, out, err, plan = c.plan("--task", "869fejukt", "--branch", "task/869fejukt-new")
+        self.assertNotIn("--branch", out)
+        code, out, err, plan = c.plan("--pr", "--branch", "task/869fejukt-new")
+        self.assertIn("or pass another name with --branch", out)
+
+    def test_taken_branch_checked_out_in_a_worktree_says_commit_there_not_switch(self):
+        c = Case({"a.txt": lines(5)})
+        wt = os.path.join(os.path.realpath(mkdir()), "ticket-869fejukt")
+        g(c.repo, "worktree", "add", "-q", "-b", "task/869fejukt-shield", wt, "main")
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        code, out, err, plan = c.plan("--task", "869fejukt")
+        self.assertEqual((code, plan["verdict"]), (1, "stop"), out + err)
+        self.assertIn(f"branch task/869fejukt-shield already exists and is checked out in the "
+                      f"worktree at {wt} — commit there", out)
+        self.assertNotIn("git switch", out)
+
+    def test_stopped_plan_on_another_branch_does_not_forecast_committing_there(self):
+        c = Case({"a.txt": lines(5)})
+        g(c.repo, "checkout", "-q", "-b", "feature")
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        write_file(c.p("a.txt"), read_file(c.p("a.txt")) + b"theirs\n")
+        g(c.repo, "add", "a.txt")  # someone staged a change on the session's path
+        code, out, err, plan = c.plan("--task", "869fejukt")
+        self.assertEqual(plan["verdict"], "stop", out + err)
+        self.assertIn("Branch:   no — stopped, see Commit", out)
+        self.assertNotIn("committing there", out)
+
+    def test_direct_task_branch_of_another_session_is_not_committed_onto(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        c.t.edit(c.p("a.txt"), "line 3", "A WORK")
+        c.plan("--task", "T1", "--branch", "task/T1-a", "--no-merge", "--no-push")
+        self.assertEqual(c.apply("--no-merge", "--no-push", msg="A work (T1)\n")[0], 0)  # the shared checkout stays on task/T1-a
+        a, tip = c.s, g(c.repo, "rev-parse", "HEAD")
+        c.s = Session(c.cfg, c.repo)  # another tab in the same checkout, no task
+        c.s.main.edit(c.p("b.txt"), "b", "B WORK")
+        code, out, err, plan = c.plan()
+        self.assertEqual((code, plan["verdict"]), (1, "stop"), out + err)
+        self.assertIn("Branch:   no — stop: the branch task/T1-a holds commits not made by this "
+                      "session's /commit: ", out)
+        self.assertIn("go back to main (git switch main) and run /commit again for a branch of "
+                      "its own; if an earlier session's /commit made them (a session that has "
+                      "ended, not another open tab: --session also takes all of its uncommitted "
+                      "edits), pass its --session as well as this one's", out)
+        self.assertEqual(c.apply()[0], 1)
+        self.assertEqual(g(c.repo, "rev-parse", "HEAD"), tip)
+        self.assertIn("B WORK", read_file(c.p("b.txt")).decode())
+        # A, after the merge of main its own stop names, still goes ahead on its branch
+        other = os.path.join(os.path.realpath(mkdir()), "main-wt")
+        g(c.repo, "worktree", "add", "-q", other, "main")
+        write_file(os.path.join(other, "m.txt"), "m\n")
+        g(other, "add", "m.txt")
+        g(other, "commit", "-qm", "on main")
+        g(c.repo, "merge", "-q", "--no-edit", "main")
+        c.s = a
+        c.t.edit(c.p("a.txt"), "line 4", "A MORE")
+        code, out, err, plan = c.plan("--task", "T1", "--no-push")
+        self.assertEqual(plan["verdict"], "go", out + err)
+
+    def test_ticket_gate_commit_on_its_task_branch_is_not_committed_onto(self):
+        for lang, want in (("en", "if it is a /ticket gate commit, /resume that session and "
+                                  "publish at its gate"),
+                           ("ru", "если это коммит шлюза /ticket — /resume ту сессию и публикуй в "
+                                  "её шлюзе")):
+            with self.subTest(lang=lang):
+                c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+                g(c.repo, "switch", "-q", "-c", "task/LOCAL-17-discount")
+                write_file(c.p("a.txt"), lines(5).replace("line 2", "GATE"))
+                g(c.repo, "commit", "-qam", "Discount (LOCAL-17)")  # the gate's own commit
+                head_sha = g(c.repo, "rev-parse", "HEAD")
+                c.t.edit(c.p("b.txt"), "b", "B WORK")
+                code, out, err, plan = c.plan("--task", "LOCAL-17", lang=lang)
+                self.assertEqual((code, plan["verdict"]), (1, "stop"), out + err)
+                self.assertIn(want, out)
+                self.assertNotIn("git switch", out)  # going back ends at "already exists"
+                self.assertEqual(c.apply("--task", "LOCAL-17", msg="B (LOCAL-17)\n")[0], 1)
+                self.assertEqual(g(c.repo, "rev-parse", "HEAD"), head_sha)
+
+    def test_no_merge_with_a_task_on_main_plans_the_push_of_the_new_branch(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        code, out, err, plan = c.plan("--task", "T1", "--branch", "task/T1-a", "--no-merge")
+        self.assertEqual((code, plan and plan["verdict"]), (0, "go"), out + err)
+        self.assertIn("Push:     yes — origin/task/T1-a (new branch on origin)", out)
+        self.assertEqual(c.apply("--no-merge", msg="Shield (T1)\n")[0], 0)
+        self.assertEqual(g(c.remote, "rev-parse", "task/T1-a"), g(c.repo, "rev-parse", "HEAD"))
+
+    def test_no_merge_on_another_sessions_pushed_branch_does_not_push_into_it(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        c.t.edit(c.p("a.txt"), "line 3", "A WORK")
+        c.plan("--task", "T1", "--branch", "task/T1-a", "--no-merge", "--no-push")
+        self.assertEqual(c.apply("--no-merge", "--no-push", msg="A work (T1)\n")[0], 0)
+        g(c.repo, "push", "-q", "-u", "origin", "task/T1-a")  # A's branch and PR
+        tip = g(c.remote, "rev-parse", "task/T1-a")
+        c.s = Session(c.cfg, c.repo)
+        c.s.main.edit(c.p("b.txt"), "b", "B WORK")
+        code, out, err, plan = c.plan("--no-merge")
+        self.assertEqual((code, plan["verdict"]), (1, "stop"), out + err)
+        self.assertEqual(c.apply("--no-merge")[0], 1)
+        self.assertEqual(g(c.remote, "rev-parse", "task/T1-a"), tip)
+
+    def test_branch_stop_says_when_git_switch_back_would_be_refused(self):
+        c = Case({"a.txt": lines(5), "CLAUDE.md": lines(12)}, remote=True)
+        c.t.edit(c.p("CLAUDE.md"), "line 3", "RULE")
+        write_file(c.p("CLAUDE.md"), read_file(c.p("CLAUDE.md")).replace(b"line 10", b"THEIRS"))
+        c.plan("--task", "T1", "--branch", "task/T1-a", "--no-merge", "--no-push")
+        self.assertEqual(c.apply("--no-merge", "--no-push", msg="A work (T1)\n")[0], 0)  # CLAUDE.md committed in part
+        c.s = Session(c.cfg, c.repo)
+        c.s.main.edit(c.p("a.txt"), "line 3", "B WORK")
+        for args in (("--task", "T2"), ()):
+            with self.subTest(args=args):
+                code, out, err, plan = c.plan(*args)
+                self.assertEqual(plan["verdict"], "stop", out + err)
+                self.assertIn("git switch main would be refused: CLAUDE.md has uncommitted "
+                              "changes (maybe someone else's) that main changes; no stash", out)
+                self.assertNotIn("go back to main", out)
+        proc = subprocess.run(["git", "switch", "main"], cwd=c.repo, env=BASE_ENV,
+                              capture_output=True)
+        self.assertNotEqual(proc.returncode, 0)  # git does refuse it
+
+    def test_stopped_plan_forecasts_no_branch_and_no_task_link(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"})
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        write_file(c.p("a.txt"), read_file(c.p("a.txt")) + b"theirs\n")
+        g(c.repo, "add", "a.txt")  # someone staged a change on the session's path
+        code, out, err, plan = c.plan("--task", "869fejukt")
+        self.assertEqual(plan["verdict"], "stop", out + err)
+        self.assertIn("Branch:   no — stopped, see Commit", out)
+        self.assertNotIn("will create it", out)
+        g(c.repo, "reset", "-q")
+        c2 = Case({"a.txt": lines(5)})
+        code, out, err, plan = c2.plan("--task", "869fejukt")  # nothing to commit
+        self.assertNotIn("Task:", out)
+
+    def test_task_on_another_tasks_branch_stops(self):
+        c = Case({"a.txt": lines(5)})
+        g(c.repo, "checkout", "-q", "-b", "task/869fhab12-npc-shield")
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        code, out, err, plan = c.plan("--task", "869fzzz99")
+        self.assertEqual((code, plan["verdict"]), (1, "stop"), out + err)
+        self.assertIn("Branch:   no — stop: task/869fhab12-npc-shield is another task's branch, "
+                      "not 869fzzz99's; go back to main (git switch main) and run /commit again", out)
+        code, out, err, plan = c.plan("--task", "869fhab12")
+        self.assertIn("Branch:   task/869fhab12-npc-shield — committing there", out)
+
+    def test_branch_made_despite_a_failing_post_checkout_hook_is_reported_made(self):
+        c = Case({"a.txt": lines(5)})
+        write_file(c.p(".git/hooks/post-checkout"), "#!/bin/sh\necho hook broke >&2\nexit 2\n")
+        os.chmod(c.p(".git/hooks/post-checkout"), 0o755)
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        c.plan("--task", "869fejukt", "--branch", "task/869fejukt-shield", "--no-push")
+        code, out, err = c.apply("--no-push", msg="Shield (869fejukt)\n")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Branch:   task/869fejukt-shield — created from main (the post-checkout "
+                      "hook failed: hook broke)", out)
+        self.assertIn("SHIELD", c.show("a.txt", "task/869fejukt-shield"))
+
+    def test_task_on_another_branch_is_committed_there(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        g(c.repo, "checkout", "-q", "-b", "feature")
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        code, out, err, plan = c.plan("--task", self.URL, "--no-merge")
+        self.assertIn("Branch:   feature — committing there", out)
+        code, out, err = c.apply("--no-merge", msg="Shield\n\n" + self.URL + "\n")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(g(c.repo, "branch", "--show-current"), "feature\n")
+        self.assertEqual(g(c.remote, "rev-parse", "feature"), g(c.repo, "rev-parse", "HEAD"))
+
+    def test_refused_commit_takes_the_new_branch_back(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        hook = c.p(".git/hooks/pre-commit")
+        write_file(hook, "#!/bin/sh\nexit 1\n")
+        os.chmod(hook, 0o755)
+        c.t.edit(c.p("a.txt"), "line 3", "SHIELD")
+        c.plan("--task", "869fejukt", "--branch", "task/869fejukt-x")
+        code, out, err = c.apply(msg="x (869fejukt)\n")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("Branch:   task/869fejukt-x removed — no commit; back on main", out)
+        self.assertEqual(g(c.repo, "branch", "--show-current"), "main\n")
+        self.assertEqual(g(c.repo, "branch", "--list", "task/*"), "")
+
+
+class PullRequestRepos(unittest.TestCase):
+
+    def test_pr_history_is_detected_and_main_is_never_touched(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        pr_history(c)
+        log = fake_gh(c)
+        main = g(c.repo, "rev-parse", "main")
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        code, out, err, plan = c.plan(lang="ru")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Ветка:    session/<тема коммита> — создам от main", out)
+        self.assertIn("В main:   нет — в этом репо через PR (4 из 5 последних коммитов main "
+                      "пришли через PR)", out)
+        self.assertIn("PR:       не открываю сам — открой PR из session/<тема> в main", out)
+        code, out, err = c.apply(msg="Ускорить загрузку уровня\n\nТело коммита.\n")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Ветка:    session/uskorit-zagruzku-urovnya — создана от main", out)
+        self.assertIn("Push:     готово — origin/session/uskorit-zagruzku-urovnya", out)
+        self.assertIn("PR:       не открываю сам — открой PR из session/uskorit-zagruzku-urovnya в "
+                      "main (с GitHub CLI: gh pr create --fill --base main --head "
+                      "session/uskorit-zagruzku-urovnya)", out)
+        self.assertEqual(g(c.repo, "rev-parse", "main"), main)
+        self.assertEqual(g(c.remote, "rev-parse", "main"), main)
+        self.assertEqual(g(c.repo, "rev-parse", "--abbrev-ref", "@{upstream}"),
+                         "origin/session/uskorit-zagruzku-urovnya\n")
+        self.assertFalse(os.path.exists(log))  # gh never ran
+
+    def test_pr_line_names_the_github_page_to_open_the_pr_and_gh_never_runs(self):
+        for url in ("https://github.com/o/r.git", "git@github.com:o/r.git"):
+            with self.subTest(url=url):
+                c = Case({"a.txt": lines(5)}, remote=True)
+                g(c.repo, "config", f"url.{c.remote}.insteadOf", url)
+                g(c.repo, "remote", "set-url", "origin", url)
+                g(c.repo, "checkout", "-q", "-b", "task/77-x")
+                log = fake_gh(c)
+                c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+                want = ("PR:       not opened by /commit — open it (or see the open one): "
+                        "https://github.com/o/r/compare/main...task/77-x?expand=1")
+                code, out, err, plan = c.plan("--pr", "--task", "77")
+                self.assertIn(want, out)
+                code, out, err = c.apply("--pr", "--task", "77", msg="Fix (#77)\n")
+                self.assertEqual(code, 0, out + err)
+                self.assertIn(want, out)
+                self.assertEqual(g(c.remote, "rev-parse", "task/77-x"), g(c.repo, "rev-parse",
+                                                                          "HEAD"))
+                self.assertFalse(os.path.exists(log))  # gh never ran
+
+    def test_session_branch_name_taken_on_origin_gets_a_suffix(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        pr_history(c)
+        g(c.repo, "push", "-q", "origin", "main:refs/heads/session/fix-typo")
+        g(c.repo, "fetch", "-q", "origin")
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        c.plan()
+        code, out, err = c.apply(msg="Fix typo\n")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Branch:   session/fix-typo-2 — created from main", out)
+
+    def test_pr_branch_of_another_session_is_not_committed_onto_even_with_its_task(self):
+        for lang, want in (("en", "Branch:   no — stop: the branch task/T1-x holds commits not "
+                                  "made by this session's /commit: "),
+                           ("ru", "нет — стоп: на ветке task/T1-x коммиты не из /commit этой "
+                                  "сессии: ")):
+            c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+            c.t.edit(c.p("a.txt"), "line 3", "X WORK")
+            c.plan("--pr", "--task", "T1", "--branch", "task/T1-x")
+            self.assertEqual(c.apply("--pr", msg="X work (T1)\n")[0], 0)
+            tip = g(c.remote, "rev-parse", "task/T1-x")
+            x_sid = c.s.sid
+            c.s = Session(c.cfg, c.repo)  # another session in the same checkout, no task
+            c.s.main.edit(c.p("b.txt"), "b", "Y WORK")
+            code, out, err, plan = c.plan("--pr", lang=lang)
+            self.assertEqual(plan["verdict"], "stop", out + err)
+            self.assertIn(want, out)
+            self.assertIn("X work (T1)", out)
+            self.assertEqual(c.apply("--pr")[0], 1)
+            self.assertEqual(g(c.remote, "rev-parse", "task/T1-x"), tip)
+            self.assertIn("Y WORK", read_file(c.p("b.txt")).decode())
+            # the task taken from the branch name proves nothing: still a stop, and no push
+            c.s.main.edit(c.p("b.txt"), "Y WORK", "Y WORK (T1)")
+            code, out, err, plan = c.plan("--pr", "--task", "T1", lang=lang)
+            self.assertEqual(plan["verdict"], "stop", out + err)
+            self.assertIn(want, out)
+            self.assertNotIn("Task:", out)
+            self.assertNotIn("Задача:", out)
+            self.assertEqual(c.apply("--pr", msg="Y work (T1)\n")[0], 1)
+            self.assertEqual(g(c.remote, "rev-parse", "task/T1-x"), tip)
+            # the task's earlier session, passed with --session, makes those commits its own
+            code, out, err, plan = c.plan("--pr", "--task", "T1", "--session", x_sid,
+                                          "--session", c.s.sid, lang=lang)
+            self.assertEqual(plan["verdict"], "go", out + err)
+
+    def test_pushed_branch_without_this_sessions_commits_is_neither_pushed_nor_given_a_pr(self):
+        for shape in ("another session's", "a person's"):
+            for lang, want in (("en", "no — the branch holds no commit made by this session's "
+                                      "/commit — if the branch is yours, open its PR yourself"),
+                               ("ru", "нет — на ветке нет коммитов /commit этой сессии — если "
+                                      "ветка твоя, открой её PR сам")):
+                with self.subTest(shape=shape, lang=lang):
+                    c = Case({"a.txt": lines(5)}, remote=True)
+                    pr_history(c)
+                    if shape == "a person's":
+                        g(c.repo, "checkout", "-q", "-b", "feature/human")
+                        write_file(c.p("h.txt"), "wip\n")
+                        g(c.repo, "add", "h.txt")
+                        g(c.repo, "commit", "-qm", "Human WIP")
+                        g(c.repo, "push", "-q", "-u", "origin", "feature/human")
+                    else:
+                        c.t.edit(c.p("a.txt"), "line 3", "X WORK")
+                        c.plan("--task", "T1", "--branch", "task/T1-x")
+                        self.assertEqual(c.apply(msg="X work (T1)\n")[0], 0)
+                        c.s = Session(c.cfg, c.repo)  # this session changed nothing here
+                    code, out, err, plan = c.plan(lang=lang)
+                    self.assertEqual(plan["verdict"], "nothing", out + err)
+                    self.assertIn("PR:       " + want, out)
+                    code, out, err = c.apply()
+                    self.assertEqual(code, 0, out + err)
+                    self.assertIn("PR:       " + want, out)
+
+    def test_someones_unpushed_clean_merge_on_their_branch_is_not_pushed(self):
+        for mode in ("--pr", "--no-merge"):
+            with self.subTest(mode=mode):
+                c = Case({"a.txt": lines(5)}, remote=True)
+                g(c.repo, "checkout", "-q", "-b", "feature/human")
+                write_file(c.p("h.txt"), "wip\n")
+                g(c.repo, "add", "h.txt")
+                g(c.repo, "commit", "-qm", "Human WIP")
+                g(c.repo, "push", "-q", "-u", "origin", "feature/human")
+                other = os.path.join(os.path.realpath(mkdir()), "other")
+                g(c.repo, "worktree", "add", "-q", other, "main")
+                write_file(os.path.join(other, "m.txt"), "m\n")
+                g(other, "add", "m.txt")
+                g(other, "commit", "-qm", "on main")
+                g(other, "push", "-q", "origin", "main")
+                g(c.repo, "fetch", "-q", "origin")
+                g(c.repo, "merge", "-q", "--no-edit", "origin/main")  # theirs, clean, unpushed
+                tip = g(c.remote, "rev-parse", "feature/human")
+                code, out, err, plan = c.plan(mode)  # this session changed nothing here
+                self.assertEqual(plan["verdict"], "nothing", out + err)
+                self.assertIn("Push:     no — the branch holds no commit made by this session's "
+                              "/commit", out)
+                self.assertEqual(c.apply(mode)[0], 0)
+                self.assertEqual(g(c.remote, "rev-parse", "feature/human"), tip)
+
+    def test_rerun_with_nothing_new_names_the_pr_page_again(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        g(c.repo, "checkout", "-q", "-b", "feature")
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        c.plan("--pr")
+        self.assertEqual(c.apply("--pr")[0], 0)
+        code, out, err, plan = c.plan("--pr")
+        self.assertEqual(plan["verdict"], "nothing", out + err)
+        self.assertIn("Push:     no — origin/feature already has everything", out)
+        self.assertIn("PR:       not opened by /commit — open a PR from feature into main", out)
+
+    def test_pr_branch_with_nothing_beyond_main_is_neither_pushed_nor_promised_a_pr(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        g(c.repo, "checkout", "-q", "-b", "feature")
+        code, out, err, plan = c.plan("--pr")
+        self.assertEqual(plan["verdict"], "nothing", out + err)
+        self.assertIn("PR:       no — the branch has nothing beyond origin/main", out)
+        self.assertNotIn("open a PR", out)
+        code, out, err = c.apply("--pr")
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("feature", g(c.remote, "branch"))
+
+    def test_main_override_in_a_pr_repository_fast_forwards_main(self):
+        c = Case({"a.txt": lines(5)}, remote=True)
+        pr_history(c)
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        code, out, err, plan = c.plan("--main")
+        self.assertNotIn("Branch:", out)
+        code, out, err = c.apply("--main")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
+        self.assertNotIn("PR:", out)
+
+    def test_direct_commits_naming_issues_are_not_taken_for_squash_merges(self):
+        for committer, mode in (("t@t", "direct"), ("noreply@github.com", "pr")):
+            with self.subTest(committer=committer):
+                c = Case({"a.txt": lines(5)}, remote=True)
+                env = dict(BASE_ENV, GIT_COMMITTER_EMAIL=committer)
+                for i in range(1, 4):
+                    write_file(c.p(f"f{i}.txt"), f"{i}\n")
+                    g(c.repo, "add", f"f{i}.txt")
+                    subprocess.run(["git", "commit", "-qm", f"Fix thing {i} (#{i})"], cwd=c.repo,
+                                   env=env, check=True)
+                g(c.repo, "push", "-q", "origin", "main")
+                log = fake_gh(c)
+                c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+                code, out, err, plan = c.plan("--task", "#14", lang="ru")
+                self.assertEqual((code, plan["mode"]), (0, mode), out + err)
+                if mode == "pr":
+                    self.assertIn("В main:   нет — в этом репо через PR (3 из 4 последних "
+                                  "коммитов main пришли через PR)", out)
+                    continue
+                self.assertNotIn("через PR", out)
+                code, out, err = c.apply(msg="Fix level load (#14)\n")
+                self.assertEqual(code, 0, out + err)
+                self.assertEqual(g(c.remote, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
+                self.assertEqual(g(c.repo, "rev-parse", "main"), g(c.repo, "rev-parse", "HEAD"))
+                self.assertFalse(os.path.exists(log))  # gh never ran
+
+    def test_pr_repository_on_main_with_someones_unpushed_commit_says_review_them(self):
+        for lang, want in (("en", "hand work — not publishing them; review and push them "
+                                  "yourself"),
+                           ("ru", "hand work — их не публикую; проверь и запушь их сам")):
+            with self.subTest(lang=lang):
+                c = Case({"a.txt": lines(5)}, remote=True)
+                pr_history(c)
+                write_file(c.p("h.txt"), "h\n")
+                g(c.repo, "add", "h.txt")
+                g(c.repo, "commit", "-qm", "hand work")
+                code, out, err, plan = c.plan(lang=lang)
+                self.assertEqual((code, plan["verdict"]), (1, "stop"), out + err)
+                self.assertIn(want, out)
+                self.assertNotIn("git switch -c", out)
+
+    def test_pr_repository_on_main_with_unpushed_commits_stops(self):
+        c = Case({"a.txt": lines(5), "b.txt": "b\n"}, remote=True)
+        pr_history(c)
+        c.t.edit(c.p("a.txt"), "line 3", "SESSION")
+        self.assertEqual(c.land("--main", "--no-push")[0], 0)
+        code, out, err, plan = c.plan()
+        self.assertEqual((code, plan["verdict"]), (1, "stop"), out + err)
+        self.assertIn("main has 1 commit origin lacks, and this repository takes work through "
+                      "PRs — not pushing main", out)
 
 
 if __name__ == "__main__":

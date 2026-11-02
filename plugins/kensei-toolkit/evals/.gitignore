@@ -6,3 +6,4 @@ report.html
 [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*-*-*-*.jsonl
 # generated per clone by make_history.py
 ticket-commit-at-gate/history.jsonl
+ticket-commit-skill-at-gate/history.jsonl

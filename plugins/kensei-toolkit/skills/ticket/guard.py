@@ -202,6 +202,19 @@ else («тесты не трогай») voids nothing.
                  calendar («создай событие в календаре», «назначь встречу») — «напиши сообщение
                  коммита» and «добавь событие в лог» are no send. «обнови описание PR» / "update
                  the PR description" is a tracker edit.
+  the commit skill  a typed `/kensei-toolkit:commit` (or `/commit`) is «закоммить» + «запушь»:
+                 inside a /ticket run that skill hands both to the gate. `pr` in its arguments
+                 adds the PR, `main` the merge into and push to the base branch (keys only as
+                 the leading argument words; without the push, `main` is the local merge alone);
+                 `local` / `locally` / `no-push`, or any word of a push in the arguments («не
+                 пушить», "push later"), leave the push out; a hint that holds something back
+                 («не вливай в main») leaves only the commit; `plan` orders nothing. When the
+                 model invokes the skill kensei-toolkit:commit after a typed «закоммить» (not
+                 a typed /kensei-toolkit:commit, which settles the push itself), the push joins
+                 that command once — not when the
+                 user's words mention a push at all («не пушь», «пуш потом») or hold it back
+                 («только закоммить», «локально»); the model's own
+                 arguments to it add nothing else
   AskUserQuestion answers after that message: an option the user picked grants exactly the tags
                  in its label — [commit] [merge-local] [push] [pr] [merge] [force-push]
                  [publish] [repo-admin] [reset] [delete-branch] [status] [create-task] [tracker-edit]
@@ -784,6 +797,60 @@ def human_text(entry):
     return text
 
 
+COMMIT_SKILL = re.compile(r"^/?(?:kensei-toolkit:)?commit$")
+COMMIT_KEYS = {"plan", "local", "no-merge", "no-push", "pr", "main"}
+NO_PUSH_ARGS = re.compile(r"(?<![\w-])(?:local(?:ly)?|no-push)(?![\w-])|без\s+пуш|локальн|"
+                          r"только\s+(?:за)?комм?ит", re.I)
+PUSH_WORD = re.compile(r"пуш|push", re.I)  # any word of a push: then only detect() grants it
+
+
+def commit_command(text):
+    """What the commit skill typed as a command orders: `/kensei-toolkit:commit` (or `/commit`)
+    is «закоммить» + «запушь» — inside a /ticket run that skill hands both to the gate. Its
+    leading argument words are keys: `pr` adds the PR, `main` the merge into the base branch
+    and the push there, `local` / `no-push` leave the push out, `plan` orders nothing; the rest
+    is a message hint, read as typed text. Any word of a push in the arguments («не пушить»,
+    "push later") leaves the implicit push out, and a hint that holds something back («не
+    вливай в main») keeps only the commit. -> the actions, or None when the text is not that
+    command."""
+    m = re.match(r"\s*(?:<command-message>[^<]*</command-message>\s*)?"
+                 r"<command-name>\s*(/[^<\s]*)\s*</command-name>", text or "")
+    if m:
+        args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+        name, args = m.group(1), args.group(1) if args else ""
+    else:  # a queued message keeps the typed form: `/kensei-toolkit:commit pr`
+        m = re.match(r"\s*(/\S+)(.*)\Z", text or "", re.S)
+        if not m:
+            return None
+        name, args = m.group(1), m.group(2)
+    if not COMMIT_SKILL.match(name):
+        return None
+    words = normalize_text(args).split()
+    keys = set()
+    for w in words:
+        if w not in COMMIT_KEYS:
+            break
+        keys.add(w)
+    if "plan" in keys:
+        return set()
+    grants = {"commit"} | detect(args)
+    if revokes(args):
+        return grants
+    if not NO_PUSH_ARGS.search(args) and not PUSH_WORD.search(args):
+        grants.add("push")
+    if "pr" in keys:
+        grants.add("pr")
+    if "main" in keys:  # the push to main ("force") only with the push: `main local` is local
+        grants |= {"merge-local", "force"} if "push" in grants else {"merge-local"}
+    return grants
+
+
+def raw_text(entry):
+    if entry.get("type") == "attachment":
+        return blocks_text(entry["attachment"].get("prompt"))
+    return blocks_text(entry.get("message", {}).get("content"))
+
+
 def is_human(entry):
     if entry.get("isSidechain") or entry.get("isMeta"):
         return False
@@ -1026,7 +1093,15 @@ def read_authorization(transcript_path, cwd):
             return None, set(), set(), set(), set(), failure
     text = human_text(human) if human else None
     typed = detect(text) if text else set()
+    ordered = commit_command(raw_text(human)) if human else None
+    if ordered is not None:
+        typed = ordered
     actions = set(typed)
+    # the push a model-invoked commit skill adds, once per command; a typed commit command
+    # (/kensei-toolkit:commit) has settled the push itself
+    skill_push = ordered is not None
+    # «не пушь», «пуш потом», «только закоммить», «локально»: no skill push
+    said_push = bool(text and (PUSH_WORD.search(text) or NO_PUSH_ARGS.search(text)))
     approved, used, unseen = set(), set(), set()
     # status grants: the tasks a typed status command named, each changed once; or, when it
     # named none (or an option carried [status]), one change of any task
@@ -1040,10 +1115,16 @@ def read_authorization(transcript_path, cwd):
     for entry in after:
         if is_queued(entry):  # queued mid-turn: adds its orders, or holds everything back
             text = queued_text = human_text(entry)
+            said_push = said_push or bool(PUSH_WORD.search(queued_text)
+                                          or NO_PUSH_ARGS.search(queued_text))
             if revokes(queued_text):  # it voids every command so far and grants nothing itself
                 actions, approved, typed, refs, open_status = set(), set(), set(), set(), False
                 continue
-            granted = detect(queued_text)
+            granted = commit_command(raw_text(entry))
+            if granted is None:
+                granted = detect(queued_text)
+            else:
+                skill_push = True
             if "status" in granted:  # adds to what the earlier message named
                 named = status_refs(queued_text)
                 refs |= named
@@ -1056,12 +1137,23 @@ def read_authorization(transcript_path, cwd):
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     calls[b.get("id")] = b
+                    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
                     if b.get("name") == "Skill" and re.search(
-                            r"(?:^|:)ticket$", str((b.get("input") or {}).get("skill", ""))):
+                            r"(?:^|:)ticket$", str(inp.get("skill", ""))):
                         actions -= typed  # the model invoked /ticket: earlier typing is void
                         if "status" in typed:
                             refs, open_status = set(), False
                         typed = set()
+                    elif b.get("name") == "Skill" and str(inp.get("skill", "")) == \
+                            "kensei-toolkit:commit" and "commit" in typed and not skill_push \
+                            and not said_push \
+                            and not NO_PUSH_ARGS.search(str(inp.get("args") or "")):
+                        # the model took the user's typed «закоммить» to the commit skill, which
+                        # is commit + push: the push joins the command (the skill's own
+                        # arguments, chosen by the model, add nothing else)
+                        skill_push = True
+                        actions.add("push")
+                        typed = typed | {"push"}
         elif entry.get("type") == "user" and isinstance(content, list):
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "tool_result":

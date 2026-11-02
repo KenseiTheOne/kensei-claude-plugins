@@ -3,6 +3,196 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.2.1 — 2026-11-02
+
+### commit
+2.2.1 makes `/commit` smaller: the parts of 2.2.0 that guessed — and the review rounds kept
+finding holes in — are replaced by simple rules or by a stop that names the way out.
+`sessioncommit.py` 3,594 → 3,749 lines with tasks and PR repositories added (3,123 before
+them); tests 157 → 225.
+
+- **Publishing is fast-forward only (behaviour change).** After the commit the script pushes
+  the branch, moves main to the branch by fast-forward (`git merge --ff-only` in main's checkout,
+  with `merge.autoStash` off and `--no-overwrite-ignore`; a ref update when main is checked out
+  nowhere) and pushes main. It no longer rebases onto origin, takes main into the branch by
+  rebase or merge, merges `--no-ff` into main, or creates a missing local main. Each of those
+  situations is now a stop after the commit that names the merge to run, e.g. `main ушёл вперёд
+  на 3 коммита — влей main в ветку (git merge main) и снова /commit`, `origin/main ушёл вперёд
+  на 1 коммит — влей его в main (git merge origin/main) …`, both merges when main and
+  origin/main diverged, or `локальной ветки main нет — создай её (git branch main origin/main)`
+  (naming `git remote set-head origin -a` too when a stale origin/HEAD is possible). A clean
+  merge the user makes that way is not "someone's commit" on the next run; a hand-resolved one
+  is (see below). From a branch, only main is pushed; `/commit no-merge` pushes the branch.
+- **`plan` forecasts with apply's own code.** The publishing code runs dry in `plan` (local
+  refs, no fetch, no writes, the coming commit counted on top of HEAD), so the `В main:` /
+  `Push:` lines are apply's decisions on the refs plan saw; 2.2.0 kept a second copy of every
+  rule for the forecast.
+- **Own commits are only the ones `/commit` recorded (behaviour change).** The `[branch sha]`
+  lines read from shell output and the HEAD-reflog scan for `git commit -q` are gone: a commit
+  the session made itself with `git commit` in Bash is no longer published — publishing stops
+  before it and names it (`коммиты не из /commit этой сессии` / `commits not made by this
+  session's /commit`), with the way out: review and push them yourself, or drop them;
+  `/commit no-merge` where the branch alone would pass. Records are per session, so `--session`
+  added after a `/commit` of the current session commits the earlier session's edits instead of
+  calling them "already in HEAD".
+- **No guessing about edits that reached HEAD another way.** Edits a `/commit` committed are
+  known from its records. For anything else in HEAD (a Bash commit, a hand commit of an agent's
+  rewrite) only the exact core remains: the same change merges cleanly in `git merge-file`, and
+  a file that is HEAD plus only the session's newer edits is committed whole. A file the replay
+  cannot split is skipped, and every such skip reason now ends `— передай --declare, если весь
+  файл твой` / `— --declare it if the whole file is yours`. A file the session created and
+  someone committed by hand after it was written is committed only when HEAD is one of the
+  session's states (plus what the working tree shares); otherwise it is skipped as tangled, so
+  a teammate's committed line they removed on disk again is never reverted in the session's
+  commit.
+- **A workflow agent's Write over an existing file is skipped** — `агент перезаписал файл
+  целиком, не знаю, что в нём было до этого` — unless the session created that file (also in
+  an edit already committed): then it is committed marked `unverified`. 2.2.0's rebuild of the
+  file from the agent's last `Read` is gone.
+- **Shell commands are matched crudely.** Plan lists every file changed or untracked here and
+  not committed whole whose repository path or (unique) file name appears in the text of any
+  shell command of the session — main, subagents, workflow agents — as `named by this session's
+  shell commands`. A refused or hook-blocked command never ran and names nothing; a failed one
+  counts, marked `[failed]`. Every naming command, uncut, is in the run's `commands.json`
+  (`named_by`: file → commands, oldest first), and SKILL.md has the model look there for the
+  write before deciding a file was only read. 2.2.0's `cd`/subshell/quote parsing, "may write"
+  pattern and printed command list are gone. New untracked files of a declared folder that
+  the session's edits did not create get one `Пропуск:` / `Skip:` line (`не взяты новые файлы
+  в объявленных папках`), not a count under `Чужое:` / `Foreign:`.
+- Fixes since 2.2.0:
+  - A merge commit is exempt from the foreign-commit stop only when its tree is exactly git's
+    clean merge of its parents (`git merge-tree --write-tree`); a hand-resolved `git pull`, an
+    amended merge or `-s ours` stops the run instead of being published.
+  - A commit someone made on top of the session's while `git commit` ran is no longer taken
+    back: the run stops, and the next plan finds the session's commit below it, records it and
+    puts the index back. A pending commit is settled only by a plan in its own repository, and
+    `apply` puts recorded index entries back also when the plan's verdict is a stop.
+  - Whole files are checked against the plan once more after hashing (a save in that window was
+    committed and pushed as the session's; now exit 3).
+  - The replay from HEAD for an edit that cannot be undone must give what is on disk, and an
+    undo at a hunk's own line where the same lines occur elsewhere counts only when the result
+    is the working tree (someone's lookalike block shifted onto that line was undone instead).
+  - All-skipped work is not "nothing": `Коммит: нет — правки сессии пропущены (N), см. Пропуск`,
+    `verdict: skipped`, and skipped session files are not counted under `Чужое:` / `Foreign:`.
+  - An orphan branch is never merged into main, on any run. An origin/HEAD whose ref is gone is
+    ignored, and on `main`/`master` tracking origin/<itself> that branch is the default.
+  - Ways out that work: `/commit no-merge` is offered only where it would pass; stops say
+    `git merge`, never `git pull`; a push a protected main rejects names `/commit no-merge`; a
+    remote not named origin is named; every stop before the push prints the Push line;
+    uncommitted changes in main's checkout in the way are foreseen by plan; git's `hint:` and
+    "stash them" lines are left out.
+  - `Ещё:` / `Elsewhere:` counts only the session's files still uncommitted in the other
+    repository; started outside a repository, plan takes the one repository where something of
+    the session is left.
+  - Faster on large repositories: files `git status` does not list are `unchanged` without a
+    HEAD read or replay; `apply` hashes whole files in one git process.
+  - A notebook or binary file the session edited and someone then deleted or renamed is skipped
+    (`deleted after this session's edits`) like a text file; it was committed and pushed as the
+    session's deletion.
+  - A file marked assume-unchanged or skip-worktree with the session's edits is skipped naming
+    the flag and how to clear it, not reported as "no new changes". A CRLF file under
+    `text=auto` / `core.autocrlf` (`true` or `input`) is skipped (commit it with `git add`)
+    instead of committed with every line ending rewritten.
+  - A file git tracks under another letter case than the disk shows (it or its folder renamed
+    only by case, `git status` clean) is skipped as `git хранит его как <X> — на диске другой
+    регистр букв …` / `git tracks it as <X> — the letter case on disk differs …`, not as
+    "untracked before this session" with git's spelling counted foreign.
+  - A failed fetch says `fetch не прошёл` / `fetch failed`, not "no network"; a failed push says
+    `push не прошёл` / `push failed` unless origin refused it (`[rejected]`, `[remote
+    rejected]`, `declined`, `protected`) — a pre-push hook or a bad URL is no longer reported
+    as `origin/main отклонил push` with the protected-branch hint.
+  - Started outside a repository, the Repository line says it is the only repository with this
+    session's work left, not the only one the session edited.
+  - New files whose index entry an earlier run could not update are no longer counted as
+    foreign modified and untracked files.
+  - A post-checkout hook that fails `git switch -c` no longer makes the Branch line say the
+    branch was not made while HEAD is on it: the switch is judged by HEAD.
+  - A new Unity asset whose `.meta` (or whose new folder's `.meta`) Unity has not written yet is
+    skipped — `новый ассет без .meta — Unity его ещё не импортировал` / `a new asset with no
+    .meta yet` — instead of committed and pushed without it, its later `.meta` then left
+    behind as foreign.
+- **Tasks: the link in the message, a task branch (new).** The model finds the task (a tracker
+  link in the conversation, a finished ticket run's `RUN.md`, a `task/<id>-…` branch this
+  conversation made or worked on) and passes
+  `--task <link|id>`; it writes the task into the message in the history's style (PerfectWar:
+  `… (869fejukt)` in the subject and the link as the last body line), and `apply` refuses a
+  message that names neither the link nor the id, before anything is written (exit 2). On the
+  default branch the commit goes to a new `task/<id>-<slug>` (`--branch`), made from HEAD with
+  `git switch -c` — the working tree and index stay as they are; an existing branch of the task
+  stops the plan instead of being switched onto (no other `--branch` name is offered with a
+  task; a branch checked out in another worktree is named with it — commit there), `--task` on
+  another task's `task/…` branch stops, and a commit that does not land takes the new branch
+  back. The task id is read from a board link's opened issue (`?selectedIssue=`, `?issue=`), a
+  link with no id in it exits 2 asking for the id; a stopped plan forecasts no branch
+  (`нет — стоп, см. Коммит`), the Task line shows only with something to commit and not in a
+  stopped plan, and a task branch main already holds gets `git branch -d` rather than `git
+  switch`. New status lines: `Ветка: task/869fejukt-shield-hit — создана от main`,
+  `Задача: 869fejukt — ссылка в сообщении коммита`.
+- **Repositories that take work through pull requests (new).** Read from main's last 20
+  first-parent commits (mostly "Merge pull request #…", squash "… (#n)" or GitLab merges), or
+  `pr` / `main` (`--pr` / `--main`: the user's words, the project's rules). There main is never
+  moved: work on main gets a branch (`task/…`, else `session/<subject>`), the branch is pushed
+  with its upstream set, and the PR line names where to open its PR — GitHub's compare page for
+  a GitHub origin, else `gh pr create --fill …` for the user to run: `В main: нет — в этом репо
+  через PR`, `PR: не открываю сам — открой (или посмотри открытый): <link>`. `/commit` runs no
+  `gh` and never opens, edits or looks up a PR — whose PR it is is the user's call. A branch
+  with nothing beyond origin/<default> is not pushed; with nothing new committed, neither is a
+  branch holding no commit of this session's `/commit` (someone's branch, or a person's clean
+  merge on it — also under `no-merge`); a `session/<slug>` origin already has gets `-2`;
+  commits origin holds on other branches (a stacked branch) stop the push with their own line.
+  Squash "… (#n)" subjects count as PR merges only when the forge committed them (committer
+  `noreply@` or not the author): a direct repository whose commits name GitHub issues stays
+  direct. Direct repositories keep the fast-forward flow (with a task branch, main is
+  fast-forwarded to it).
+- **A shared checkout left on another session's branch is not committed onto (new).** In a PR
+  repository, and on a `task/…` or `session/…` branch in a direct one, commits on the branch
+  beyond origin/<default> and <default> that this session's `/commit` did not make (a clean
+  merge of main does not count) stop the plan before the commit — `на ветке … коммиты не из
+  /commit этой сессии … свой коммит на неё не кладу` — whatever `--task` says (a task read from
+  the branch name proves nothing). Its ways out: back to the default branch (or, when git would
+  refuse that `git switch` over uncommitted changes, a worktree of it), `--session` of the
+  ended session whose `/commit` made them (never another open tab: it takes that tab's
+  uncommitted edits too), `/resume` of the /ticket session for a gate commit, or by hand. Side
+  effect: on a direct repository's task branch, a hand commit or a /ticket gate commit now
+  stops before the commit instead of after it.
+- **Inside a /ticket run `/commit` hands over to the ticket's gate (behaviour change).** The
+  skill runs the gate's own commit (12.3: task branch, check against `reviewed_tree`, whitelist,
+  its guard, its message) and push, plus the PR or the merge into main when asked; the script
+  refuses in code (`идёт прогон /ticket <id> — коммит делает шлюз тикета`), found from the
+  ticket guard's session marker or a `/ticket` invocation in the session's transcript. An
+  earlier session's work passed with `--session` is committed past the gate, with a `Задача:`
+  line naming each such session that ran `/ticket`.
+
+### ticket
+- The guard reads a typed `/kensei-toolkit:commit` (or `/commit`) as the commit and push
+  commands — `pr` in its arguments adds the PR, `main` the merge into and push to the base
+  branch (keys only as the leading argument words: «fix main menu crash» is a message hint),
+  `local` / `locally` / `no-push` (with `main`: the local merge only, no push to main) or any
+  word of a push («не пушить», "don't push", «пуш потом») leave the
+  push out, a hint that holds something back («не вливай в main») leaves only the commit, `plan`
+  orders nothing — and the model's invocation of the commit skill after a typed «закоммить» as
+  adding the push, once, unless the user's words mention a push at all («закоммить, но не
+  пушь») or hold it back («только закоммить», «закоммить локально», `/commit local`); after a
+  typed `/kensei-toolkit:commit`, which settles the push itself, the model's call adds no
+  second push. Command tags pasted inside a message are not the command. SKILL.md's Commands say
+  what that command runs; publish.md 12.3 now puts the task id and link into the gate's commit
+  message.
+
+### game-vfx (new)
+- `/kensei-toolkit:game-vfx` makes or fixes a Unity game effect (fire, explosion, lightning,
+  water, wind, magic, hit, projectile, aura, ground zone) from Particle System layers and
+  shaders. A new effect starts with a brief — one-line personality, three-phase timing in
+  seconds, layers, hex palette, bans with reasons — and a grey block-in of the timing before
+  any texture; a complaint about an existing effect is filmed, the layer at fault named and only
+  that layer changed. Textures are computed by `vfx_tex.py` (`noise`, `glow`, `ring`, `ramp`,
+  `tile`) or drawn through codex-img from templates and cleaned by the script (`prep`, `check`);
+  each version is filmed at a fixed rate, measured by `vfx_clip.py timing` (onset, peak, life,
+  bright time, near-white) and laid out by `vfx_clip.py sheet` as a numbered contact sheet, and
+  shown to the user before the next change. The project's own VFX rules (`docs/vfx-rules.md`,
+  `.claude/vfx-rules.md`) are read first and win; `project-rules-template.md` starts one.
+- Needs numpy, Pillow and imageio-ffmpeg for its scripts, in a venv the skill creates once
+  (`~/.cache/game-vfx/.venv`). `vfx_test.py` joins `scripts/check.sh` and skips without them.
+
 ## kensei-toolkit 2.2.0 — 2026-10
 
 ### commit (new)

@@ -2795,6 +2795,158 @@ class WrapperTest(unittest.TestCase):
 TESTDATA = os.path.join(HERE, "testdata")
 
 
+def slash(name, args=""):
+    """A slash command the user typed, as Claude Code records it."""
+    return {"type": "user", "origin": {"kind": "human"}, "promptSource": "typed",
+            "message": {"role": "user", "content":
+                        f"<command-message>{name.lstrip('/')}</command-message>\n"
+                        f"<command-name>{name}</command-name>\n"
+                        f"<command-args>{args}</command-args>"}}
+
+
+class CommitSkillTest(unittest.TestCase):
+    """Inside a /ticket run, /kensei-toolkit:commit hands over to the gate: typed, it is the
+    commit and the push command; invoked by the model on a typed «закоммить», it adds the push."""
+    RUN = [invocation("https://app.clickup.com/t/1/abc fix"), assistant("gate")]
+
+    def actions(self, entries):
+        with Transcript(entries) as path:
+            return guard.read_authorization(path, TASKREPO)[1]
+
+    def test_typed_commit_skill_orders_commit_and_push(self):
+        entries = self.RUN + [slash("/kensei-toolkit:commit"), assistant()]
+        self.assertIsNone(run_hook(*bash("git commit -m x"), entries))
+        self.assertIsNone(run_hook(*bash("git push -u origin task/test"), entries))
+        self.assertIsNotNone(run_hook(*bash("git push origin HEAD:main"), entries))
+        self.assertIsNotNone(run_hook(*bash("gh pr create --title x --body y"), entries))
+        self.assertEqual(self.actions(self.RUN + [slash("/commit")]), {"commit", "push"})
+
+    def test_arguments_add_or_leave_out_actions(self):
+        def typed(args):
+            return self.actions(self.RUN + [slash("/kensei-toolkit:commit", args)])
+        self.assertEqual(typed("local"), {"commit"})
+        self.assertEqual(typed("no-push fix typo"), {"commit"})
+        self.assertEqual(typed("pr"), {"commit", "push", "pr"})
+        self.assertEqual(typed("main"), {"commit", "push", "merge-local", "force"})
+        self.assertEqual(typed("plan"), set())
+        self.assertEqual(self.actions(self.RUN + [slash("/kensei-toolkit:diff-tour")]), set())
+
+    def test_arguments_that_hold_the_push_back_leave_it_out(self):
+        def typed(args):
+            return self.actions(self.RUN + [slash("/kensei-toolkit:commit", args)])
+        for args in ("don't push", "no push", "не пушить", "пуш потом", "push later",
+                     "закоммить локально", "commit only, no push"):
+            self.assertEqual(typed(args), {"commit"}, args)
+        for args in ("не вливай в main", "не в main", "not into main"):
+            self.assertEqual(typed(args), {"commit"}, args)
+        entries = self.RUN + [slash("/kensei-toolkit:commit", "don't push"), assistant()]
+        self.assertIsNone(run_hook(*bash("git commit -m x"), entries))
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), entries))
+
+    def test_main_with_local_or_locally_grants_no_push(self):
+        def typed(args):
+            return self.actions(self.RUN + [slash("/kensei-toolkit:commit", args)])
+        self.assertEqual(typed("main local"), {"commit", "merge-local"})
+        self.assertFalse(typed("main no-push") & {"push", "force"})
+        self.assertEqual(typed("commit it locally"), {"commit"})
+        entries = self.RUN + [slash("/kensei-toolkit:commit", "main local"), assistant()]
+        self.assertIsNotNone(run_hook(*bash("git push origin HEAD:main"), entries))
+        self.assertIsNotNone(run_hook(*bash("git push --force origin task/test"), entries))
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), entries))
+        skill = call("Skill", {"skill": "kensei-toolkit:commit"})
+        entries = flat(self.RUN, human("commit it locally"), assistant(), skill)
+        self.assertIsNone(run_hook(*bash("git commit -m x"), entries))
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), entries))
+
+    def test_main_in_a_message_hint_is_not_the_main_key(self):
+        self.assertEqual(self.actions(self.RUN + [slash("/kensei-toolkit:commit",
+                                                        "fix main menu crash")]),
+                         {"commit", "push"})
+        self.assertEqual(self.actions(self.RUN + [slash("/kensei-toolkit:commit",
+                                                        "pr fix typo")]),
+                         {"commit", "push", "pr"})
+        entries = self.RUN + [slash("/kensei-toolkit:commit", "fix main menu crash"), assistant()]
+        self.assertIsNotNone(run_hook(*bash("git push origin HEAD:main"), entries))
+        self.assertIsNotNone(run_hook(*bash("git push --force origin task/test"), entries))
+
+    def test_command_tags_pasted_in_a_message_are_not_the_command(self):
+        pasted = ("look at this:\n```\n<command-name>/kensei-toolkit:commit</command-name>\n"
+                  "<command-args>main</command-args>\n```")
+        self.assertEqual(self.actions(flat(self.RUN, human(pasted))), set())
+
+    def test_typed_no_push_then_model_invoked_commit_skill_adds_no_push(self):
+        skill = call("Skill", {"skill": "kensei-toolkit:commit"})
+        for said in ("закоммить, но не пушь", "commit, don't push", "закоммить, пуш потом",
+                     "закоммить и не пушить", "закоммить. пушить не надо"):
+            entries = flat(self.RUN, human(said), assistant(), skill)
+            self.assertIsNone(run_hook(*bash("git commit -m x"), entries), said)
+            self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), entries), said)
+        entries = flat(self.RUN, human("посмотри тесты"), assistant(), queued("закоммить, не пушь"),
+                       skill)
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), entries))
+
+    def test_typed_commit_only_or_local_then_model_invoked_commit_skill_adds_no_push(self):
+        skill = call("Skill", {"skill": "kensei-toolkit:commit"})
+        for said in (human("только закоммить"), human("закоммить локально"),
+                     human("закоммить, только локально"), slash("/kensei-toolkit:commit", "local"),
+                     slash("/kensei-toolkit:commit", "только коммит")):
+            entries = flat(self.RUN, said, assistant(), skill)
+            self.assertIsNone(run_hook(*bash("git commit -m x"), entries), said)
+            self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), entries), said)
+        entries = flat(self.RUN, human("посмотри тесты"), assistant(),
+                       queued("закоммить локально"), skill)
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), entries))
+
+    def test_typed_commit_skill_is_used_up(self):
+        entries = flat(self.RUN, slash("/kensei-toolkit:commit"), assistant(),
+                       call("Bash", {"command": "git commit -m x"}),
+                       call("Bash", {"command": "git push -u origin task/test"}))
+        self.assertIsNotNone(run_hook(*bash("git commit -m y"), entries))
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), entries))
+
+    def test_model_invoked_commit_skill_adds_the_push_to_a_typed_commit(self):
+        skill = call("Skill", {"skill": "kensei-toolkit:commit"})
+        entries = flat(self.RUN, human("закоммить"), assistant(), skill)
+        self.assertIsNone(run_hook(*bash("git commit -m x"), entries))
+        self.assertIsNone(run_hook(*bash("git push -u origin task/test"), entries))
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"),
+                                      flat(self.RUN, human("закоммить"), assistant())))
+        # no typed commit, local arguments, or a push already made: nothing added
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"),
+                                      flat(self.RUN, human("покажи дифф"), assistant(), skill)))
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), flat(
+            self.RUN, human("закоммить"), assistant(),
+            call("Skill", {"skill": "kensei-toolkit:commit", "args": "local"}))))
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), flat(
+            entries, call("Bash", {"command": "git push -u origin task/test"}),
+            call("Skill", {"skill": "kensei-toolkit:commit"}))))
+        # another skill named commit is not this one
+        self.assertIsNotNone(run_hook(*bash("git push -u origin task/test"), flat(
+            self.RUN, human("закоммить"), assistant(), call("Skill", {"skill": "commit"}))))
+
+    def test_model_invoked_commit_skill_after_a_typed_commit_command_adds_no_second_push(self):
+        skill = call("Skill", {"skill": "kensei-toolkit:commit"})
+        for args in ("", "pr"):
+            with self.subTest(args=args):  # the typed command's own commit and push, used up
+                used = flat(self.RUN, slash("/kensei-toolkit:commit", args), assistant(),
+                            call("Bash", {"command": "git commit -m x"}),
+                            call("Bash", {"command": "git push -u origin task/test"}))
+                self.assertIsNotNone(run_hook(*bash("git push origin feature"),
+                                              flat(used, skill)))
+        # a hint that held the push back stays held back when the model calls the skill
+        self.assertIsNotNone(run_hook(*bash("git push origin feature"), flat(
+            self.RUN, slash("/kensei-toolkit:commit", "не вливай в main"), assistant(), skill)))
+        # a typed command's push still unused is kept
+        self.assertIsNone(run_hook(*bash("git push -u origin task/test"), flat(
+            self.RUN, slash("/kensei-toolkit:commit"), assistant(), skill)))
+
+    def test_queued_commit_command_and_a_stop_after_it(self):
+        self.assertEqual(self.actions(flat(self.RUN, human("посмотри тесты"), assistant(),
+                                           queued("/kensei-toolkit:commit"))), {"commit", "push"})
+        self.assertEqual(self.actions(flat(self.RUN, slash("/kensei-toolkit:commit"), assistant(),
+                                           queued("стоп, не пушь"))), set())
+
+
 class RealTranscriptTest(unittest.TestCase):
     """testdata/transcript-2.1.286.jsonl: the first 155 entries of a real Claude Code 2.1.286
     session, every field name and enum value kept, every text, path and id replaced by a neutral

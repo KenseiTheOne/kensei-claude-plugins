@@ -2,7 +2,8 @@
 """commit — land this session's work in git and leave everyone else's alone.
 
   sessioncommit.py plan [--repo DIR] [--session ID]... [--declare PATH]... [--out DIR]
-                        [--lang ru|en] [--no-merge] [--no-push]
+                        [--lang ru|en] [--task LINK|ID] [--branch NAME] [--pr|--main]
+                        [--no-merge] [--no-push]
       Read this session's transcripts (the main one, its subagents and workflow agents), find
       the files it edited in the repository and split each into this session's changes and
       everyone else's. Writes plan.json and the content to commit into a private run directory
@@ -10,13 +11,21 @@
       for the repository: no fetch, no index write. Prints the status block (what will be
       committed, skipped, left alone, merged and pushed), then details for the model.
       Exit 0: go, or nothing to do; 1: stop (nothing may be applied); 2: error.
-  sessioncommit.py apply --plan RUN/plan.json [--message-file FILE|-] [--no-merge] [--no-push]
-      Re-check the plan against the repository (exit 3 when it moved), commit exactly the planned
-      content through a private index (the repository's hooks and signing still apply), set the
-      real index entries of those paths to the new commit and nothing else, then integrate into
-      the default branch and push — never forced, never stashed. One status line per step.
+  sessioncommit.py apply --plan RUN/plan.json [--message-file FILE|-] [--task LINK|ID]
+                         [--pr|--main] [--no-merge] [--no-push]
+      Re-check the plan against the repository (exit 3 when it moved) and that the message names
+      the task (exit 2), make the planned branch from HEAD (`git switch -c`), commit exactly the
+      planned content through a private index (the repository's hooks and signing still apply),
+      set the real index entries of those paths to the new commit and nothing else, then
+      publish: in a repository that takes work through pull requests, push the branch and name
+      the page to open its PR on (no PR is opened or edited here); elsewhere by fast-forward
+      only — push the branch, or move the default branch to it and push that. Never rebased, merged, forced or stashed; anything
+      else stops with the merge to run. One status line per step.
       Exit 0: every planned step done; 1: stopped at a step (its line says why; earlier steps
       stay done); 2: error; 3: stale plan.
+
+Both refuse (exit 1, a stop line) inside a /ticket run of this session: the ticket's publish
+gate commits there, with its own checks and guard.
 
 Where a file holds this session's edits and someone else's, the commit gets HEAD plus this
 session's hunks only: the session's edits are undone from the working tree (reverse replay of
@@ -40,47 +49,13 @@ import sys
 import tempfile
 import time
 import unicodedata
+import urllib.parse
 
 KEEP_RUNS = 20          # run directories kept per repository
-MAX_HINTS = 40          # shell commands kept in plan.json as possible file changes
-SHOW_HINTS = 12         # of those, the newest printed
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 SHELL_TOOLS = ("Bash", "PowerShell")
 SID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 TOOL_ID_RE = re.compile(r'"tool_use_id"\s*:\s*"([^"\\]+)"')
-# `[main 1a2b3c4] subject`, `[main (root-commit) 1a2b3c4] subject`, `[detached HEAD 1a2b3c4] …`
-COMMIT_LINE_RE = re.compile(r"^\[[^\]\n]*? ([0-9a-f]{7,64})\] ", re.M)
-# A shell command that may make commits (`git commit -q` prints no `[branch sha]` line): the
-# reflog entries written while it ran may be the session's own commits. A quick filter; the
-# git subcommand itself is read by git_call.
-GIT_WRITE_RE = re.compile(r"\bgit\b[^\n|;&]*?\s(?:commit|merge|cherry-pick|revert|pull)(?![-\w])")
-GIT_COMMIT_SUBS = ("commit", "merge", "pull", "cherry-pick", "revert")
-GIT_ARG_OPTS = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env")
-# Reflog messages of entries that made a new commit (not a fast-forward, reset or checkout,
-# whose new id is someone else's commit).
-OWN_REFLOG_RE = re.compile(r"^(?:commit(?: \([a-z]+\))?|cherry-pick|revert):|^(?:merge|pull)\b.*"
-                           r": Merge made by ")
-# Shell commands that may have changed files. Hints only: the script never takes paths from them.
-HINT_RE = re.compile(r"""(?x)
-    \b(?:sed|perl)\b[^|;&\n]*\s-[a-zA-Z]*i\b | \bsed\b[^|;&\n]*--in-place
-  | (?:^|[\s;&|(])(?:rm|rmdir|mv|cp|touch|tee|ln|install|rsync|unzip|patch|truncate|dd|chmod)\s
-  | \bgit\s+(?:rm|mv|apply|am|restore|checkout|reset|stash|cherry-pick|revert|merge|rebase|pull
-              |update-index)(?![-\w])
-  | \btar\s+-?[a-zA-Z]*x
-  | \b(?:python3?|node|ruby|perl|deno|bun)\s+(?:-[a-zA-Z]*[ce]\b|-(?:\s|$))
-  | \b(?:prettier|black|ruff|gofmt|rustfmt|clang-format|dotnet\s+format|npm\s+(?:i|install|ci)
-        |yarn|pnpm|pip\s+install|Set-Content|Out-File|Remove-Item|Move-Item|Copy-Item)\b
-  | \bUnity(?:\.exe)?\b[^\n]*-(?:batchmode|executeMethod|projectPath)
-""")
-# A redirect into a file — looked for outside quoted strings (`grep "List<Ship>"` is no redirect).
-REDIRECT_RE = re.compile(r"(?<![<>&0-9=-])>{1,2}(?![&=])")
-QUOTED_RE = re.compile(r"""'[^']*'|"(?:[^"\\]|\\.)*\"""")
-HINT_NOISE_RE = re.compile(r"\d?>>?\s*/dev/null|&>\s*/dev/null|\d?>&\d|<<-?\s*'?\w+'?")
-
-
-def may_write(text):
-    """True when a shell command (or part of one) may change files: a hint, never a path."""
-    return bool(HINT_RE.search(text) or REDIRECT_RE.search(QUOTED_RE.sub("''", text)))
 RUN_NAME_RE = re.compile(r"\d{8}-\d{6}(?:-\d+)?$")
 LANG = "en"
 
@@ -155,8 +130,9 @@ def git(cwd, *args, ok=(0,), index=None, stdin=None, literal=False):
     return proc
 
 
-# Never stash someone's work on the way (merge.autoStash / rebase.autoStash in their config).
-NO_AUTOSTASH = ("-c", "merge.autoStash=false", "-c", "rebase.autoStash=false")
+# User config that would touch someone's work on the way: the fast-forward of main in its
+# checkout never stashes their changes (merge.autoStash).
+NO_SIDE_EFFECTS = ("-c", "merge.autoStash=false")
 
 
 def git_state(git_dir):
@@ -212,7 +188,10 @@ def text_of(proc):
 
 
 def errtext(proc):
-    return ((proc.stderr or b"") + (proc.stdout or b"")).decode("utf-8", "replace").strip()
+    """git's message, without its `hint:` lines (advice for a person at the prompt, which would
+    crowd out the reason in a one-line status)."""
+    text = ((proc.stderr or b"") + (proc.stdout or b"")).decode("utf-8", "replace")
+    return "\n".join(ln for ln in text.split("\n") if not ln.startswith("hint:")).strip()
 
 
 def oneline(s, limit=200):
@@ -305,7 +284,8 @@ class Repo:
         batched: it reports the unfiltered size)."""
         paths = [p for p in paths if "\n" not in p]
         if not paths or text_of(git(self.root, "config", "core.autocrlf",
-                                    ok=(0, 1))).strip().lower() in ("true", "1", "yes", "on"):
+                                    ok=(0, 1))).strip().lower() in ("true", "1", "yes", "on",
+                                                                     "input"):
             return
         data = git(self.root, "check-attr", "-z", "--stdin", *self.FILTER_ATTRS,
                    stdin=b"".join(os.fsencode(p) + b"\0" for p in paths), ok=None)
@@ -469,71 +449,6 @@ def canonical(path):
     return cur
 
 
-def make_patch(before, after, context=3):
-    """structuredPatch-shaped hunks (LF lines, "\\ No newline" markers) from before to after."""
-    a, b = split_lines(before), split_lines(after)
-    hunks = []
-    for group in difflib.SequenceMatcher(None, a, b, autojunk=False).get_grouped_opcodes(context):
-        i1, i2, j1, j2 = group[0][1], group[-1][2], group[0][3], group[-1][4]
-        out = []
-
-        def add(tag, line):
-            out.append(tag + line.rstrip("\n"))
-            if not line.endswith("\n"):
-                out.append("\\ No newline at end of file")
-        for tag, a1, a2, b1, b2 in group:
-            if tag == "equal":
-                for line in a[a1:a2]:
-                    add(" ", line)
-            else:
-                for line in a[a1:a2]:
-                    add("-", line)
-                for line in b[b1:b2]:
-                    add("+", line)
-        hunks.append({"oldStart": i1 + 1 if i2 > i1 else i1, "oldLines": i2 - i1,
-                      "newStart": j1 + 1 if j2 > j1 else j1, "newLines": j2 - j1, "lines": out})
-    return hunks
-
-
-READ_ROW_RE = re.compile(r"^\s*(\d+)\t(.*)$")
-READ_MAX_LINES = 2000   # Read shows at most this many lines without offset/limit
-READ_MAX_WIDTH = 2000   # and cuts longer lines
-
-
-def read_content(inp, text, tur):
-    """The whole file a Read call showed (LF text), or None when it may be cut or is not text.
-    "unchanged" when Read said the file did not change since the agent's last Read."""
-    if inp.get("offset") not in (None, 0, 1) or inp.get("limit") is not None or \
-            inp.get("pages") is not None:
-        return None
-    f = tur.get("file") if isinstance(tur, dict) else None
-    if isinstance(f, dict) and isinstance(f.get("content"), str):
-        if f.get("startLine", 1) == 1 and f.get("numLines") == f.get("totalLines"):
-            return norm(f["content"])
-        return None
-    rows = text.split("\n")
-    if not READ_ROW_RE.match(rows[0]) and "unchanged since" in text.lower():
-        return "unchanged"  # no file rows at all: a stub, not file text that says so
-    body = []
-    for i, row in enumerate(rows):
-        m = READ_ROW_RE.match(row)
-        if not m:
-            rest = "\n".join(rows[i:]).strip()
-            if rest and not rest.startswith("<system-reminder>"):
-                return None
-            break
-        if int(m.group(1)) != len(body) + 1:
-            return None
-        body.append(m.group(2))
-    if not body:
-        if "unchanged since" in text.lower():
-            return "unchanged"
-        return "" if "contents are empty" in text else None
-    if len(body) >= READ_MAX_LINES or any(len(b) >= READ_MAX_WIDTH for b in body):
-        return None
-    return "\n".join(body)
-
-
 def event_path(tur, inp, cwd):
     path = (tur or {}).get("filePath") or inp.get("file_path") or inp.get("notebook_path")
     if not isinstance(path, str) or not path:
@@ -549,9 +464,9 @@ def tool_events(name, inp, tur, cwd, text=""):
     """The file events one successful edit-tool call leaves. Kinds:
     patch (structuredPatch hunks), create (whole content: a Write that created the file, or an
     Edit with an empty old_string), rewrite (a Write over an existing file with no patch in the
-    transcript, as workflow agents leave it: what the file held before is unknown here),
-    replace (old/new strings from the tool input when the transcript has no toolUseResult),
-    opaque (NotebookEdit: no patch)."""
+    transcript, as workflow agents leave it: what the file held before is unknown, so it is
+    the session's only when the session created the file), replace (old/new strings from the
+    tool input when the transcript has no toolUseResult), opaque (NotebookEdit: no patch)."""
     path = event_path(tur, inp, cwd)
     if not path:
         return []
@@ -579,43 +494,25 @@ def tool_events(name, inp, tur, cwd, text=""):
     return out
 
 
-def resolve_rewrite(ev, fi, events, last_read):
-    """Turn a rewrite (a Write over an existing file, no patch recorded) into a patch: the file
-    before it is the agent's last whole Read of the path in the same transcript plus the
-    agent's own edits since. Left a rewrite when there is no such Read."""
-    seen = last_read.get((fi, ev["path"]))
-    while True:
-        if not seen or seen[0] is None:
-            return ev
-        content, since, prev = seen
-        if isinstance(content, tuple):
-            content = read_content(*content)
-            if content == "unchanged":
-                # "File unchanged since last read": the agent's previous view still holds.
-                seen = prev
-                continue
-            if content is None:
-                return ev
-        break
-    between = [e for e in events[since:] if e["path"] == ev["path"] and e["order"][1] == fi]
-    try:
-        before = forward(content, between)
-    except (NotFound, Ambiguous):
-        return ev
-    if any(e["kind"] in ("rewrite", "opaque") for e in between):
-        return ev
-    return {"path": ev["path"], "kind": "patch", "hunks": make_patch(before, norm(ev["content"])),
-            "from_read": True}
+# A tool result that says the call never ran: refused by the user, a permission rule, the auto
+# mode classifier or a safety check, blocked by a PreToolUse hook, or rejected before running.
+NEVER_RAN = ("<tool_use_error>", "Permission for this action was denied",
+             "Permission for this command was denied", "Permission to use ",
+             "The user doesn't want to ", "PreToolUse:")
+
+
+def never_ran(text):
+    text = text.lstrip()
+    if text.startswith("Error: "):
+        text = text[len("Error: "):]
+    return text.startswith(NEVER_RAN)
 
 
 def read_transcripts(files):
-    """Edit events in time order, shell commands that may have changed files (full text, with
-    their timestamps), commit shas from shell output (with the output's timestamp) and the time
-    spans of shell commands that may have made commits ((start, end) timestamps)."""
-    uses, seen, events, hints, shas, git_runs = {}, set(), [], [], [], []
-    # (file index, path) -> (whole content | Read call | None, len(events) at it, previous entry)
-    last_read = {}
-    tools = EDIT_TOOLS + SHELL_TOOLS + ("Read",)
+    """(edit events in time order, the shell commands the session's agents sent — any agent's,
+    oldest first — as [(text, failed)]). A command refused or blocked before it ran is left out;
+    one that ran and exited non-zero is kept, marked failed."""
+    uses, seen, events, shell = {}, set(), [], {}
     for fi, path in enumerate(files):
         try:
             fh = open(path, encoding="utf-8", errors="replace")
@@ -623,311 +520,110 @@ def read_transcripts(files):
             continue
         with fh:
             for ln, line in enumerate(fh):
-                if '"tool_use"' in line:
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        continue
-                    if entry.get("type") != "assistant":
-                        continue
+                if '"tool_use"' not in line and not (
+                        '"tool_result"' in line and
+                        any((i in uses or i in shell) and i not in seen
+                            for i in TOOL_ID_RE.findall(line))):
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("type") == "assistant":
                     for b in blocks(entry):
-                        name = b.get("name")
-                        if b.get("type") != "tool_use" or name not in tools:
+                        name, tid = b.get("name"), b.get("id")
+                        if b.get("type") != "tool_use":
                             continue
                         inp = b.get("input") if isinstance(b.get("input"), dict) else {}
-                        uses[b.get("id")] = (name, inp, entry.get("cwd"),
-                                             str(entry.get("timestamp") or ""))
-                elif '"tool_result"' in line:
-                    if not any(i in uses and i not in seen for i in TOOL_ID_RE.findall(line)):
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        continue
-                    if entry.get("type") != "user":
-                        continue
-                    results = [b for b in blocks(entry) if b.get("type") == "tool_result"]
-                    tur = entry.get("toolUseResult") if len(results) == 1 else None
-                    ts = str(entry.get("timestamp") or "")
-                    for k, b in enumerate(results):
-                        tid = b.get("tool_use_id")
-                        if tid not in uses or tid in seen:
-                            continue
+                        if name in SHELL_TOOLS and isinstance(inp.get("command"), str):
+                            shell.setdefault(tid, [str(entry.get("timestamp") or ""),
+                                                   inp["command"], None])
+                        elif name in EDIT_TOOLS:
+                            uses[tid] = (name, inp, entry.get("cwd"))
+                    continue
+                if entry.get("type") != "user":
+                    continue
+                results = [b for b in blocks(entry) if b.get("type") == "tool_result"]
+                tur = entry.get("toolUseResult") if len(results) == 1 else None
+                ts = str(entry.get("timestamp") or "")
+                for k, b in enumerate(results):
+                    tid = b.get("tool_use_id")
+                    if tid in shell and tid not in seen:
                         seen.add(tid)
-                        name, inp, cwd, start = uses[tid]
-                        text = result_text(b, tur)
-                        if name in SHELL_TOOLS:
-                            # A shell command that exited non-zero ("Exit code N") may still
-                            # have changed files or committed before the part that failed; one
-                            # the user rejected or a hook or permission blocked never ran.
-                            if (b.get("is_error") or isinstance(tur, str)) and \
-                                    not text.lstrip().startswith("Exit code"):
-                                continue
-                            cmd = inp.get("command")
-                            where = cwd or entry.get("cwd")
-                            if isinstance(cmd, str):
-                                if may_write(HINT_NOISE_RE.sub(" ", cmd)):
-                                    hints.append((ts, cmd, where))
-                                if GIT_WRITE_RE.search(cmd):
-                                    git_runs.append((start, ts, cmd, where))
-                            shas += [(s, ts) for s in COMMIT_LINE_RE.findall(text)]
-                            continue
-                        if b.get("is_error") or isinstance(tur, str):
-                            continue  # a failed edit changed nothing
-                        tur_d = tur if isinstance(tur, dict) else None
-                        if name == "Read":
-                            p = event_path(tur_d, inp, cwd or entry.get("cwd"))
-                            if p:
-                                # Parsed only if a rewrite of the path needs it. A Read that
-                                # shows no file rows ("unchanged since last read") keeps the one
-                                # before it to fall back on.
-                                rows = READ_ROW_RE.match(text.split("\n", 1)[0])
-                                last_read[(fi, p)] = ((inp, text, tur_d), len(events),
-                                                      None if rows else last_read.get((fi, p)))
-                            continue
-                        for j, ev in enumerate(tool_events(name, inp, tur_d,
-                                                           cwd or entry.get("cwd"), text)):
-                            ev["order"] = (ts, fi, ln, k, len(events))
-                            ev["id"] = f"{tid}:{j}"
-                            if ev["kind"] == "rewrite":
-                                order, eid = ev["order"], ev["id"]
-                                ev = resolve_rewrite(ev, fi, events, last_read)
-                                ev["order"], ev["id"] = order, eid
-                            events.append(ev)
-                            if name == "Write" and isinstance(inp.get("content"), str):
-                                # After a Write the file is its content: a later Write of the
-                                # agent builds on that, not on an older Read.
-                                last_read[(fi, ev["path"])] = (norm(inp["content"]), len(events),
-                                                               None)
-                            elif ev["kind"] == "opaque":
-                                last_read[(fi, ev["path"])] = (None, len(events), None)
-                elif '"edited_text_file"' in line:
-                    # "This file was modified by the user or a linter": the agent's earlier Read
-                    # no longer shows the file, and Claude Code lets it write without a new Read.
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
+                        if b.get("is_error"):
+                            refused = never_ran(result_text(b, None)) or (
+                                isinstance(tur, str) and never_ran(tur))
+                            shell[tid][2] = "refused" if refused else "failed"
                         continue
-                    att = entry.get("attachment")
-                    if entry.get("type") != "attachment" or not isinstance(att, dict) or \
-                            att.get("type") != "edited_text_file":
+                    if tid not in uses or tid in seen:
                         continue
-                    p = event_path({"filePath": att.get("filename")}, {}, entry.get("cwd"))
-                    if p:
-                        last_read[(fi, p)] = (None, len(events), None)
+                    seen.add(tid)
+                    if b.get("is_error") or isinstance(tur, str):
+                        continue  # a failed edit changed nothing
+                    name, inp, cwd = uses[tid]
+                    for j, ev in enumerate(tool_events(name, inp, tur if isinstance(tur, dict)
+                                                       else None, cwd or entry.get("cwd"),
+                                                       result_text(b, tur))):
+                        ev["order"] = (ts, fi, ln, k, len(events))
+                        ev["id"] = f"{tid}:{j}"
+                        events.append(ev)
     events.sort(key=lambda ev: ev["order"])
-    hints.sort(key=lambda h: h[0])
-    return events, hints, shas, git_runs
+    return events, [(cmd, state == "failed") for _, cmd, state in
+                    sorted(shell.values(), key=lambda s: s[0]) if state != "refused"]
 
 
-# --- shell commands that may have touched the repository ---------------------------------
+# --- files the session's shell commands name ---------------------------------------------
+# The script never takes a path from a shell command: these are pointers for the model, which
+# declares the files that are the session's. A file left out costs work, a file named in vain
+# costs a look, so the match is crude on purpose.
 
-SEGMENT_RE = re.compile(r"&&|\|\||[;\n|&]")
-CD_RE = re.compile(r"^[\s({]*(?:builtin\s+)?(cd|chdir|pushd|popd|Set-Location|sl|Push-Location"
-                   r"|Pop-Location)(?:\s+(.*?))?[\s)}]*$")
-_PATH_CHARS = r"""[^\s'"`;|&<>(){}$*?,\]]*"""
-# An absolute path in a command: /x, ~/x, $HOME/x, C:\x — at the start of a word.
-PATH_TOKEN_RE = re.compile(r"""(?:^|(?<=[\s'"=:(`<>,\[]))((?:~|\$HOME|\$\{HOME\})?/"""
-                           + _PATH_CHARS + r"|[A-Za-z]:[\\/]" + _PATH_CHARS + ")")
-NOWHERE = object()  # a directory the command moved to that cannot be told (`cd "$TMP"`)
+NAME_CHARS = r"[\w.@+~-]"
+PATH_RUN_RE = re.compile(r"[\w.@+~/-]+")
 
 
-VAR_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
-ASSIGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_]\w*)=(.*?)\s*$")
-PREFIX_WORDS = ("do", "then", "else", "sudo", "env", "time", "nohup", "command", "exec", "xargs")
-COPY_TOOLS = ("cp", "rsync", "install", "ln", "scp")  # only their last operand is written
+def path_keys(text):
+    """Every run of path characters in the text, and each tail of it that starts after a slash:
+    `rm /Users/me/app/src/a.cs` gives `src/a.cs` and `a.cs` among others — a repository path or a
+    file name is named when it is one of them, as a whole word."""
+    keys = set()
+    for run in PATH_RUN_RE.findall(text):
+        keys.add(run)
+        keys.update(run[i + 1:] for i, c in enumerate(run) if c == "/")
+    return keys
 
 
-def expand(word, env):
-    """~, $VAR and ${VAR} from env (HOME and the command's own NAME=value assignments); None
-    when the word holds a variable or a command substitution that cannot be told."""
-    if word == "~" or word.startswith("~/"):
-        word = env["HOME"] + word[1:]
-    unknown = []
-
-    def var(m):
-        value = env.get(m.group(1) or m.group(2))
-        if value is None:
-            unknown.append(m.group(0))
-        return value or ""
-    word = VAR_RE.sub(var, word)
-    return None if unknown or "$" in word or "`" in word else word
-
-
-def shell_words(text):
-    try:
-        return shlex.split(text, posix=True)
-    except ValueError:
-        return text.split()
-
-
-def shell_dir(arg, cur, env):
-    """Where `cd <arg>` goes from cur: a path, None (cur unrecorded, so unrecorded) or NOWHERE."""
-    words = [w for w in shell_words(arg or "")
-             if w not in ("-L", "-P", "-e", "-Path", "-LiteralPath", "--")]
-    if not words:
-        return env["HOME"]
-    word = expand(words[0], env)
-    if word is None or word == "-" or any(c in word for c in "*?["):
-        return NOWHERE
-    if not os.path.isabs(word):
-        if cur is None or cur is NOWHERE:
-            return cur
-        word = os.path.join(cur, word)
-    return os.path.normpath(word)
-
-
-def inside(path, root):
-    p = canonical(path)
-    return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
-
-
-HEREDOC_RE = re.compile(r"(?<!<)<<-?(?!<)\s*(['\"]?)(\w+)\1")
-
-
-def heredoc_split(cmd):
-    """(the command without its here-document bodies, the bodies a command runs). The body of
-    `cat > f <<EOF` or `tee f <<EOF` is the text written to f, not something that runs."""
-    rows, out, bodies, i = cmd.split("\n"), [], [], 0
-    while i < len(rows):
-        out.append(rows[i])
-        i += 1
-        for m in HEREDOC_RE.finditer(out[-1]):
-            start = i
-            while i < len(rows) and rows[i].strip() != m.group(2):
-                i += 1
-            head = SEGMENT_RE.split(out[-1][:m.start()])[-1].split()
-            if not head or head[0] not in ("cat", "tee"):
-                bodies.append("\n".join(rows[start:i]))
-            i += 1
-    return "\n".join(out), bodies
-
-
-def operands(seg):
-    """(command name, the words after it) of one simple command: options, assignments and
-    redirection operators left out (a redirection's target stays)."""
-    words = [re.sub(r"^\d?[<>]{1,2}", "", w) for w in shell_words(seg)]
-    words = [w for w in words if w and not w.startswith("-") and w not in "()[]{}!"]
-    while words and (re.match(r"^[A-Za-z_]\w*=", words[0]) or words[0] in PREFIX_WORDS):
-        words.pop(0)
-    return (words[0], words[1:]) if words else ("", [])
-
-
-def names_inside(text, env, root):
-    """True when text names an absolute path inside the repository (/x, ~/x, $HOME/x, C:/x)."""
-    for m in PATH_TOKEN_RE.finditer(text):
-        p = expand(m.group(1), env)
-        if p and os.path.isabs(p) and inside(p, root):
-            return True
-    return False
-
-
-def git_call(seg):
-    """(subcommand, [-C directories]) of a simple command that runs git, or None."""
-    words = shell_words(seg)
-    i = 0
-    while i < len(words) and (not words[i].strip("({!") or re.match(r"^[A-Za-z_]\w*=", words[i])
-                              or words[i].lstrip("({") in PREFIX_WORDS):
-        i += 1
-    if i >= len(words) or os.path.basename(words[i].lstrip("({")) != "git":
-        return None
-    i, dirs = i + 1, []
-    while i < len(words) and words[i].startswith("-"):
-        if words[i] in GIT_ARG_OPTS:
-            if words[i] == "-C" and i + 1 < len(words):
-                dirs.append(words[i + 1])
-            i += 1
-        i += 1
-    return (words[i].rstrip(")}") if i < len(words) else ""), dirs
-
-
-def shell_parts(text, cwd, env):
-    """(simple command, the directory it runs in) for each part of a shell command: the tool
-    call's cwd, followed through the command's own cd, pushd/popd and NAME=value assignments
-    (kept in env); a cd inside ( … ) or $( … ) ends with it, and `git -C <dir>` runs in <dir>.
-    The directory is a path, None (the call recorded no cwd) or NOWHERE (cannot be told)."""
-    cur, stack, sub = cwd or None, [], []
-    for seg in SEGMENT_RE.split(text):
-        if not seg.strip():
-            continue
-        depth = seg.count("(") - seg.count(")")
-        sub += [cur] * max(depth, 0)
-        m, cd = ASSIGN_RE.match(seg), CD_RE.match(seg)
-        if m and " " not in m.group(2).strip("'\""):
-            words = shell_words(m.group(2))
-            value = expand(words[0], env) if len(words) == 1 else None
-            env.pop(m.group(1), None) if value is None else env.__setitem__(m.group(1), value)
-        elif cd:
-            verb = cd.group(1)
-            if verb in ("popd", "Pop-Location"):
-                cur = stack.pop() if stack else NOWHERE
-            else:
-                if verb in ("pushd", "Push-Location"):
-                    stack.append(cur)
-                cur = shell_dir(cd.group(2), cur, env)
-        else:
-            here = cur
-            for d in (git_call(seg) or ("", []))[1]:
-                here = shell_dir(d, here, env)
-            yield seg, here
-        for _ in range(max(-depth, 0)):
-            if sub:
-                cur = sub.pop()
-
-
-def commit_dirs(cmd, cwd):
-    """The directories a shell command ran `git commit|merge|pull|cherry-pick|revert` in (each
-    a path, None or NOWHERE as shell_parts gives them)."""
-    env = {"HOME": os.path.expanduser("~")}
-    return [d for seg, d in shell_parts(heredoc_split(cmd)[0], cwd, env)
-            if (git_call(seg) or ("",))[0] in GIT_COMMIT_SUBS]
-
-
-def touches_repo(cmd, cwd, root):
-    """True when a shell command may have changed files of the repository at root. Only the
-    parts of it that may change files (may_write) count, each in the directory it runs in
-    (shell_parts): one that names a path inside the repository — absolute, or relative to the
-    directory it runs in — or runs inside it and names no file. A part that runs inside but
-    names only paths outside (`rm -rf /tmp/x`, `cat > ~/notes.txt`), a read-only part (`ls`,
-    `| head`) and the source of a copy do not count; the body of a here-document a command runs
-    (`python3 - <<EOF`) is searched for absolute paths. A call whose transcript entry records no
-    cwd counts as inside."""
-    env = {"HOME": os.path.expanduser("~")}
-    text, bodies = heredoc_split(cmd)
-    for seg, cur in shell_parts(HINT_NOISE_RE.sub(" ", text), cwd, env):
-        if not may_write(seg):
-            continue
-        name, words = operands(seg)
-        if name in COPY_TOOLS and len(words) > 1:
-            words = words[-1:]
-        paths = [expand(w, env) for w in words]
-        if any(p and (os.path.isabs(p) and inside(p, root) or names_inside(p, env, root))
-               for p in paths):
-            return True
-        if cur is None:
-            return True
-        if cur is NOWHERE:
-            continue
-        rel = [p for p in paths if p is not None and not os.path.isabs(p)]
-        if inside(cur, root):
-            if not paths or rel:
-                return True
-        elif any(inside(os.path.join(cur, p), root) for p in rel):
-            return True
-    return any(names_inside(b, env, root) for b in bodies)
-
-
-def repo_hints(hints, root):
-    """The shell hints that may have touched this repository, each command once (at its newest
-    run), oldest first; and how many commands were left out as run elsewhere."""
-    newest, elsewhere = {}, set()
-    for ts, cmd, cwd in hints:
-        if touches_repo(cmd, cwd, root):
-            newest[cmd] = ts
-        else:
-            elsewhere.add(cmd)
-    kept = sorted(newest.items(), key=lambda h: h[1])
-    return [(ts, cmd) for cmd, ts in kept], len(elsewhere - set(newest))
+def shell_named(cmds, paths, fold, universe=()):
+    """(the paths among `paths` that the commands name, {path: indexes of the commands naming
+    it, oldest first}).
+    A path is named by itself (repository-relative, so also inside an absolute path), or by its
+    file name when no other path in `paths` or `universe` (every changed path, the session's own
+    files included, also when they are committed) has that name. fold spells text and paths
+    alike (Unicode form, letter case where git ignores it)."""
+    texts = [fold(c.replace("\\ ", " ").replace("\\", "/")) for c in cmds]
+    whole = "\n".join(texts)
+    where = {}
+    for n, text in enumerate(texts):
+        for key in path_keys(text):
+            where.setdefault(key, []).append(n)
+    names = {}
+    for p in set(paths) | set(universe):
+        names.setdefault(fold(os.path.basename(p)), []).append(p)
+    named, by = [], {}
+    for p in paths:
+        hits = set()
+        for key in [fold(p)] + ([fold(os.path.basename(p))]
+                                if len(names[fold(os.path.basename(p))]) == 1 else []):
+            if PATH_RUN_RE.fullmatch(key):
+                hits.update(where.get(key, ()))
+            else:  # a space or another character no run holds: look for it as a whole word
+                rx = re.compile(r"(?<!" + NAME_CHARS + ")" + re.escape(key) + r"(?!" +
+                                NAME_CHARS + ")")
+                if rx.search(whole):
+                    hits.update(n for n, text in enumerate(texts) if rx.search(text))
+        if hits:
+            named.append(p)
+            by[p] = sorted(hits)
+    return named, by
 
 
 # --- own commits -------------------------------------------------------------------------
@@ -946,22 +642,15 @@ def _read_records(cfg, sid):
 
 
 def load_records(cfg, sids):
-    """{"commits": set, "paths": {abs path: {event, ts, commit}}, "rewritten": {old: new},
-    "unsynced": {abs path: {stale, entry, commit}}, "pending": [{parent, tree, branch, paths,
-    sync}]} merged over the sessions. unsynced: real index entries a commit of this skill could
-    not set yet; pending: a commit begun but not confirmed (the run may have been killed)."""
-    out = {"commits": set(), "paths": {}, "rewritten": {}, "unsynced": {}, "pending": []}
+    """{"commits": set, "unsynced": {abs path: {stale, entry, commit}}, "pending": [{parent,
+    tree, branch, paths, sync}]} merged over the sessions.
+    unsynced: real index entries a commit of this skill could not set yet; pending: a commit
+    begun but not confirmed (the run may have been killed). The per-path records ("paths":
+    {abs path: {event, ts, commit}}) are read per session (collect)."""
+    out = {"commits": set(), "unsynced": {}, "pending": []}
     for sid in sids:
         data = _read_records(cfg, sid)
         out["commits"].update(c for c in data.get("commits") or [] if isinstance(c, str))
-        for k, v in (data.get("rewritten") or {}).items():
-            if isinstance(k, str) and isinstance(v, str):
-                out["rewritten"][k] = v
-        for path, rec in (data.get("paths") or {}).items():
-            if isinstance(rec, dict) and isinstance(rec.get("ts"), str):
-                old = out["paths"].get(path)
-                if old is None or rec["ts"] > old["ts"]:
-                    out["paths"][path] = rec
         for path, u in (data.get("unsynced") or {}).items():
             if isinstance(u, dict) and isinstance(u.get("commit"), str):
                 out["unsynced"][path] = u
@@ -975,74 +664,6 @@ def load_records(cfg, sids):
 
 def load_own(cfg, sids):
     return load_records(cfg, sids)["commits"]
-
-
-def epoch_of(ts):
-    """Seconds since the epoch of a transcript timestamp (2026-10-26T10:00:00.123Z), or None."""
-    try:
-        whole = datetime.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
-    except (TypeError, ValueError):
-        return None
-    frac = re.match(r"\.(\d+)", ts[19:])
-    return whole.replace(tzinfo=datetime.timezone.utc).timestamp() + \
-        (float("0." + frac.group(1)) if frac else 0.0)
-
-
-def head_logs(R):
-    """{checkout root: the path of its HEAD reflog} for every worktree of the repository."""
-    out = {}
-    for path, _, gone in worktrees(R):
-        if gone:
-            continue
-        p = git(path, "rev-parse", "--absolute-git-dir", ok=None)
-        if p.returncode == 0:
-            out[canonical(path)] = os.path.join(text_of(p).strip(), "logs", "HEAD")
-    return out
-
-
-def reflog_commits(R, git_runs):
-    """[(sha, end timestamp, named)] of the commits made while one of the session's shell
-    commands ran `git commit` (merge, pull, cherry-pick, revert) — between the call and its
-    result — in the checkout it ran that in, from that checkout's HEAD reflog: the session's
-    `git commit -q` prints no `[branch sha]` line. Only entries that made a new commit count —
-    not a fast-forward, reset or branch creation. named: the command holds the commit's subject
-    (`git commit -m '<subject>'`); a commit that is not named still has to hold the session's
-    edits (collect checks) — someone else may commit in that checkout meanwhile. The reflog keeps
-    whole seconds, so an entry from the second the command started counts only when named."""
-    logs, spans = None, {}
-    for start, end, cmd, cwd in git_runs:
-        a, z = epoch_of(start), epoch_of(end)
-        if a is None or z is None or z < a:
-            continue
-        for d in commit_dirs(cmd, cwd):
-            if d is NOWHERE:
-                continue
-            if logs is None:
-                logs = sorted(head_logs(R).items(), key=lambda kv: -len(kv[0]))
-            where = R.root if d is None else d
-            log = next((lg for root, lg in logs if inside(where, root)), None)
-            if log and (a, z, end, cmd) not in spans.get(log, []):
-                spans.setdefault(log, []).append((a, z, end, cmd))
-    out = []
-    for log, runs in spans.items():
-        try:
-            with open(log, "rb") as fh:
-                rows = fh.read().decode("utf-8", "replace").split("\n")
-        except OSError:
-            continue
-        for row in rows:
-            meta, _, msg = row.partition("\t")
-            parts = meta.split()
-            if len(parts) < 4 or not parts[-2].isdigit() or not OWN_REFLOG_RE.match(msg):
-                continue
-            t = int(parts[-2])
-            subject = msg.split(": ", 1)[1].strip() if ": " in msg else ""
-            for a, z, end, cmd in runs:
-                named = bool(subject) and subject[:40] in cmd
-                if t <= z and (t >= a or (t == int(a) and named)):
-                    out.append((parts[1], end, named))
-                    break
-    return out
 
 
 def edit_records(cfg, sids, change):
@@ -1059,18 +680,18 @@ def edit_records(cfg, sids, change):
         os.replace(tmp, path)
 
 
-def record_own(cfg, sids, shas, paths=None, rewritten=None, unsynced=None):
+def record_own(cfg, sids, shas, paths=None, unsynced=None):
     """Remember, for each session, the commits this skill made (so a later run knows that
     unpushed commits with these ids are the session's own), the last session edit each
-    committed path got (so a later run replays only the edits made since), commits a rebase
-    gave new ids, and real index entries a commit could not set yet."""
-    if not shas and not paths and not rewritten and not unsynced:
+    committed path got (so a later run replays only the edits made since), and real index
+    entries a commit could not set yet."""
+    if not shas and not paths and not unsynced:
         return
 
     def change(data):
         data["commits"] = sorted(set(c for c in data.get("commits") or [] if isinstance(c, str))
                                  | set(shas or []))
-        for key, new in (("paths", paths), ("rewritten", rewritten), ("unsynced", unsynced)):
+        for key, new in (("paths", paths), ("unsynced", unsynced)):
             data[key] = dict(data.get(key) or {}, **(new or {}))
     edit_records(cfg, sids, change)
 
@@ -1143,12 +764,6 @@ def hunk_rows(hunk):
     return rows
 
 
-def hunk_sides(hunk):
-    """(old lines, new lines) of a structuredPatch hunk."""
-    rows = hunk_rows(hunk)
-    return [ln for t, ln in rows if t != "+"], [ln for t, ln in rows if t != "-"]
-
-
 def locate(lines, side, expected):
     """Index where `side` occurs exactly: at `expected` if it is there, else the nearest
     occurrence (no fuzz, like GNU patch without fuzz). None when it does not occur."""
@@ -1181,14 +796,18 @@ def count_at(lines, side):
     return n
 
 
-def apply_hunks(text, hunks, reverse):
+def apply_hunks(text, hunks, reverse, guesses=None):
     """Apply a structuredPatch forward, or undo it (reverse). A hunk is matched exactly with
     its full context first, then with up to MAX_FUZZ context lines dropped at each end (a
     neighbouring edit changed them); the changed lines themselves always match exactly — when
     they do not, raises NotFound. A match away from the hunk's own line, or with context
     dropped, counts only when it is the one place in the file the lines occur: a shorter
     pattern also matches lookalike code elsewhere, and the nearest of several is a guess.
-    Whether a neighbouring edit really collides with the session's is left to merge-file."""
+    Whether a neighbouring edit really collides with the session's is left to merge-file.
+    `guesses` (a list) collects the hunks matched at their own line where the same lines occur
+    elsewhere too: the line number is the working tree's at the time of the edit, so it is
+    right only when nothing moved the file's lines since — undoing such a hunk may undo a
+    lookalike block someone's lines shifted onto that line instead."""
     lines = split_lines(text)
     order = list(reversed(hunks)) if reverse else list(hunks)
     offset = 0
@@ -1216,6 +835,8 @@ def apply_hunks(text, hunks, reverse):
                 if (fuzz or at != expected) and count_at(lines, find) > 1:
                     at, repeated = None, True
                     continue
+                if guesses is not None and count_at(lines, find) > 1:
+                    guesses.append(start)
             if at is not None:
                 offset = at - cut_front - (start - 1 if new_len else start)
                 lines[at:at + len(find)] = put
@@ -1273,11 +894,12 @@ def do_replace(text, ev):
     return text.replace(old, new, 1)
 
 
-def reverse_replay(text, events):
-    """The file without these session edits: undo every event, last first."""
+def reverse_replay(text, events, guesses=None):
+    """The file without these session edits: undo every event, last first (`guesses`: see
+    apply_hunks)."""
     for ev in reversed(events):
         if ev["kind"] == "patch":
-            text = apply_hunks(text, ev["hunks"], reverse=True)
+            text = apply_hunks(text, ev["hunks"], reverse=True, guesses=guesses)
         elif ev["kind"] == "replace":
             text = undo_replace(text, ev)
         elif ev["kind"] == "rewrite":
@@ -1287,36 +909,18 @@ def reverse_replay(text, events):
     return text
 
 
-def forward(text, events):
-    """Replay events forward from `text`."""
+def forward(text, events, guesses=None):
+    """Replay events forward from `text` (`guesses`: see apply_hunks)."""
     for ev in events:
         if ev["kind"] == "create":
             text = norm(ev["content"])
         elif ev["kind"] == "rewrite":
             raise Ambiguous("rewrite")
         elif ev["kind"] == "patch":
-            text = apply_hunks(text, ev["hunks"], reverse=False)
+            text = apply_hunks(text, ev["hunks"], reverse=False, guesses=guesses)
         elif ev["kind"] == "replace":
             text = do_replace(text, ev)
     return text
-
-
-def contains(ev, text):
-    """True when `text` (LF) holds the result of this session edit: its new lines are there."""
-    if text is None:
-        return False
-    try:
-        if ev["kind"] == "patch":
-            apply_hunks(text, ev["hunks"], reverse=True)
-        elif ev["kind"] == "replace":
-            return norm(ev["new"]) in text
-        elif ev["kind"] in ("create", "rewrite"):
-            return norm(ev["content"]) == text
-    except NotFound:
-        return False
-    except Ambiguous:
-        return True  # there, more than once
-    return True
 
 
 def terminators(raw):
@@ -1431,10 +1035,14 @@ def is_binary(data):
     return data is not None and b"\0" in data[:8000]
 
 
-def attribute(events, w_raw, h_raw, declared, run_dir, committed=False, mode_changed=False):
+def attribute(events, w_raw, h_raw, declared, run_dir, committed=False, mode_changed=False,
+              created=False, head_time=None):
     """What to commit for one path. `events` are the session's edits not committed yet;
-    `committed` says earlier ones were (by this skill or the session's own `git commit`), so
-    HEAD already holds them; `mode_changed`: a declared file's exec bit differs from HEAD's.
+    `committed` says earlier ones were (by this skill, as its records say), so HEAD already
+    holds them; `mode_changed`: a declared file's exec bit differs from HEAD's; `created`: the
+    session created the file (maybe in an edit already committed), so an agent's later Write
+    over it is the session's whole content; `head_time`: when HEAD's last commit to the path
+    was made (epoch seconds), for a created file HEAD already tracks.
     Returns a dict with status (commit | partial | unchanged | skipped), how (whole | computed |
     delete), content (bytes for computed), reason, detail."""
     def whole(reason=None):
@@ -1452,14 +1060,14 @@ def attribute(events, w_raw, h_raw, declared, run_dir, committed=False, mode_cha
         return {"status": "unchanged"}  # nothing on disk to commit, whatever the edits were
     if committed and not events:
         return {"status": "unchanged"}
+    if w_raw is None:  # before the notebook/binary rules: a deletion is never inferred
+        if h_raw is None:
+            return {"status": "unchanged"}
+        return {"status": "skipped", "reason": "deleted"}
     if any(ev["kind"] == "opaque" for ev in events):
         return whole("notebook")
     if is_binary(w_raw) or is_binary(h_raw):
         return whole("binary")
-    if w_raw is None:
-        if h_raw is None:
-            return {"status": "unchanged"}
-        return {"status": "skipped", "reason": "deleted"}
     w_txt = decode(w_raw)
     h_txt = decode(h_raw) if h_raw is not None else None
     w, h = norm(w_txt), (norm(h_txt) if h_txt is not None else None)
@@ -1484,55 +1092,99 @@ def attribute(events, w_raw, h_raw, declared, run_dir, committed=False, mode_cha
 
     # A Write over an existing file is the session's whole content only when the session made
     # the file in the first place; otherwise, with no patch, it is a rewrite of unknown content.
-    first = next((i for i, ev in enumerate(events) if ev["kind"] == "create"), None)
+    # Nothing tells whether someone changed the file between the creation and that Write, so
+    # such a file is committed marked unverified.
+    first = next((i for i, ev in enumerate(events) if ev["kind"] == "create"
+                  or (created and ev["kind"] == "rewrite")), None)
     if first is not None:
-        events = events[:first] + [dict(ev, kind="create") if ev["kind"] == "rewrite" else ev
-                                   for ev in events[first:]]
+        events = events[:first] + [dict(ev, kind="create", rewrite=True)
+                                   if ev["kind"] == "rewrite" else ev for ev in events[first:]]
     anchors = [i for i, ev in enumerate(events) if ev["kind"] == "create"]
     if anchors:
         # The session wrote the whole file: its content from there on is the session's own.
         k = anchors[-1]
+        guesses = []
         try:
-            s = forward(norm(events[k]["content"]), events[k + 1:])
+            s = forward(norm(events[k]["content"]), events[k + 1:], guesses)
         except NotFound:
             return {"status": "skipped", "reason": "rewritten"}
         except Ambiguous as e:
             return {"status": "skipped", "reason": "ambiguous", "detail": why(e)}
+        if guesses and s != w:
+            # A hunk went to its own line number among lookalike places, and the file differs
+            # from what the session made: someone's lines may have moved it onto a lookalike.
+            return {"status": "skipped", "reason": "ambiguous", "detail": "repeated"}
         if h is None or s == w:
-            return outcome(s)
-        c, where = common_changes(s, w, h)
-        if c is None:
-            return {"status": "skipped", "reason": "tangled", "detail": where}
-        return outcome(c)
+            res = outcome(s)
+        else:
+            c, where = common_changes(s, w, h)
+            if c is None:
+                return {"status": "skipped", "reason": "tangled", "detail": where}
+            res = outcome(c)
+        try:
+            at = datetime.datetime.fromisoformat(
+                events[k]["order"][0].replace("Z", "+00:00")).timestamp()
+        except (KeyError, IndexError, ValueError):
+            at = None
+        if h is not None and head_time is not None and (at is None or head_time > int(at)) \
+                and res["status"] in ("commit", "partial"):
+            # Someone committed the file after the session wrote it (by hand: a create this
+            # skill committed leaves no create here). HEAD's change since is not the session's
+            # work undone — maybe a person's committed line they then removed on disk — so the
+            # commit may take out of HEAD only the session's own later edits: HEAD must be one
+            # of the session's states, plus what the working tree shares.
+            target = norm(decode(res["content"])) if res.get("how") == "computed" else w
+
+            def reaches(j):
+                try:
+                    return forward(h, events[j:]) == target
+                except (NotFound, Ambiguous):
+                    return False
+            if not any(reaches(j) for j in range(k + 1, len(events) + 1)):
+                return {"status": "skipped", "reason": "tangled", "detail": None}
+        if events[k].get("rewrite") and res["status"] in ("commit", "partial"):
+            res["reason"] = "unverified"
+        return res
     if any(ev["kind"] == "rewrite" for ev in events):
         return {"status": "skipped", "reason": "rewrite-unknown"}
+    guesses = []  # hunks undone at their own line among lookalike places
     try:
-        b = reverse_replay(w, events)
+        b = w
+        for ev in reversed(events):
+            b = reverse_replay(b, [ev], guesses)
+            if h is not None and b == h and w != h:
+                # W less its newest session edits is exactly HEAD: all W has beyond HEAD is
+                # the session's (the older edits are in HEAD already).
+                return outcome(w)
     except NotFound as e:
-        neighbour = len(e.args) > 1 and e.args[1] == "neighbour"
-        return {"status": "skipped", "reason": "tangled" if neighbour else "notfound",
-                "detail": why(e)}
+        if len(e.args) > 1 and e.args[1] == "neighbour":
+            return {"status": "skipped", "reason": "tangled", "detail": why(e)}
+        return {"status": "skipped", "reason": "notfound", "detail": why(e)}
     except Ambiguous as e:
         # Undo is impossible (deleted text, repeated text, a whole write): replay forward from
-        # HEAD instead.
-        if h is None:
-            return {"status": "skipped", "reason": "ambiguous", "detail": why(e)}
-        try:
-            return outcome(forward(h, events))
-        except (NotFound, Ambiguous):
-            return {"status": "skipped", "reason": "ambiguous", "detail": why(e)}
+        # HEAD instead. Replayed on HEAD, not on the file the edits were made in: every change
+        # it makes must be on disk as it is — not undone by someone since, not landed elsewhere.
+        if h is not None:
+            try:
+                c = forward(h, events)
+                back, bad = merge_file(run_dir, w, h, c)
+                if not bad and back == w:
+                    return outcome(c)
+            except (NotFound, Ambiguous):
+                pass
+        return {"status": "skipped", "reason": "ambiguous", "detail": why(e)}
     if h is None:
         if b == "":
             return outcome(w)
         return {"status": "skipped", "reason": "untracked-before"}
-    if w == h:
-        return {"status": "unchanged"}
-    if b == h:
-        return outcome(w)
     merged, conflicts = merge_file(run_dir, w, b, h)
     if conflicts:
         detail = ", ".join(f"{a}–{z}" for a, z in conflicts)
         return {"status": "skipped", "reason": "tangled", "detail": detail, "lines": conflicts}
+    if guesses and merged != w:
+        # A hunk was undone at its own line among lookalikes, and the file holds more than the
+        # session's edits: someone's lines may have moved a lookalike block onto that line.
+        return {"status": "skipped", "reason": "ambiguous", "detail": "repeated"}
     return outcome(merged)
 
 
@@ -1643,9 +1295,17 @@ def declared_path(arg, root, tracked=lambda path: False):
 
 
 def default_branch(R):
+    """origin/HEAD's branch, else main, else master. origin/HEAD is a local note made at clone
+    time: after a rename on the server (master → main) it may name a branch origin no longer
+    has — ignored when its ref is gone, and overruled by the current branch when that is main or
+    master and tracks origin/<itself>."""
     sym = text_of(git(R.root, "symbolic-ref", "-q", "refs/remotes/origin/HEAD", ok=(0, 1))).strip()
-    if sym.startswith("refs/remotes/origin/"):
-        return sym[len("refs/remotes/origin/"):]
+    named = sym[len("refs/remotes/origin/"):] if sym.startswith("refs/remotes/origin/") and \
+        rev(R.root, sym) else None
+    if R.branch in ("main", "master") and R.branch != named and own_upstream(R, R.branch):
+        return R.branch
+    if named:
+        return named
     for name in ("main", "master"):
         if rev(R.root, "refs/heads/" + name) or rev(R.root, "refs/remotes/origin/" + name):
             return name
@@ -1654,6 +1314,16 @@ def default_branch(R):
 
 def has_origin(R):
     return "origin" in text_of(git(R.root, "remote")).split()
+
+
+def no_remote(R):
+    """The Push line when there is no origin: /commit pushes only there."""
+    others = text_of(git(R.root, "remote")).split()
+    if others:
+        return T("нет — нет remote с именем origin (есть: {r}); запушь сам",
+                 "no — no remote named origin (remotes: {r}); push it yourself",
+                 r=", ".join(others[:3]) + (" …" if len(others) > 3 else ""))
+    return T("нет — нет remote", "no — no remote")
 
 
 def upstream_of(R, branch):
@@ -1667,6 +1337,43 @@ def own_upstream(R, branch):
     (a branch made from origin/main tracks origin/main, which is not its own place)."""
     up = upstream_of(R, branch)
     return up if up == "refs/remotes/origin/" + branch else None
+
+
+def branch_ref(R, branch):
+    """origin/<branch> when it exists: where the branch alone is pushed — also when it was pushed
+    without -u or tracks origin/main."""
+    up = "refs/remotes/origin/" + branch
+    return up if rev(R.root, up) else None
+
+
+def unrelated(R, default):
+    """True when the branch shares no history with the default branch — an orphan (`git
+    checkout --orphan`), before its first commit or after: there is nothing to merge it into,
+    and it goes to origin/<branch> alone. A merge would need --allow-unrelated-histories and
+    put main's history into it (and the branch's files into main)."""
+    if not R.head:
+        return True
+    refs = [r for r in ("refs/heads/" + default, "refs/remotes/origin/" + default)
+            if rev(R.root, r)]
+    return bool(refs) and all(git(R.root, "merge-base", "HEAD", r, ok=None).returncode == 1
+                              for r in refs)
+
+
+def no_merge_passes(R, branch, default, own):
+    """True when `/commit no-merge` would push the branch: nothing on it beyond origin/<branch>
+    (or origin/main) that /commit did not make, and nothing on origin/<branch> it lacks."""
+    up, up_main = branch_ref(R, branch), "refs/remotes/origin/" + default
+    if up and rev_list(R.root, up, "HEAD"):
+        return False
+    return not foreign_commits(R, "HEAD", published_refs(R, up, up_main), own,
+                               merged=(up_main, up))
+
+
+def published_refs(R, *refs):
+    """The refs among these that exist: what is on them is on origin already. Pushing the branch
+    alone publishes nothing that origin/<branch> or origin/main holds (a merge of origin/main
+    into the branch brings main's commits along, and they are not someone's unpushed work)."""
+    return [r for r in refs if r and rev(R.root, r)]
 
 
 def worktrees(R):
@@ -1694,18 +1401,60 @@ def checkout_of(R, branch):
     return None, False
 
 
-def tracked_clean(path):
-    return not git(path, "status", "--porcelain", "--untracked-files=no").stdout.strip()
+def changed_paths(R, a, b):
+    """The paths that differ between two commits (`a...b`: since their merge base)."""
+    data = git(R.root, "diff", "--name-only", "-z", "--no-renames", a, *([b] if b else []),
+               "--").stdout
+    return {os.fsdecode(p) for p in data.split(b"\0") if p}
 
 
-def noff_style(R, ref):
-    """True when the branch's history is mostly merge commits (the repository merges with
-    --no-ff)."""
-    parents = text_of(git(R.root, "log", "--first-parent", "-20", "--format=%P", ref, "--",
-                          ok=None)).split("\n")
-    parents = [p for p in parents if p.strip()]
-    merges = sum(1 for p in parents if len(p.split()) > 1)
-    return merges >= 2 and merges * 2 >= len(parents)
+def in_the_way(where, paths):
+    """The paths among `paths` with uncommitted tracked changes in the checkout at `where`: a
+    merge or fast-forward there that changes them is refused by git (and must never stash)."""
+    data = git(where, "--no-optional-locks", "status", "--porcelain=v1", "-z",
+               "--untracked-files=no", "--no-renames").stdout
+    return sorted({os.fsdecode(rec[3:]) for rec in data.split(b"\0") if rec} & set(paths))
+
+
+def unity_asset(R, path):
+    """A path Unity imports and gives a .meta: inside Assets/ of a Unity project (ProjectSettings/
+    beside it), with no hidden or `~` part and not *.tmp."""
+    parts = path.split("/")
+    if "Assets" not in parts[:-1] or path.endswith(".tmp"):
+        return False
+    i = parts.index("Assets")
+    if any(p.startswith(".") or p.endswith("~") or p.lower() == "cvs" for p in parts[i + 1:]):
+        return False
+    return os.path.isdir(os.path.join(R.root, *parts[:i], "ProjectSettings"))
+
+
+def back_to(R, d, then=""):
+    """The way back to the default branch a branch stop names: `git switch d` — or, when git
+    would refuse it (uncommitted changes in files the switch changes; /commit never stashes),
+    why not and what works instead."""
+    hit = in_the_way(R.root, changed_paths(R, "refs/heads/" + d, "HEAD")) \
+        if rev(R.root, "refs/heads/" + d) else []
+    if not hit:
+        return T("вернись на {d} (git switch {d}) и снова /commit{x}",
+                 "go back to {d} (git switch {d}) and run /commit again{x}", d=d, x=then)
+    return T("git switch {d} не пройдёт: в {p} незакоммиченные правки (может, чужие), а {d} эти "
+             "файлы меняет; stash не делаю — коммить свою работу из отдельного worktree от {d} "
+             "(git worktree add ../<папка> {d}, перенеся туда свои правки) или сначала "
+             "разберись с правками в {p}", "git switch {d} would be refused: {p} has uncommitted "
+             "changes (maybe someone else's) that {d} changes; no stash — commit your work from "
+             "a worktree of {d} (git worktree add ../<dir> {d}, moving your edits there) or deal "
+             "with the changes in {p} first", d=d,
+             p=", ".join(hit[:3]) + (" …" if len(hit) > 3 else ""))
+
+
+def checkout_blocks(d, where, paths, no_merge):
+    return T("в checkout {d} ({w}) незакоммиченные правки в {p} — merge перезаписал бы их; "
+             "закоммить или убери их там и запусти /commit снова{x}",
+             "the checkout of {d} ({w}) has uncommitted changes in {p} that the merge would "
+             "overwrite; commit or remove them there and run /commit again{x}", d=d, w=where,
+             p=", ".join(paths[:5]) + (" …" if len(paths) > 5 else ""),
+             x=T(", или /commit no-merge — запушить только ветку",
+                 ", or /commit no-merge to push the branch alone") if no_merge else "")
 
 
 def subjects(R, shas, limit=5):
@@ -1717,11 +1466,24 @@ def subjects(R, shas, limit=5):
     return "; ".join(out) + (T(" … и ещё {n}", " … and {n} more", n=more) if more > 0 else "")
 
 
+def clean_merge(R, sha, parents):
+    """True when the merge commit holds exactly what git's own merge of its two parents gives
+    (`git merge-tree --write-tree`, git 2.38+): nothing added, dropped or resolved by hand in
+    it. A hand-resolved conflict, an amended merge or `-s ours` is someone's work."""
+    if len(parents) != 2:
+        return False
+    p = git(R.root, "merge-tree", "--write-tree", "--no-messages", *parents, ok=None)
+    tree = text_of(p).split("\n", 1)[0].strip()
+    return p.returncode == 0 and bool(tree) and \
+        tree == text_of(git(R.root, "rev-parse", sha + "^{tree}")).strip()
+
+
 def foreign_commits(R, include, exclude, own, merged=()):
-    """Commits reachable from include and from none of exclude that are not this session's.
-    A merge commit whose other parents are all in one of `merged` (main, origin/main: already
-    published or about to be) brings nothing new — the session's own `git merge` / `git pull`,
-    which prints no `[branch sha]` line — and does not count."""
+    """Commits reachable from include and from none of exclude that are not this session's
+    (`own`: the ones this skill recorded). A merge commit whose other parent is in one of
+    `merged` (main, origin/main, origin/<branch>: already published or about to be) and whose
+    tree is git's clean merge of its parents brings nothing new — a `git merge` / `git pull`
+    of main into the branch, whoever ran it — and does not count."""
     excludes = [exclude] if isinstance(exclude, str) else list(exclude or [])
     refs = [r for r in merged if r and rev(R.root, r)]
     data = text_of(git(R.root, "rev-list", "--parents", include,
@@ -1731,34 +1493,234 @@ def foreign_commits(R, include, exclude, own, merged=()):
         shas = row.split()
         if not shas or shas[0] in own:
             continue
-        if len(shas) > 2 and refs and all(any(is_ancestor(R.root, p, r) for r in refs)
-                                          for p in shas[2:]):
+        if len(shas) == 3 and refs and any(is_ancestor(R.root, shas[2], r) for r in refs) \
+                and clean_merge(R, shas[0], shas[1:]):
             continue
         out.append(shas[0])
     return out
 
 
-NAME_CHARS = r"[\w.@+-]"
+def still_changed(root, rels):
+    """The paths among `rels` that git status in `root` still shows (changed or untracked), or
+    None when git cannot read that repository."""
+    left = set()
+    try:
+        for part in chunks(sorted(rels)):
+            data = git(root, "--no-optional-locks", "status", "--porcelain=v1", "-z",
+                       "--untracked-files=all", "--no-renames", "--", *part, literal=True).stdout
+            left.update(os.fsdecode(rec[3:]) for rec in data.split(b"\0") if rec)
+    except Fail:
+        return None
+    return left
 
 
-NAME_RUN_RE = re.compile(NAME_CHARS + "+")
-NAME_ONLY_RE = re.compile("^" + NAME_CHARS + "+$")
+def unpushed_own(root, own):
+    """True when the repository at `root` holds commits this session's /commit recorded that
+    no remote-tracking ref has."""
+    if not own or not text_of(git(root, "remote", ok=None)).split():
+        return False  # with no remote, nothing is ever pushed: nothing waits for /commit there
+    p = git(root, "rev-list", "--branches", "--not", "--remotes", "--", ok=None)
+    return p.returncode == 0 and bool(own & set(text_of(p).split()))
 
 
-def name_words(cmds):
-    """The words of the commands as named_in matches them: runs of name characters."""
-    return {w for c in cmds for w in NAME_RUN_RE.findall(c)}
+# --- /ticket runs, tasks and PR repositories ----------------------------------------------
+
+def task_runs_root():
+    """The ticket skill's runs root (its guard reads the same variable)."""
+    return os.path.expanduser(os.environ.get("KENSEI_TASK_RUNS_DIR") or "~/.claude/task-runs")
 
 
-def named_in(cmds, rel, words=None):
-    """True when a shell command names this repository path or its file name. A path names
-    itself only where its file name does, so the file name is what is looked for: as a whole
-    word (`words`, from name_words) when it is made of name characters only."""
-    base = os.path.basename(rel) or rel
-    if words is not None and NAME_ONLY_RE.match(base):
-        return base in words
-    rx = re.compile(r"(?<!" + NAME_CHARS + r")" + re.escape(base) + r"(?!" + NAME_CHARS + ")")
-    return any(rx.search(c) for c in cmds)
+TICKET_CMD = re.compile(r"^\s*<command-message>[^<]*</command-message>\s*"
+                        r"<command-name>/(?:[\w.-]+:)?ticket</command-name>\s*"
+                        r"(?:<command-args>(.*?)</command-args>)?", re.S)
+TICKET_SKILL = re.compile(r"(?:^|:)ticket$")
+
+
+def task_of(ref):
+    """(id, url or None) of a task given as a tracker link or an id: the ClickUp, Jira, Linear,
+    GitHub, YouTrack, Asana, Notion id as the ticket skill takes it. A link is read from an
+    issue a board opened (?selectedIssue=, ?issue=, ?p=), then the segment after a marker
+    (/issue/, /browse/, /t/…), then a Notion page id or an Asana gid; anything else -> None
+    rather than a guess from the last segment (a board's own id)."""
+    ref = (ref or "").strip()
+    idlike = re.compile(r"[A-Za-z0-9][\w.-]*")
+    if re.match(r"(?i)https?://", ref):
+        parts = urllib.parse.urlsplit(ref)
+        query = urllib.parse.parse_qs(parts.query)
+        segs = [s for s in parts.path.split("/") if s]
+        tid = next((query[k][0] for k in ("selectedIssue", "issue", "p")
+                    if k in query and idlike.fullmatch(query[k][0])), None)
+        for i, s in enumerate(segs[:-1]):
+            if tid is None and s.lower() in ("issue", "issues", "browse", "task", "t"):
+                tid = segs[-1] if s.lower() == "t" else segs[i + 1]
+        if tid is None and segs:
+            last = re.search(r"(?:^|-)([0-9a-f]{32})$|^(\d{6,})$", segs[-1])  # Notion, Asana
+            tid = last and (last.group(1) or last.group(2))
+        return (tid, ref) if tid and idlike.fullmatch(tid) else None
+    tid = ref.lstrip("#")
+    return (tid, None) if idlike.fullmatch(tid) else None
+
+
+def ticket_run(cfg, sid):
+    """The /ticket run of session `sid`: its task id ('' when not known), or None when the
+    session never ran /ticket. Read from the ticket guard's session marker (<runs root>/.guard/
+    <session id>, holding "run: <run dir>") and, for a session whose hooks are not back (a
+    resume), from a /ticket invocation in its main transcript."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", sid or "")
+    if not safe:
+        return None
+    task = None
+    try:
+        with open(os.path.join(task_runs_root(), ".guard", safe), encoding="utf-8",
+                  errors="replace") as fh:
+            m = re.search(r"^run: (.+)$", fh.read(4096), re.M)
+        task = os.path.basename(m.group(1).strip().rstrip("/")) if m else ""
+    except OSError:
+        pass
+    if task:
+        return task
+    for path in glob.glob(os.path.join(glob.escape(os.path.join(cfg, "projects")), "*",
+                                       safe + ".jsonl")):
+        try:
+            fh = open(path, "rb")
+        except OSError:
+            continue
+        with fh:
+            for raw in fh:
+                if b"ticket" not in raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict) or entry.get("isSidechain"):
+                    continue
+                args = None
+                if entry.get("type") == "user" and not entry.get("isMeta"):
+                    msg = entry.get("message")
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    if isinstance(content, list):
+                        content = "\n".join(b.get("text", "") for b in content if
+                                            isinstance(b, dict) and b.get("type") == "text")
+                    m = TICKET_CMD.match(content) if isinstance(content, str) else None
+                    args = (m.group(1) or "") if m else None
+                elif entry.get("type") == "assistant":
+                    for b in blocks(entry):
+                        inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                        if b.get("type") == "tool_use" and b.get("name") == "Skill" and \
+                                TICKET_SKILL.search(str(inp.get("skill") or "")):
+                            args = str(inp.get("args") or "")
+                if args is not None:
+                    words = args.split()
+                    found = task_of(words[0]) if words else None
+                    task = found[0] if found else (task or "")
+    return task
+
+
+def refuse_in_ticket(cfg, sids, lab):
+    """Inside a /ticket run its publish gate commits — not this script. -> exit 1 after the
+    stop line, or None when no ticket run is on."""
+    own = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    for sid in [own] if own else sids:
+        task = ticket_run(cfg, sid)
+        if task is not None:
+            print(label(lab) + T("нет — стоп: идёт прогон /ticket{t} — коммит делает шлюз тикета",
+                                 "no — stop: a /ticket run{t} is on — its gate makes the commit",
+                                 t=" " + task if task else ""),
+                  flush=True)
+            print("---\nverdict: stop\nticket: " + (task or "?"))
+            return 1
+    for sid in sids if own else []:  # an earlier session's work passed with --session
+        task = ticket_run(cfg, sid) if sid != own else None
+        if task is not None:
+            print(label(T("Задача", "Task")) + T(
+                "сессия {s} вела /ticket{t} — её работа идёт мимо шлюза тикета (/resume {s}, "
+                "чтобы пройти шлюз)", "session {s} ran /ticket{t} — its work bypasses the ticket "
+                "gate (/resume {s} to go through it)", s=sid, t=" " + task if task else ""))
+    return None
+
+
+def mentions_task(message, task):
+    """True when the commit message names the task: its link, or its id as a whole word (a
+    number only as #<n>)."""
+    text = message.decode("utf-8", "replace") if isinstance(message, bytes) else message
+    if task.get("url") and task["url"] in text:
+        return True
+    tid = re.escape(task["id"])
+    rx = rf"#{tid}(?!\w)" if task["id"].isdigit() else rf"(?<![\w-]){tid}(?![\w-])"
+    return bool(re.search(rx, text, re.I))
+
+
+PR_SUBJECT = re.compile(r"^Merge pull request #\d+|^Merge branch '[^']+' into '[^']+'|"
+                        r"^Merged in \S+ \(pull request #\d+\)")
+SQUASH_SUBJECT = re.compile(r"\(#\d+\)\s*$")  # also a direct commit naming an issue: see below
+
+
+def repo_mode(R, default, pr=False, main=False):
+    """("pr" | "direct", why): how work reaches the default branch here — through pull requests
+    when most of its recent first-parent history came that way (GitHub's "Merge pull request
+    #…" or a squash "… (#12)" GitHub committed, GitLab's "Merge branch 'x' into 'main'"), else
+    directly; `pr` / `main` (the user's words or the project's rules, passed by the model)
+    decide first."""
+    if pr or main:
+        return ("pr" if pr else "direct"), T("по аргументу", "as asked")
+    ref = next((r for r in ("refs/remotes/origin/" + default, "refs/heads/" + default)
+                if default and rev(R.root, r)), None)
+    if not ref:
+        return "direct", None
+    rows = text_of(git(R.root, "log", "--first-parent", "-n", "20", "--format=%ae%x00%ce%x00%s",
+                       ref, "--", ok=None)).split("\n")
+    rows = [r.split("\0") for r in rows if r.count("\0") == 2 and r.split("\0")[2].strip()]
+    # "(#12)" at the end is a squash merge only when the forge committed it (GitHub's
+    # noreply@github.com, a merge bot): a direct commit naming an issue has its author as committer.
+    hits = sum(1 for ae, ce, s in rows if PR_SUBJECT.search(s) or (SQUASH_SUBJECT.search(s) and (
+        "noreply@" in ce.lower() or ce.lower() != ae.lower())))
+    if len(rows) >= 4 and hits * 2 >= len(rows):
+        return "pr", T("{n} из {t} последних коммитов {d} пришли через PR",
+                       "{n} of the last {t} commits of {d} came through PRs", n=hits,
+                       t=len(rows), d=default)
+    return "direct", None
+
+
+TRANSLIT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+                    "a b v g d e e zh z i y k l m n o p r s t u f kh ts ch sh sch - y - e yu ya"
+                    .split()))
+
+
+def slug(text, limit=40):
+    """A short kebab-case branch slug from a commit subject."""
+    out = "".join(TRANSLIT.get(ch, ch) for ch in (text or "").lower())
+    out = re.sub(r"[^a-z0-9]+", "-", out).strip("-")
+    return out[:limit].rstrip("-") or "work"
+
+
+def branch_problem(R, name, task_id=None):
+    """Why the new branch cannot be made (an invalid name, a branch of that name, another
+    branch of the same task), or None."""
+    if git(R.root, "check-ref-format", "--branch", name, ok=None).returncode != 0:
+        return T("{b} — не годится как имя ветки", "{b} is not a valid branch name", b=name)
+    taken = [name] if rev(R.root, "refs/heads/" + name) else []
+    if task_id:
+        rows = text_of(git(R.root, "for-each-ref", "--format=%(refname:short)",
+                           "refs/heads/task/", ok=None)).split()
+        taken += [b for b in rows if b == "task/" + task_id or b.startswith(f"task/{task_id}-")]
+    if taken:
+        where, gone = checkout_of(R, taken[0])
+        if where and not gone:  # `git switch` onto it would fail
+            return T("ветка {b} уже есть и выгружена в worktree {p} — коммить там",
+                     "branch {b} already exists and is checked out in the worktree at {p} — "
+                     "commit there", b=taken[0], p=where)
+        # with --task any other name stops the same: no other name is offered
+        other = "" if task_id else T(", или передай другое имя в --branch",
+                                     ", or pass another name with --branch")
+        if is_ancestor(R.root, "refs/heads/" + taken[0], "HEAD"):  # landed in main already
+            return T("ветка {b} уже в {d} — удали её (git branch -d {b}) и снова /commit",
+                     "branch {b} is already in {d} — delete it (git branch -d {b}) and run "
+                     "/commit again", b=taken[0], d=R.branch) + other
+        return T("ветка {b} уже есть — на неё не переключаюсь; переключись сам (git switch {b}) "
+                 "и снова /commit", "branch {b} already exists — not switching onto it; switch "
+                 "yourself (git switch {b}) and run /commit again", b=taken[0]) + other
+    return None
 
 
 def collect(args):
@@ -1769,10 +1731,13 @@ def collect(args):
     if not sids:
         raise Fail("no session id: pass --session or run inside Claude Code "
                    "(CLAUDE_CODE_SESSION_ID)")
-    files = []
+    sids = list(dict.fromkeys(sids))
+    files, file_sid = [], []  # file_sid[i]: the session transcript files[i] belongs to
     for sid in sids:
-        files += transcript_files(cfg, sid)
-    events, all_hints, raw_shas, git_runs = read_transcripts(files)
+        found = transcript_files(cfg, sid)
+        files += found
+        file_sid += [sid] * len(found)
+    events, cmds = read_transcripts(files)
     # Repositories in temp places (an agent's scratchpad clone) are throwaway work, not the
     # user's project — unless this run is in a temp place itself.
     here_temp = is_temp(canonical(os.getcwd()))
@@ -1781,25 +1746,37 @@ def collect(args):
     except Fail:
         if args.repo != ".":
             raise
-        # Started outside a repository (a session in ~): take the one this session edited.
-        roots = sorted({canonical(r) for r in map(repo_root_of, (ev["path"] for ev in events))
-                        if r})
-        temps = [r for r in roots if is_temp(r) and not here_temp]
-        roots = [r for r in roots if r not in temps]
+        # Started outside a repository (a session in ~): take the one this session edited —
+        # among those where something of it is left: a file git status still shows, or a
+        # commit its /commit recorded and nothing pushed yet.
+        edited = {}
+        for p in (ev["path"] for ev in events):
+            r = repo_root_of(p)
+            if r:
+                edited.setdefault(canonical(r), set()).add(p)
+        temps = [r for r in edited if is_temp(r) and not here_temp]
+        own = load_own(cfg, sids)
+        roots, done = [], []
+        for r in sorted(set(edited) - set(temps)):
+            left = still_changed(r, {rel_of(r, p) for p in edited[r]})
+            (roots if left is None or left or unpushed_own(r, own) else done).append(r)
         if len(roots) != 1:
             clones = f"{len(temps)} temporary clone{'s' if len(temps) != 1 else ''} (left alone)"
+            spent = f"{len(done)} with nothing of it left to commit or push"
+            also = "; also " + ", ".join(([spent] if done else []) + ([clones] if temps else []))
             raise Fail("the current directory is not a git repository" + (
-                "; this session edited files in: " + ", ".join(roots) +
-                " — run plan with --repo <path> for each" + (f"; also {clones}" if temps else "")
-                if roots else ", and this session edited files only in " + clones if temps else
+                "; this session's work is left in: " + ", ".join(roots) + " — run plan with "
+                "--repo <path> for each" + (also if done or temps else "") if roots else
+                ", and nothing of this session's is left to commit or push in the repositories "
+                "it edited (" + spent + (f"; also {clones}" if temps else "") + ")" if done else
+                ", and this session edited files only in " + clones if temps else
                 ", and this session edited no file in any repository"))
         R = Repo(roots[0])
-        print(T("Репозиторий: {r} — текущая папка не в git, а сессия правила только его",
-                "Repository: {r} — the current directory is not in git, and this session "
-                "edited only this one", r=R.root))
+        print(T("Репозиторий: {r} — текущая папка не в git; несделанное этой сессии есть "
+                "только в нём", "Repository: {r} — the current directory is not in git; this "
+                "is the only repository with this session's work left", r=R.root))
     run_dir = os.path.abspath(args.out) if args.out else new_run_dir(cfg, R.root)
     private_dir(run_dir)
-    hints, hints_elsewhere = repo_hints(all_hints, R.root)
 
     # Which paths: this repository, another repository, or no repository at all. Paths are
     # spelt as git spells them: NFC where git precomposes Unicode (macOS), whatever spelling the
@@ -1826,6 +1803,16 @@ def collect(args):
             temp_clones.add(root)
         else:
             other.setdefault(root, set()).add(rel)
+    # Another repository is named only for the session's files still changed there (committed
+    # there since, nothing to /commit); one git cannot read keeps all its files.
+    for root, rels in list(other.items()):
+        left_there = still_changed(root, rels)
+        if left_there is None:
+            continue
+        if left_there:
+            other[root] = left_there
+        else:
+            del other[root]
     status_rows = R.status()
     declared, missing_decl, refused, untracked_decl = set(), [], [], []
     decl_arg = {}
@@ -1892,16 +1879,26 @@ def collect(args):
             by_path.pop(rel, None)
             missing_decl.append(decl_arg.get(rel) or rel)
 
-    # What the session already committed: by this skill (recorded per path), or by its own
-    # `git commit` in Bash — named by its `[branch sha]` output line, or, for a quiet one, found
-    # in the reflog at the time the command ran. HEAD holds those edits, so only later ones
-    # are replayed.
+    # What the session already committed: only what this skill recorded (per path, the last
+    # edit each commit holds). HEAD holds those edits, so only later ones are replayed. A commit
+    # the session made with its own `git commit` in Bash is not the skill's: it is foreign to
+    # publishing, and the replay finds its edits in HEAD only where they merge cleanly (the same
+    # change on both sides); a file it cannot split is skipped, pointing at --declare.
     rec = load_records(cfg, sids)
-    if rec["pending"]:
+    prefix = R.root.rstrip(os.sep) + os.sep
+
+    def here(pend):
+        """The pending commit was made in this repository (records before 2.2.1 name it only
+        by the paths they hold)."""
+        if pend.get("repo"):
+            return pend["repo"] == R.common_dir
+        keys = list(pend.get("paths") or {}) + list(pend.get("sync") or {})
+        return any(k.startswith(prefix) for k in keys)
+    if any(here(p) for p in rec["pending"]):
         # A run killed right after `git commit` (or while its post-commit hook ran) recorded
         # nothing more: the commit that holds exactly the planned tree on the planned parent
-        # is that run's.
-        for pend in rec["pending"]:
+        # is that run's. Another repository's pending commit waits for a plan there.
+        for pend in filter(here, rec["pending"]):
             sha = landed(R, pend)
             if sha:
                 settle(cfg, sids, pend, sha)
@@ -1910,69 +1907,30 @@ def collect(args):
         rec = load_records(cfg, sids)
     own = set(rec["commits"])
 
-    def in_head(sha):
-        """sha is in HEAD's history, itself or as the commit a rebase by this skill made of it."""
-        seen = set()
-        while sha and sha not in seen and R.head:
-            seen.add(sha)
-            if rev(R.root, sha) and is_ancestor(R.root, sha, R.head):
-                return True
-            sha = rec["rewritten"].get(sha)
-        return False
+    def in_history(sha):
+        return bool(sha and R.head and rev(R.root, sha) and is_ancestor(R.root, sha, R.head))
 
-    def changed_in(sha):
-        names = git(R.root, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root",
-                    sha, ok=None).stdout
-        return [os.fsdecode(n) for n in names.split(b"\0") if n]
+    # Per session: a commit recorded under a session holds that session's edits only. A run
+    # with sessions A and B records under both; a run with A alone says nothing of B's edits.
+    path_recs = {sid: {p: r for p, r in (_read_records(cfg, sid).get("paths") or {}).items()
+                       if isinstance(r, dict) and isinstance(r.get("ts"), str)} for sid in sids}
 
-    def blob_text(sha, rel):
-        p = git(R.root, "cat-file", "--filters", f"{sha}:{rel}", ok=None)
-        return norm(decode(p.stdout)) if p.returncode == 0 else None
-
-    def before(rel, ts):
-        return [ev for ev in by_path.get(rel, []) if ev["order"][0] <= ts]
-
-    # The session's own `git commit` in Bash: the commit its output names is the session's. One
-    # found only in the reflog while the command ran must also hold the session's last edit
-    # before then of a file it changes — or carry the subject the command gave — else it is
-    # someone's who committed in that checkout meanwhile, and stays foreign.
-    bash_cut = {}
-    found = [(s, ts, True) for s, ts in raw_shas] + reflog_commits(R, git_runs)
-    for s, ts, named in found:
-        full = rev(R.root, s)
-        if not full:
-            continue
-        names = changed_in(full)
-        if not named and not any(before(n, ts) and contains(before(n, ts)[-1], blob_text(full, n))
-                                 for n in names):
-            continue
-        own.add(full)
-        if in_head(full):
-            for n in names:
-                if n not in bash_cut or ts > bash_cut[n][0]:
-                    bash_cut[n] = (ts, full)
-
-    def cut_of(rel, evs):
-        cut = 0
-        r = rec["paths"].get(os.path.join(R.root, rel))
-        if r and R.head and in_head(r.get("commit")):
-            ids = [ev.get("id") for ev in evs]
+    def uncommitted(rel, evs):
+        """The path's edits that no commit of this skill in HEAD holds yet, in time order: per
+        session, the ones after the last edit its own record names."""
+        absp = os.path.join(R.root, rel)
+        done = set()
+        for sid in sids:
+            r = path_recs[sid].get(absp)
+            if not (r and in_history(r.get("commit"))):
+                continue
+            mine = [ev for ev in evs if file_sid[ev["order"][1]] == sid]
+            ids = [ev["id"] for ev in mine]
             if r.get("event") in ids:
-                cut = ids.index(r["event"]) + 1
+                done.update(ids[:ids.index(r["event"]) + 1])
             else:
-                cut = sum(1 for ev in evs if ev["order"][0] <= r["ts"])
-        if rel in bash_cut:
-            # Edits up to the end of the command that committed, less the last ones the commit
-            # does not hold: a parallel agent's edits made after the commit while the command
-            # still ran (`git commit && npm test`) are not committed yet.
-            ts, sha = bash_cut[rel]
-            k = sum(1 for ev in evs if ev["order"][0] <= ts)
-            if k > cut:
-                text = blob_text(sha, rel)
-                while k > cut and not contains(evs[k - 1], text):
-                    k -= 1
-            cut = max(cut, k)
-        return cut
+                done.update(ev["id"] for ev in mine if ev["order"][0] <= r["ts"])
+        return [ev for ev in evs if ev["id"] not in done]
 
     head_map = R.ls_tree(by_path.keys())
     staged = R.staged()
@@ -1980,13 +1938,36 @@ def collect(args):
     untracked = [p for p in candidates if p not in head_map]
     ignored = R.ignored(untracked)
     filemode = R.filemode()
-    R.plain_paths([p for p in candidates if p in head_map])
+    ignorecase = text_of(git(R.root, "config", "--bool", "core.ignorecase", ok=(0, 1))
+                         ).strip() == "true"
+    # A file git tracks under another letter case than the disk has (a case-only rename of it
+    # or its folder that git does not see): not new, and not committed under the disk's name.
+    case_disk = {}
+    if ignorecase and any(p not in declared and by_path[p] for p in untracked):
+        tracked = {_fold(os.fsdecode(x)): os.fsdecode(x)
+                   for x in git(R.root, "ls-files", "-z").stdout.split(b"\0") if x}
+        case_disk = {p: tracked[_fold(p)] for p in untracked if p not in declared and
+                     unicodedata.normalize("NFC", tracked.get(_fold(p), p)) !=
+                     unicodedata.normalize("NFC", p)}
+    # A tracked path git status does not list is the same on disk, in the index and in HEAD:
+    # nothing to commit, whatever the edits were — no HEAD read, no replay (one git process per
+    # file on a repository with `* text=auto`). A file someone marked assume-unchanged or
+    # skip-worktree is hidden from git status the same way.
+    listed = {path for _, path in status_rows}
+    R.plain_paths([p for p in candidates if p in head_map and p in listed])
+    hidden = set()  # assume-unchanged (a lowercase tag) or skip-worktree (S): git status is mum
+    quiet = [p for p in candidates if p in head_map and p not in listed]
+    for part in chunks(quiet):
+        rows = git(R.root, "ls-files", "-v", "-z", "--", *part, literal=True, ok=None).stdout
+        hidden |= {os.fsdecode(r[2:]) for r in rows.split(b"\0")
+                   if r[:1].islower() or r[:1] == b"S"}
     items = []
     for rel in candidates:
         evs = by_path[rel]
         absp = os.path.join(R.root, rel)
-        cut = cut_of(rel, evs)
-        item = {"path": rel, "events": len(evs) - cut, "declared": rel in declared}
+        todo = uncommitted(rel, evs)
+        cut = len(evs) - len(todo)
+        item = {"path": rel, "events": len(todo), "declared": rel in declared}
         if cut:
             item["committed_events"] = cut
         if evs:
@@ -1997,6 +1978,17 @@ def collect(args):
             continue
         if os.path.isdir(absp) and not os.path.islink(absp):
             item.update(status="skipped", reason="directory")
+            items.append(item)
+            continue
+        if rel in case_disk:
+            item.update(status="skipped", reason="case-disk", detail=case_disk[rel])
+            items.append(item)
+            continue
+        if rel in head_map and rel not in listed and rel not in declared and \
+                not os.path.islink(absp):
+            item["status"] = "unchanged"
+            if todo and rel in hidden:
+                item.update(status="skipped", reason="hidden")
             items.append(item)
             continue
         w_raw, w_hash = read_worktree(absp)
@@ -2011,8 +2003,19 @@ def collect(args):
             chmod = rel in declared and filemode and w_raw is not None and os.name != "nt" \
                 and h is not None and h[0] in ("100644", "100755") and \
                 ("100755" if os.access(absp, os.X_OK) else "100644") != h[0]
-            res = attribute(evs[cut:], w_raw, h_raw, rel in declared, run_dir, committed=cut > 0,
-                            mode_changed=chmod)
+            created = any(ev["kind"] == "create" for ev in evs)
+            when = text_of(git(R.root, "log", "-1", "--format=%ct", "HEAD", "--", rel,
+                               literal=True)).strip() if h and created else ""
+            res = attribute(todo, w_raw, h_raw, rel in declared, run_dir, committed=cut > 0,
+                            mode_changed=chmod, created=created,
+                            head_time=int(when) if when.isdigit() else None)
+        if res.get("status") in ("commit", "partial") and h and w_raw is not None \
+                and h[0] != "120000" and rel not in R._plain:
+            # git's eol filters would renormalise HEAD's own lines (a CRLF blob under text=auto
+            # or autocrlf): every line of the file would change in the commit
+            again = git(R.root, "hash-object", "--stdin", "--path=" + rel, stdin=h_raw, ok=None)
+            if again.returncode == 0 and text_of(again).strip() != h[1]:
+                res = {"status": "skipped", "reason": "eol"}
         item.update(res)
         item["w_hash"] = w_hash
         item["created"] = h is None and w_raw is not None
@@ -2038,6 +2041,7 @@ def collect(args):
         meta_head = R.ls_tree(companions.keys())
         dirs_in_head = R.ls_dirs({m[:-len(".meta")] for m in companions})
         meta_ignored = R.ignored([m for m in companions if m not in meta_head])
+        missing = set()
         for meta, owner in sorted(companions.items()):
             absm = os.path.join(R.root, meta)
             folder = meta[:-5]
@@ -2051,10 +2055,20 @@ def collect(args):
                 items.append({"path": meta, "events": 0, "declared": False, "status": "commit",
                               "how": "whole", "reason": "companion", "companion_of": owner,
                               "w_hash": w_hash, "created": True, "deleted": False})
+            elif not exists and not in_head and not owner_deleted and \
+                    meta not in meta_ignored and unity_asset(R, folder):
+                missing.add(meta)  # Unity has not imported it yet
             elif not exists and in_head and owner_deleted:
                 items.append({"path": meta, "events": 0, "declared": False, "status": "commit",
                               "how": "delete", "reason": "companion", "companion_of": owner,
                               "w_hash": "absent", "created": False, "deleted": True})
+        for it in items:  # without its .meta (or its new folder's) the asset is not committed
+            path = it["path"]
+            if it.get("created") and it.get("status") in ("commit", "partial") and any(
+                    p + ".meta" in missing for p in [path] + [path.rsplit("/", i)[0] for i in
+                                                              range(1, path.count("/") + 1)]):
+                it.pop("how", None)
+                it.update(status="skipped", reason="no-meta")
     head_map.update(R.ls_tree([i["path"] for i in items if i["path"] not in head_map]))
 
     # The index entries this skill's own earlier commit should have set but could not (the
@@ -2063,24 +2077,22 @@ def collect(args):
     # index still holds the recorded stale entry and HEAD the commit's, apply puts them right;
     # a record that no longer matches is dropped.
     unsynced, drop = [], []
-    prefix = R.root.rstrip(os.sep) + os.sep
     for absp, u in sorted(rec["unsynced"].items()):
         if not absp.startswith(prefix):
             continue
         path = git_rel(R.root, absp)
-        sha, seen = u.get("commit"), set()
-        while sha and sha not in seen and not (rev(R.root, sha) and R.head and
-                                                is_ancestor(R.root, sha, R.head)):
-            seen.add(sha)
-            sha = rec["rewritten"].get(sha)
+        sha = u.get("commit")
         stale = tuple(u["stale"]) if u.get("stale") else "absent"
         mine = tuple(u["entry"]) if u.get("entry") else None
-        if not sha or sha in seen or R.ls_tree([path]).get(path) != mine or \
+        if not in_history(sha) or R.ls_tree([path]).get(path) != mine or \
                 index_entries(R, [path]).get(path, "absent") != stale:
             drop.append(absp)
             continue
-        dirty = git(R.root, "--no-optional-locks", "diff", "--quiet", "HEAD", "--", path,
-                    ok=(0, 1), literal=True).returncode == 1
+        # the disk against the commit's entry: the stale index makes `git diff HEAD` see a
+        # new file the commit holds as deleted
+        raw, _ = read_worktree(os.path.join(R.root, path))
+        dirty = raw is not None if not mine else raw is None or mine[1] != text_of(git(
+            R.root, "hash-object", "--stdin", "--path=" + path, stdin=raw)).strip()
         unsynced.append({"path": path, "commit": sha, "entry": u.get("entry"),
                          "stale": u.get("stale"), "dirty": dirty, "record": absp})
     forget(cfg, sids, unsynced=drop)
@@ -2147,8 +2159,7 @@ def collect(args):
     # there (a case-only rename with only the new name declared).
     case_clash = []
     added = [it["path"] for it in ours if it["how"] != "delete" and it["path"] not in head_map]
-    if added and text_of(git(R.root, "config", "--bool", "core.ignorecase",
-                             ok=(0, 1))).strip() == "true":
+    if added and ignorecase:
         gone_now = {it["path"] for it in ours if it["how"] == "delete"}
         tree, new = {}, set(added)
         listing = git(R.root, "ls-tree", "-r", "-z", "--name-only", R.head).stdout \
@@ -2177,42 +2188,61 @@ def collect(args):
         if ("100755" if os.access(absp, os.X_OK) else "100644") != it["mode"]:
             mode_left.append(it["path"])
 
-    # Foreign work: what stays untouched.
+    # Foreign work: what stays untouched. The session's own skipped files stay too, but they
+    # are not someone else's: their Skip lines name them.
     ours_whole = {it["path"] for it in items if it.get("status") == "commit"}
     ours_any = ours_whole | {it["path"] for it in items if it.get("status") == "partial"}
     left_whole = ours_whole - set(mode_left)  # nothing of these stays after the commit
     unsynced_dirty = {u["path"] for u in unsynced if u["dirty"]}
+    own_skipped = {it["path"] for it in items
+                   if it.get("status") == "skipped" and it.get("reason") != "ignored"}
+    own_skipped |= set(case_disk.values())
 
     def stays_modified(xy, path):
         if path in unsynced_paths and path not in ours_any:
             return path in unsynced_dirty
         return path not in left_whole and xy[1] != " "
+
+    def stays_staged(xy, path):
+        return xy[0] not in " ?" and path not in ours_any and path not in unsynced_paths
     foreign = {"modified": 0, "untracked": 0, "staged": 0}
+    left_decl = set(untracked_decl)  # a Skip line of their own
     for xy, path in status_rows:
+        if path in own_skipped or path in left_decl:
+            continue
         if xy == "??":
-            foreign["untracked"] += path not in ours_any
+            foreign["untracked"] += path not in ours_any and path not in unsynced_paths
         elif xy != "!!":
             foreign["modified"] += stays_modified(xy, path)
-            if xy[0] not in " ?" and path not in ours_any and path not in unsynced_paths:
-                foreign["staged"] += 1
-    partial = [it["path"] for it in items if it.get("status") == "partial"]
-    # Tracked changes left after our commit block a rebase or merge in this checkout.
-    dirty_after = bool(partial) or any(
-        xy not in ("??", "!!") and (stays_modified(xy, path) or
-                                    (xy[0] not in " ?" and path not in ours_any and
-                                     path not in unsynced_paths))
-        for xy, path in status_rows)
+            foreign["staged"] += stays_staged(xy, path)
 
     # Files left out of the commit that the session's own shell commands name: the model cannot
     # see the shell commands of subagents and workflow agents, so this is its only pointer.
-    cmds = [c for _, c in hints]
-    words = name_words(cmds)
-    left = [path for xy, path in status_rows if xy != "!!" and path not in left_whole]
-    left += [it["path"] for it in items if it.get("status") == "skipped"]
-    bash_named = []
-    for path in left:
-        if path not in bash_named and named_in(cmds, path, words):
-            bash_named.append(path)
+    # Every changed or untracked file not committed whole is a candidate (a partial file's
+    # other part may be the session's Bash edit); a failed command counts too (it may have
+    # written before it failed), a refused one does not (it never ran). A bare file name counts
+    # only when no other changed file — the ones committed now and the session's own included —
+    # has it.
+    def fold(text):
+        text = unicodedata.normalize("NFC", text)
+        return text.casefold() if ignorecase else text
+    changed = [path for xy, path in status_rows if xy != "!!"]
+    left = [path for path in changed if path not in left_whole
+            and (path not in unsynced_paths or path in unsynced_dirty)]
+    bash_named, hits = shell_named([c for c, _ in cmds], left, fold,
+                                   universe=changed + list(by_path))
+    # Every command naming each of those files, uncut and oldest first: one of them may be the
+    # write (a subagent's python heredoc) while the others are reads (a grep, a git diff).
+    all_commands = None
+    if hits:
+        every = sorted({n for idx in hits.values() for n in idx})
+        pos = {n: i for i, n in enumerate(every)}
+        all_commands = os.path.join(run_dir, "commands.json")
+        with open(all_commands, "w", encoding="utf-8") as fh:
+            json.dump({"commands": [("[failed] " if cmds[n][1] else "") + cmds[n][0]
+                                    for n in every],
+                       "named_by": {p: [pos[n] for n in idx] for p, idx in sorted(hits.items())}},
+                      fh, ensure_ascii=False, indent=1)
     # Files a declared folder holds that went into the commit after all (a .meta companion)
     # are not "not taken".
     untracked_decl = [p for p in untracked_decl if p not in ours_any]
@@ -2222,11 +2252,11 @@ def collect(args):
         "head": R.head, "branch": R.branch, "worktree": R.worktree,
         "files": items, "other_repos": {k: sorted(v) for k, v in sorted(other.items())},
         "temp_clones": len(temp_clones),
-        "outside": len(outside), "bash_hints": [c for _, c in hints[-MAX_HINTS:]],
-        "bash_hints_total": len(hints), "bash_hints_elsewhere": hints_elsewhere,
-        "bash_named": bash_named, "mode_left": mode_left, "unsynced": unsynced,
+        "outside": len(outside), "bash_named": bash_named, "bash_commands": all_commands,
+        "mode_left": mode_left,
+        "unsynced": unsynced,
         "declare_not_found": missing_decl, "declare_refused": refused,
-        "declare_untracked": untracked_decl, "foreign": foreign, "dirty_after": dirty_after,
+        "declare_untracked": untracked_decl, "foreign": foreign,
         "own_commits": sorted(own), "no_merge": bool(args.no_merge), "case_clash": case_clash,
         "no_push": bool(args.no_push), "run_dir": run_dir, "blocked": blocked,
     }
@@ -2234,247 +2264,131 @@ def collect(args):
     return R, plan
 
 
-def preview(R, plan, has_files, own):
-    """Status lines for merge and push, predicted from local refs (no fetch); they follow the
-    same decisions as Publisher. -> (lines, stop reason or None, something to publish).
-    A stop that comes after the commit (there are files to commit) is a forecast — apply
-    commits and stops there — so it reads "will stop after the commit" and is not a verdict."""
-    lines = []
-    branch = plan["branch"]
-    default = default_branch(R) or branch
-    remote = has_origin(R)
-    no_push = plan["no_push"]
-    plan["default"] = default
-    main_label = T("В {b}", "Into {b}", b=default)
-
-    def push_line(target, new=False):
-        if no_push:
-            return T("нет — по аргументу", "no — as asked")
-        if not remote:
-            return T("нет — нет remote", "no — no remote")
-        return T("да — origin/{t}", "yes — origin/{t}", t=target) + (
-            T(" (новая ветка на origin)", " (new branch on origin)") if new else "")
-
-    def stop_at(lab, text, after=None):
-        if has_files:
-            lines.append((lab, T("нет — остановлюсь после коммита: ",
-                                 "no — will stop after the commit: ") + text))
-        else:
-            lines.append((lab, T("нет — стоп: ", "no — stop: ") + text))
-        if after:
-            lines.append(after)
-        return lines, (None if has_files else text), has_files
-
-    def not_ours(where, shas):
-        return T("в {w} чужие незапушенные коммиты: {l} — не публикую чужое; запушь или убери "
-                 "их сам", "{w} has unpushed commits that are not this session's: {l} — not "
-                 "publishing them; push or drop them yourself", w=where, l=subjects(R, shas))
-
-    if R.head is None:
-        if not has_files:
-            lines.append(("Push", T("нет — нечего публиковать", "no — nothing to publish")))
-            return lines, None, False
-        if branch != default:
-            lines.append((main_label, T("нет — новая ветка без истории",
-                                        "no — a new branch with no history")))
-        else:
-            lines.append((main_label, T("нет — уже на {b}", "no — already on {b}", b=default)))
-        lines.append(("Push", push_line(branch, new=True)))
-        return lines, None, True
-
-    if branch == default:
-        lines.append((main_label, T("нет — уже на {b}", "no — already on {b}", b=default)))
-        up = "refs/remotes/origin/" + branch
-        if no_push or not remote:
-            lines.append(("Push", push_line(branch)))
-            return lines, None, has_files
-        if not rev(R.root, up):
-            foreign = foreign_commits(R, "HEAD", None, own)
-            if foreign:
-                return stop_at("Push", not_ours(branch, foreign))
-            lines.append(("Push", push_line(branch, new=True)))
-            return lines, None, True
-        unpushed = rev_list(R.root, "HEAD", up)
-        if not has_files and not unpushed:
-            lines.append(("Push", T("нет — origin/{b} уже содержит всё",
-                                    "no — origin/{b} already has everything", b=branch)))
-            return lines, None, False
-        foreign = foreign_commits(R, "HEAD", up, own, merged=(up,))
-        behind = len(rev_list(R.root, up, "HEAD"))
-        if foreign:
-            return stop_at("Push", not_ours(branch, foreign))
-        if behind and plan["dirty_after"]:
-            return stop_at("Push", T(
-                "origin/{b} ушёл вперёд на {n}, а в дереве есть чужие незакоммиченные правки — "
-                "rebase не делаю; закоммить или убери их и запусти /commit снова",
-                "origin/{b} is {n} ahead and the tree has uncommitted changes that are not this "
-                "session's — no rebase; commit or remove them and run /commit again",
-                b=branch, n=n_commits(behind)))
-        text = push_line(branch)
-        if behind:
-            text += T(" (сначала rebase на origin/{b}: +{n})", " (first rebase onto origin/{b}: "
-                      "+{n})", b=branch, n=behind)
-        lines.append(("Push", text))
-        return lines, None, True
-
-    up_main = "refs/remotes/origin/" + default
-    have_up = bool(rev(R.root, up_main))
-    # On another branch, not merging: the branch goes to origin/<branch>.
-    if plan["no_merge"]:
-        lines.append((main_label, T("нет — по аргументу", "no — as asked")))
-        if no_push or not remote:
-            lines.append(("Push", push_line(branch)))
-            return lines, None, has_files
-        up = own_upstream(R, branch)
-        base = up or (up_main if have_up else None)
-        foreign = foreign_commits(R, "HEAD", base, own, merged=(up_main,))
-        if foreign:
-            return stop_at("Push", not_ours(branch, foreign))
-        if up:
-            behind = len(rev_list(R.root, up, "HEAD"))
-            if behind:
-                return stop_at("Push", T(
-                    "в origin/{b} {n}, которых нет в ветке — сначала влей origin/{b} в ветку "
-                    "(git pull)", "origin/{b} has {n} the branch lacks — merge or pull "
-                    "origin/{b} into the branch first", b=branch, n=n_commits(behind)))
-            if not has_files and not rev_list(R.root, "HEAD", up):
-                lines.append(("Push", T("нет — origin/{b} уже содержит всё",
-                                        "no — origin/{b} already has everything", b=branch)))
-                return lines, None, False
-            lines.append(("Push", push_line(branch)))
-            return lines, None, True
-        lines.append(("Push", push_line(branch, new=True)))
-        return lines, None, True
-
-    # On another branch: into main, then push main.
-    main_ref = "refs/heads/" + default
-    have_main = bool(rev(R.root, main_ref))
-    if not have_main and not have_up:
-        return stop_at(main_label, T("нет ветки {b} — влей вручную или запусти с no-merge",
-                                     "no branch {b} — merge by hand or run with no-merge",
-                                     b=default))
-    after_stop = ("Push", T("нет — после стопа", "no — stopped before"))
-    excl = [r for r, ok in ((main_ref, have_main), (up_main, have_up)) if ok]
-    notes = []
-    diverged = False
-    if have_main and have_up:
-        main_foreign = foreign_commits(R, main_ref, up_main, own, merged=(up_main,))
-        if main_foreign:
-            return stop_at(main_label, main_foreign_text(R, default, main_foreign), after_stop)
-        behind = len(rev_list(R.root, up_main, main_ref))
-        ahead = rev_list(R.root, main_ref, up_main)
-        if behind and ahead:
-            if not is_ancestor(R.root, main_ref, "HEAD"):
-                return stop_at(main_label, T(
-                    "локальный {b} разошёлся с origin/{b} — сведи их вручную",
-                    "local {b} and origin/{b} diverged — reconcile them by hand", b=default),
-                    after_stop)
-            diverged = True
-        elif behind:
-            notes.append(T("сначала {b} до origin/{b}: +{n}",
-                           "first {b} to origin/{b}: +{n}", b=default, n=behind))
-    mine = rev_list(R.root, "HEAD", excl)
-    unpushed_main = have_main and (not have_up or bool(rev_list(R.root, main_ref, up_main)))
-    bup = own_upstream(R, branch) if remote and not no_push else None
-    if not has_files and not mine and not diverged:
-        lines.append((main_label, T("нет — ветка {br} уже в {b}",
-                                    "no — branch {br} is already in {b}", br=branch, b=default)))
-        # The branch's own upstream still lacks what main got (an earlier no-push run).
-        branch_too = bool(bup) and bool(rev_list(R.root, "HEAD", bup)) and \
-            not rev_list(R.root, bup, "HEAD")
-        if unpushed_main and remote and not no_push:
-            lines.append(("Push", push_line(default) + (f", origin/{branch}" if branch_too
-                                                        else "")))
-            return lines, None, True
-        if branch_too:
-            lines.append(("Push", push_line(branch)))
-            return lines, None, True
-        lines.append(("Push", push_line(default) if no_push or not remote else
-                      T("нет — нечего публиковать", "no — nothing to publish")))
-        return lines, None, False
-    foreign = foreign_commits(R, "HEAD", excl, own, merged=excl)
-    if foreign:
-        return stop_at(main_label, branch_foreign(R, branch, default, foreign), after_stop)
-    lacking = len({c for r in excl for c in rev_list(R.root, r, "HEAD")})
-    if lacking and plan["dirty_after"]:
-        return stop_at(main_label, T(
-            "в {b} {n} новых, а в дереве ветки чужие незакоммиченные правки — не вливаю {b} в "
-            "ветку; закоммить или убери их и запусти /commit снова", "{b} has {n} new and this "
-            "tree has uncommitted changes that are not this session's — not merging {b} into "
-            "the branch; commit or remove them and run /commit again", b=default,
-            n=n_commits(lacking)), after_stop)
-    if diverged:
-        notes.append(T("сначала origin/{b} в ветку (merge): +{n}",
-                       "first origin/{b} into the branch (merge): +{n}", b=default, n=lacking))
-    elif lacking:
-        notes.append(T("сначала {b} в ветку: +{n}", "first {b} into the branch: +{n}",
-                       b=default, n=lacking))
-    if not have_up and remote and not no_push:
-        # origin has no main yet: everything main holds would be published.
-        history = foreign_commits(R, main_ref if have_main else "HEAD", None, own)
-        if history:
-            lines.append((main_label, T("да — ветка {br} → {b}", "yes — branch {br} → {b}",
-                                        br=branch, b=default)))
-            return stop_at("Push", not_ours(default, history))
-    n = len(mine) + (1 if has_files else 0) + (1 if diverged else 0)  # + the merge commit
-    if not have_main:
-        how = T("создам {b} на ветке", "create {b} at the branch", b=default)
-    elif noff_style(R, main_ref) and checkout_of(R, default)[0]:
-        how = T("merge --no-ff в {b}", "merge --no-ff into {b}", b=default)
-    else:
-        how = T("fast-forward {b}", "fast-forward {b}", b=default)
-    pre = f" ({'; '.join(notes)})" if notes else ""
-    lines.append((main_label, T("да — ветка {br} → {how} ({n}){pre}",
-                                "yes — branch {br} → {how} ({n}){pre}",
-                                br=branch, how=how, n=n_commits(n), pre=pre)))
-    text = push_line(default)
-    if bup:
-        text += f", origin/{branch}"
-    lines.append(("Push", text))
-    return lines, None, True
+def lag(R, d, have_up):
+    """What keeps main from moving to the branch by fast-forward: main or origin/main has
+    commits the branch lacks. /commit never merges or rebases to get past it: -> the stop text,
+    naming the merge to run, or None."""
+    a = set(rev_list(R.root, "refs/heads/" + d, "HEAD"))
+    o = set(rev_list(R.root, "refs/remotes/origin/" + d, "HEAD")) if have_up else set()
+    if not a and not o:
+        return None
+    if a <= o:
+        return T("origin/{d} ушёл вперёд на {n} — влей его в ветку (git merge origin/{d}) и снова "
+                 "/commit", "origin/{d} is {n} ahead — merge it into the branch (git merge "
+                 "origin/{d}) and run /commit again", d=d, n=n_commits(len(o)))
+    if o <= a:
+        return T("{d} ушёл вперёд на {n} — влей {d} в ветку (git merge {d}) и снова /commit",
+                 "{d} is {n} ahead — merge {d} into the branch (git merge {d}) and run /commit "
+                 "again", d=d, n=n_commits(len(a)))
+    return T("{d} и origin/{d} разошлись и оба ушли вперёд ({n}) — влей оба в ветку (git merge "
+             "origin/{d}, затем git merge {d}) и снова /commit", "{d} and origin/{d} diverged and "
+             "are both ahead ({n}) — merge both into the branch (git merge origin/{d}, then git "
+             "merge {d}) and run /commit again", d=d, n=n_commits(len(a | o)))
 
 
-def main_foreign_text(R, d, shas):
-    return T("в локальном {d} чужие незапушенные коммиты: {l} — не трогаю {d}; запушь или "
-             "убери их сам, или /commit no-merge — запушить только ветку",
-             "local {d} has unpushed commits that are not this session's: {l} — leaving {d} "
-             "alone; push or drop them yourself, or /commit no-merge to push the branch alone",
-             d=d, l=subjects(R, shas))
+def origin_ahead(b, n):
+    """On main: origin/main has commits main lacks — no rebase, no merge by /commit."""
+    return T("origin/{b} ушёл вперёд на {n} — влей его в {b} (git merge origin/{b}) и снова "
+             "/commit", "origin/{b} is {n} ahead — merge it into {b} (git merge origin/{b}) and run "
+             "/commit again", b=b, n=n_commits(n))
 
 
-def branch_foreign(R, b, d, shas):
-    """The stop for commits on the branch that are not this session's, with the way out:
-    already on origin/<branch> — the branch alone can be pushed; else they are someone's local
-    work, to merge or drop by hand."""
-    up = "refs/remotes/origin/" + b
-    on_origin = rev(R.root, up) and all(is_ancestor(R.root, c, up) for c in shas)
-    way = T("запушить только ветку: /commit no-merge", "to push the branch alone: /commit "
-            "no-merge") if on_origin else T("влей их в {d} сам или убери с ветки",
-                                            "merge them into {d} yourself or drop them from the "
-                                            "branch", d=d)
-    return T("на ветке {b} чужие коммиты: {l} — их в {d} не вливаю; {w}",
-             "branch {b} has commits that are not this session's: {l} — not merging them into "
-             "{d}; {w}", b=b, d=d, l=subjects(R, shas), w=way)
+def no_main(R, d, have_up):
+    """No local main to fast-forward: /commit does not create it. When the other of main /
+    master is a local branch, origin/HEAD may be stale (a rename on the server): creating `d`
+    would push the old name back, so the way out names both."""
+    other = next((n for n in ("main", "master") if n != d and rev(R.root, "refs/heads/" + n)),
+                 None)
+    way = T("создай её (git branch {d} origin/{d}) и снова /commit", "create it (git branch {d} "
+            "origin/{d}) and run /commit again", d=d) if have_up else \
+        T("влей вручную", "merge by hand")
+    if other:
+        way += T("; если основную ветку на origin переименовали (а {o} есть) — git remote "
+                 "set-head origin -a", "; if origin's default branch was renamed (there is "
+                 "{o}) — git remote set-head origin -a", o=other)
+    return T("локальной ветки {d} нет — {w}; или /commit no-merge",
+             "there is no local {d} branch — {w}; or /commit no-merge", d=d, w=way)
 
 
+def branch_behind(b, n):
+    return T("в origin/{b} {n}, которых нет в ветке — сначала влей origin/{b} в ветку (git merge "
+             "origin/{b})", "origin/{b} has {n} the branch lacks — merge origin/{b} into the "
+             "branch first (git merge origin/{b})", b=b, n=n_commits(n))
+
+
+# Own commits are only the ones this skill made and recorded for the sessions of the run.
+# Everything else unpushed on the way is not published — also another session's /commit, and a
+# commit the session itself made with `git commit` in Bash: the stop names the commits.
+
+def unpushed_foreign(R, where, shas):
+    return T("в {w} незапушенные коммиты не из /commit этой сессии: {l} — их не публикую; "
+             "проверь и запушь их сам, потом снова /commit, или убери их",
+             "{w} has unpushed commits not made by this session's /commit: {l} — not "
+             "publishing them; review and push them yourself, then run /commit again, or drop "
+             "them", w=where, l=subjects(R, shas))
+
+
+def main_foreign_text(R, d, shas, no_merge=True):
+    """no_merge: `/commit no-merge` would push the branch (nothing foreign on it either)."""
+    return T("в локальном {d} незапушенные коммиты не из /commit этой сессии: {l} — не трогаю "
+             "{d}; проверь и запушь их сам, потом снова /commit{x}",
+             "local {d} has unpushed commits not made by this session's /commit: {l} — "
+             "leaving {d} alone; review and push them yourself, then run /commit again{x}", d=d,
+             l=subjects(R, shas),
+             x=T(", или /commit no-merge — запушить только ветку",
+                 ", or /commit no-merge to push the branch alone") if no_merge else "")
+
+
+def branch_foreign(R, b, d, shas, own):
+    """The stop for commits on the branch that /commit did not make (someone's, or a `git commit`
+    the session ran itself), with the way out: `/commit no-merge` where it would pass, else
+    review them and merge or drop them by hand."""
+    way = T("если ветка твоя — запушить только её: /commit no-merge", "if the branch is yours, "
+            "to push the branch alone: /commit no-merge") if no_merge_passes(R, b, d, own) else T(
+        "проверь их, влей в {d} и запушь сам, или убери их с ветки",
+        "review them, merge them into {d} and push it yourself, or drop them from the branch",
+        d=d)
+    return T("на ветке {b} коммиты не из /commit этой сессии: {l} — их в {d} не вливаю; {w}",
+             "branch {b} has commits not made by this session's /commit: {l} — not merging "
+             "them into {d}; {w}", b=b, d=d, l=subjects(R, shas), w=way)
+
+
+# A file the replay cannot split is skipped; the way out is the same for each: --declare it when
+# the whole file is the session's (it is then committed whole, as on disk).
+DECLARE = (" — передай --declare, если весь файл твой", " — --declare it if the whole file is yours")
 REASONS = {
     "ignored": ("в .gitignore", "ignored by git"),
     "directory": ("это папка — передай файлы", "a directory — declare its files"),
-    "notfound": ("мою правку переписали после меня — не нахожу её в файле",
+    "notfound": ("правку сессии переписали после неё — не нахожу её в файле",
                  "a later edit rewrote this session's change — it is not in the file"),
-    "rewritten": ("правку сессии не найти — файл менялся после неё (например, через Bash); "
-                  "передай --declare, если весь файл твой",
+    "rewritten": ("правку сессии не найти — файл менялся после неё (например, через Bash)",
                   "this session's edit cannot be found — the file changed after it (e.g. "
-                  "through Bash); --declare it if the whole file is yours"),
-    "ambiguous": ("не могу однозначно найти свою правку", "cannot locate this session's "
+                  "through Bash)"),
+    "ambiguous": ("не могу однозначно найти правку сессии", "cannot locate this session's "
                   "change for sure"),
-    "tangled": ("мои и чужие правки сцеплены", "this session's and other edits are entangled"),
-    "rewrite-unknown": ("агент переписал файл целиком (Write), а что было в нём до этого — "
-                        "неизвестно; передай --declare, если весь файл твой",
-                        "an agent rewrote the whole file (Write) and what it held before is "
-                        "unknown; --declare it if the whole file is yours"),
+    "tangled": ("правки сессии сцеплены с другими — чужими или закоммиченными не через /commit",
+                "this session's edits are entangled with other changes — someone else's, or "
+                "ones committed outside /commit"),
+    "rewrite-unknown": ("агент перезаписал файл целиком, не знаю, что в нём было до этого",
+                        "an agent overwrote the whole file and what it held before is unknown"),
     "deleted": ("удалён после правок сессии — передай --declare, если удаляла сессия",
                 "deleted after this session's edits — pass --declare if the session deleted it"),
+    "hidden": ("помечен в git как assume-unchanged/skip-worktree — не коммичу; сними пометку (git "
+               "update-index --no-assume-unchanged / --no-skip-worktree) и снова /commit, если "
+               "правка нужна", "marked assume-unchanged/skip-worktree in git — not committed; "
+               "clear the flag (git update-index --no-assume-unchanged / --no-skip-worktree) and "
+               "run /commit again if the change belongs in it"),
+    "eol": ("/commit перепишет концы строк во всём файле (в git он с CRLF, а .gitattributes/"
+            "autocrlf их нормализует) — закоммить его сам: git add их сохранит",
+            "committing it here would rewrite every line ending (CRLF in git, normalised by "
+            ".gitattributes/autocrlf) — commit it by hand; git add keeps them"),
+    "case-disk": ("git хранит его как {x} — на диске другой регистр букв (переименование, "
+                  "которого git не видит); приведи регистр на диске к git (или git mv) и снова "
+                  "/commit", "git tracks it as {x} — the letter case on disk differs (a rename "
+                  "git does not see); match the disk to git (or git mv) and run /commit again"),
+    "no-meta": ("новый ассет без .meta — Unity его ещё не импортировал: переключись в редактор "
+                "(или обнови ассеты) и снова /commit", "a new asset with no .meta yet — Unity "
+                "has not imported it: focus the editor (or refresh assets) and run /commit again"),
     "untracked-before": ("файл был вне git до правок сессии — передай --declare, если его "
                          "создала сессия", "the file was untracked before this session edited it "
                          "— pass --declare if the session created it"),
@@ -2493,12 +2407,14 @@ RANGE_RE = re.compile(r"^\d+–\d+(?:, \d+–\d+)*$")
 
 def reason_text(it):
     ru, en = REASONS.get(it.get("reason"), ("?", "?"))
-    text = T(ru, en)
     d = it.get("detail")
+    text = T(ru, en, x=d)
     if isinstance(d, str) and RANGE_RE.match(d):
         text += T(" (строки {d})", " (lines {d})", d=d)
     elif d in DETAILS:
         text += " — " + T(*DETAILS[d])
+    if it.get("reason") in ("notfound", "rewritten", "ambiguous", "tangled", "rewrite-unknown"):
+        text += T(*DECLARE)
     return text
 
 
@@ -2515,13 +2431,83 @@ def emit(lines, out=None):
 
 
 def plan_cmd(args):
+    if args.pr and args.main:
+        raise Fail("--pr and --main contradict each other: pass one")
+    task = None
+    if args.task:
+        task = task_of(args.task)
+        if not task:
+            raise Fail(T("--task {r}: не вижу id задачи — передай --task <id>",
+                         "--task {r}: no task id in it — pass --task <id>", r=args.task))
+        task = {"id": task[0], "url": task[1]}
+    refused = refuse_in_ticket(config_dir(), args.session or [], T("Коммит", "Commit"))
+    if refused is not None:
+        return refused
     R, plan = collect(args)
     items = plan["files"]
     commit = [i for i in items if i.get("status") in ("commit", "partial")]
     skipped = [i for i in items if i.get("status") == "skipped"]
+    own_skips = [i for i in skipped if i.get("reason") != "ignored"]
     own = set(plan["own_commits"])
     lines = []
     stop = None
+    plan["default"] = default_branch(R) or R.branch
+    plan["mode"], plan["mode_why"] = repo_mode(R, plan["default"], args.pr, args.main)
+    plan["task"] = task
+    # Where the commit goes: on the default branch, work for a task (or any work in a PR
+    # repository) gets a branch of its own, made from HEAD by `git switch -c` at apply — the
+    # working tree and the index stay as they are. On any other branch it is committed there.
+    plan["new_branch"], branch_stop = None, None
+    names_branch = bool(task and R.branch and (R.branch == "task/" + task["id"] or
+                                               R.branch.startswith(f"task/{task['id']}-")))
+    want_branch = bool(R.head and commit and R.branch == plan["default"]
+                       and (task or plan["mode"] == "pr"))
+    if want_branch:
+        name = args.branch or (f"task/{task['id']}" if task else "")
+        plan["new_branch"] = name  # "" — session/<slug of the commit subject>, named at apply
+        problem = branch_problem(R, name, task and task["id"]) if name else None
+        if problem:
+            lines.append((T("Ветка", "Branch"), T("нет — стоп: ", "no — stop: ") + problem))
+            branch_stop = T("ветка не создана, см. Ветка", "no branch made, see Branch")
+        else:
+            lines.append((T("Ветка", "Branch"), T(
+                "{b} — создам от {d} (git switch -c; рабочее дерево не трогаю)",
+                "{b} — will create it from {d} (git switch -c; the working tree stays)",
+                b=name or T("session/<тема коммита>", "session/<commit subject>"), d=R.branch)))
+    elif task and commit and R.branch and R.branch.startswith("task/") and not names_branch:
+        lines.append((T("Ветка", "Branch"), T(
+            "нет — стоп: {b} — ветка другой задачи, не {t}; {w}", "no — stop: {b} is another "
+            "task's branch, not {t}'s; {w}", b=R.branch, t=task["id"], w=back_to(
+                R, plan["default"]))))
+        branch_stop = T("ветка другой задачи, см. Ветка", "another task's branch, see Branch")
+    elif ((plan["mode"] == "pr" or (R.branch or "").startswith(("task/", "session/")))
+          and commit and R.head and R.branch not in (None, plan["default"])
+          and (theirs := foreign_commits(R, "HEAD", [r for r in (
+              "refs/remotes/origin/" + plan["default"], "refs/heads/" + plan["default"])
+              if rev(R.root, r)], own, merged=("refs/remotes/origin/" + plan["default"],
+                                                "refs/heads/" + plan["default"])))):
+        # A shared checkout left on another session's (or a /ticket run's) branch: its work and
+        # PR are not this session's — whatever --task says (a task taken from the branch name
+        # proves nothing). Going back is no way out when --task names this very branch.
+        lines.append((T("Ветка", "Branch"), T(
+            "нет — стоп: на ветке {b} коммиты не из /commit этой сессии: {s} — свой коммит на "
+            "неё не кладу; {w}если их сделал /commit прошлой, уже законченной сессии (не "
+            "открытой вкладки: --session берёт и все её незакоммиченные правки) — передай её "
+            "--session вместе с --session этой; если это коммит шлюза /ticket — /resume ту "
+            "сессию и публикуй в её шлюзе; если ветка твоя — закоммить и запушь сам",
+            "no — stop: the branch {b} holds commits not made by this session's /commit: {s} — "
+            "not committing onto it; {w}if an earlier session's /commit made them (a session "
+            "that has ended, not another open tab: --session also takes all of its uncommitted "
+            "edits), pass its --session as well as this one's; if it is a /ticket gate commit, "
+            "/resume that session and publish at its gate; if the branch is yours, commit and "
+            "push it yourself", b=R.branch, s=subjects(R, theirs, 3), w="" if names_branch else
+            back_to(R, plan["default"], T(" — будет своя ветка", " for a branch of its own"))
+            + "; ")))
+        branch_stop = T("на ветке чужие коммиты, см. Ветка",
+                        "the branch holds commits not made here, see Branch")
+    elif task and commit and R.branch:
+        lines.append((T("Ветка", "Branch"), T("{b} — коммит на неё", "{b} — committing there",
+                                              b=R.branch)))
     # An unfinished rebase detaches HEAD: name the rebase, not the detached HEAD.
     if R.in_progress():
         stop = op_stop(R.in_progress(), R.git_dir)
@@ -2538,22 +2524,42 @@ def plan_cmd(args):
     elif plan["case_clash"]:
         a, b = plan["case_clash"][0]
         stop = T("в коммите оказались бы и {a}, и {b} — они отличаются только регистром букв; "
-                 "если это переименование, передай --declare и старое имя (уйдёт как удаление)",
+                 "если это переименование, передай --declare и старое имя (уйдёт как удаление); "
+                 "если на диске у папки другой регистр, чем в git, — приведи его к git",
                  "the commit would hold both {a} and {b}, which differ only in letter case; for "
-                 "a rename, --declare the old name too (it is committed as a deletion)", a=a, b=b)
+                 "a rename, --declare the old name too (it is committed as a deletion); if a "
+                 "folder's case on disk differs from git's, match it to git", a=a, b=b)
+    elif branch_stop:
+        stop = branch_stop
+    if stop and not branch_stop:  # no branch is made, nothing is committed there
+        lines = [(lab, T("нет — стоп, см. Коммит", "no — stopped, see Commit")
+                  if lab == T("Ветка", "Branch") else text) for lab, text in lines]
+    if task and commit and not stop:
+        lines.append((T("Задача", "Task"), T("{t} — ссылка в сообщении коммита (проверю при "
+                                             "apply)", "{t} — named in the commit message "
+                                             "(checked at apply)", t=task["id"])))
     if commit:
         parts = []
+        def names(paths):
+            return ", ".join(paths[:3]) + (" …" if len(paths) > 3 else "")
         part = [i["path"] for i in commit if i["status"] == "partial"]
         if part:
-            parts.append(T("{n} частично: {p} — чужие правки останутся в рабочем дереве",
+            parts.append(T("{n} частично: {p} — другие правки (чужие или твои через Bash) "
+                           "останутся в рабочем дереве",
                            "{n} partly: {p} — other edits stay in the working tree",
-                           n=len(part), p=", ".join(part[:3]) + (" …" if len(part) > 3 else "")))
-        unverified = [i["path"] for i in commit if i.get("reason") in ("declared", "notebook",
-                                                                       "binary")]
+                           n=len(part), p=names(part)))
+        # Unverified: nothing tells whose all of it is — declared, a notebook or binary file, or
+        # an agent's Write over a file the session created (someone may have changed it between).
+        unverified = [i["path"] for i in commit if i["status"] == "commit" and
+                      i.get("reason") in ("declared", "notebook", "binary", "unverified")]
         if unverified:
             parts.append(T("{n} целиком без проверки: {p}", "{n} whole, unverified: {p}",
-                           n=len(unverified), p=", ".join(unverified[:3]) +
-                           (" …" if len(unverified) > 3 else "")))
+                           n=len(unverified), p=names(unverified)))
+        unverified = [i["path"] for i in commit if i["status"] == "partial" and
+                      i.get("reason") == "unverified"]
+        if unverified:
+            parts.append(T("{n} частично, без проверки: {p}", "{n} partly, unverified: {p}",
+                           n=len(unverified), p=names(unverified)))
         comp = [i["path"] for i in commit if i.get("reason") == "companion"]
         if comp:
             n = len(comp)
@@ -2568,6 +2574,10 @@ def plan_cmd(args):
                       if stop else text))
     elif stop:
         lines.append((T("Коммит", "Commit"), T("нет — стоп: ", "no — stop: ") + stop))
+    elif own_skips:
+        lines.append((T("Коммит", "Commit"), T(
+            "нет — правки сессии пропущены ({n}), см. Пропуск",
+            "no — this session's changes are skipped ({n}), see Skip", n=len(own_skips))))
     elif any(i.get("status") == "unchanged" for i in items) or skipped:
         lines.append((T("Коммит", "Commit"), T("нет — новых правок сессии в этом репозитории "
                                                "нет", "no — no new changes of this session here")))
@@ -2591,6 +2601,13 @@ def plan_cmd(args):
         lines.append((T("Пропуск", "Skip"), T(
             "{n} " + plural(n, "файл", "файла", "файлов") + " в .gitignore ({w})",
             "{n} files ignored by git ({w})", n=n, w=where)))
+    if plan["declare_untracked"]:
+        d = plan["declare_untracked"]
+        lines.append((T("Пропуск", "Skip"), T(
+            "не взяты новые файлы в объявленных папках ({n}: {p}) — их создала не правка сессии; "
+            "передай --declare каждого своего по пути", "new files in declared folders not taken "
+            "({n}: {p}) — not created by this session's edits; --declare each of yours by its "
+            "path", n=len(d), p=", ".join(d[:3]) + (" …" if len(d) > 3 else ""))))
     if plan["unsynced"]:
         u = plan["unsynced"]
         lines.append((T("Индекс", "Index"), T(
@@ -2609,17 +2626,19 @@ def plan_cmd(args):
         s=f["staged"])))
     verdict = "stop" if stop else None
     if not stop:
-        more, pstop, work = preview(R, plan, bool(commit), own)
-        lines += more
-        if pstop:
-            verdict = "stop"
-            stop = pstop
-        elif not commit and not work and not plan["unsynced"]:
-            verdict = "nothing"
+        # The same decisions apply makes, on local refs: a forecast of merge and push.
+        pub = Publisher(R, plan, own, Collect(lines), plan["no_merge"], plan["no_push"],
+                        dry=True, new_commit=bool(commit), branch=None if plan["new_branch"] is None
+                        else plan["new_branch"] or T("session/<тема>", "session/<subject>"))
+        if not pub.run():
+            push_line_after_stop(pub, lines)
+        if pub.stopped and not commit:
+            verdict, stop = "stop", pub.stopped
+        elif not commit and not pub.work and not plan["unsynced"]:
+            # Nothing to do, but the session's own skipped files wait for a decision.
+            verdict = "skipped" if own_skips else "nothing"
         else:
             verdict = "go"
-    else:
-        plan["default"] = default_branch(R) or R.branch
     for root, paths in plan["other_repos"].items():
         lines.append((T("Ещё", "Elsewhere"), T("правки этой сессии есть и в {r} ({n}) — там свой "
                                               "/commit", "this session also edited {r} ({n}) — "
@@ -2674,27 +2693,38 @@ def plan_cmd(args):
         print("exec bit changed on disk but not committed (the file keeps HEAD's mode; declare "
               "it if the chmod was this session's): " + some("mode_left"))
     if plan["bash_named"]:
-        print("named by this session's shell commands but not committed whole (declare the "
-              "ones this session changed): " + some("bash_named"))
-    if plan["bash_hints"]:
-        shown = plan["bash_hints"][-SHOW_HINTS:]
-        total = plan["bash_hints_total"]
-        print(f"bash_hints ({total} run in this repository or naming a path in it"
-              + (f", newest {len(shown)} shown, {len(plan['bash_hints'])} in plan.json"
-                 if len(shown) < total else "")
-              + (f"; {plan['bash_hints_elsewhere']} run elsewhere left out"
-                 if plan.get("bash_hints_elsewhere") else "")
-              + "; files they changed are not seen unless declared):")
-        for h in shown:
-            print("  $ " + oneline(h, 160))
-    elif plan.get("bash_hints_elsewhere"):
-        print(f"bash_hints: none run in this repository or naming a path in it "
-              f"({plan['bash_hints_elsewhere']} run elsewhere left out)")
+        print(f"named by this session's shell commands ({len(plan['bash_named'])} changed or "
+              "untracked here, not committed whole; a name match, not proof — declare the ones "
+              "this session changed; every naming command, uncut, oldest first: " +
+              plan["bash_commands"] + "): " + some("bash_named"))
     print(f"plan: {os.path.join(plan['run_dir'], 'plan.json')}")
     return 1 if verdict == "stop" else 0
 
 
 # --- apply -------------------------------------------------------------------------------
+
+class Collect:
+    """Status lines kept for printing later (plan prints its block in one piece)."""
+
+    def __init__(self, lines):
+        self.lines = lines
+
+    def say(self, lab, text, step=None, status=None):
+        self.lines.append((lab, text))
+
+
+def push_line_after_stop(pub, lines):
+    """A run stopped before the push step: the block still says what became of it."""
+    labels = [x[0] if isinstance(x, tuple) else x for x in lines]
+
+    def said(lab):
+        return any(x == lab or str(x).startswith(label(lab)) for x in labels)
+    if not said("Push"):
+        pub.steps.say("Push", pub.no_push_reason() or T("нет — после стопа", "no — stopped before"),
+                      "push", "skipped")
+    if pub.mode == "pr" and not said("PR"):
+        pub.steps.say("PR", T("нет — после стопа", "no — stopped before"), "pr", "skipped")
+
 
 class Steps:
     def __init__(self):
@@ -2801,6 +2831,21 @@ def index_entries(R, paths, index=None):
     return out
 
 
+def hash_files(R, paths, write=False):
+    """{path: blob id} of these working-tree files through the clean filters of their path, in
+    one `git hash-object --stdin-paths` — what `git add` stores, except that hash-object does
+    not see the index (git add keeps a CRLF blob's endings; collect() skips such files); a path
+    it cannot take on a line is left out for the caller to hash on its own."""
+    paths = [p for p in paths if "\n" not in p and "\r" not in p
+             and os.path.isfile(os.path.join(R.root, p))
+             and not os.path.islink(os.path.join(R.root, p))]
+    if not paths:
+        return {}
+    out = text_of(git(R.root, "hash-object", *(["-w"] if write else []), "--stdin-paths",
+                      stdin=b"".join(os.fsencode(p) + b"\n" for p in paths))).split()
+    return dict(zip(paths, out)) if len(out) == len(paths) else {}
+
+
 def quoted(paths):
     return " ".join(shlex.quote(p) for p in paths)
 
@@ -2850,23 +2895,33 @@ def commit_step(R, plan, message, steps):
     else:
         git(R.root, "read-tree", "--empty", index=index)
     ours = [i for i in plan["files"] if i.get("status") in ("commit", "partial")]
+    # Files committed whole are hashed from disk in one git process; computed content and
+    # symlinks one by one; the private index gets every entry in one update-index.
+    whole = hash_files(R, [it["path"] for it in ours if it["how"] == "whole"
+                           and it["mode"] != "120000"], write=True)
+    info = []
     for it in ours:
         path = it["path"]
         if it["how"] == "delete":
-            git(R.root, "update-index", "--force-remove", "--", path, index=index)
+            info.append(index_line(path, None, "0" * len(R.empty_tree)))
             continue
-        if it["how"] == "computed":
-            with open(it["blob"], "rb") as fh:
-                data = fh.read()
-        else:
-            data, _ = read_worktree(os.path.join(R.root, path))
-        if it["mode"] == "120000":
-            sha = text_of(git(R.root, "hash-object", "-w", "--stdin", stdin=data)).strip()
-        else:
-            sha = text_of(git(R.root, "hash-object", "-w", "--stdin", "--path=" + path,
-                              stdin=data)).strip()
-        git(R.root, "update-index", "--add", "--cacheinfo", f"{it['mode']},{sha},{path}",
-            index=index)
+        sha = whole.get(path)
+        if sha is None:
+            if it["how"] == "computed":
+                with open(it["blob"], "rb") as fh:
+                    data = fh.read()
+            else:
+                data, _ = read_worktree(os.path.join(R.root, path))
+            sha = text_of(git(R.root, "hash-object", "-w", "--stdin", *(
+                [] if it["mode"] == "120000" else ["--path=" + path]), stdin=data)).strip()
+        info.append(index_line(path, (it["mode"], sha), ""))
+    # The whole files were hashed from disk just now, after check_stale: a save someone made in
+    # between would be in those blobs. Every planned file must still be what plan saw.
+    for it in ours:
+        if read_worktree(os.path.join(R.root, it["path"]))[1] != it["w_hash"]:
+            raise Stale(f"{it['path']} changed on disk")
+    if info:
+        git(R.root, "update-index", "-z", "--index-info", stdin=b"".join(info), index=index)
     expected = text_of(git(R.root, "write-tree", index=index)).strip()
     msg_file = os.path.join(run_dir, "message.txt")
     with open(msg_file, "wb") as fh:
@@ -2893,8 +2948,8 @@ def commit_step(R, plan, message, steps):
     want_ref = "refs/heads/" + plan["branch"]
     planned = index_entries(R, paths, index=index)
     now = index_entries(R, paths)
-    pend = {"parent": R.head, "tree": expected, "branch": want_ref, "paths": path_recs,
-            "sync": sync_record(to_sync(now), now, planned)}
+    pend = {"parent": R.head, "tree": expected, "branch": want_ref, "repo": R.common_dir,
+            "paths": path_recs, "sync": sync_record(to_sync(now), now, planned)}
     # Last look before committing: a merge, cherry-pick or rebase begun since the plan would
     # turn this commit into its merge commit.
     if R.in_progress() or rev(R.root, "HEAD") != R.head:
@@ -2926,7 +2981,18 @@ def commit_step(R, plan, message, steps):
         # Someone committed, began a merge or switched branches between our checks and git
         # commit: our tree was built on the old HEAD and would undo their commit / swallow
         # their merge, or the commit is on a branch that is not the plan's. Take our commit
-        # back off the branch it landed on (only if it is still the tip) and say so.
+        # back off the branch it landed on — only while it is the tip — and say so. A commit
+        # someone made on top of ours is never taken back: the pending record lets the next
+        # plan find ours below it.
+        tree = text_of(git(R.root, "rev-parse", head + "^{tree}")).strip()
+        if tree != expected:
+            steps.say(T("Коммит", "Commit"), T(
+                "нет — во время коммита HEAD сдвинулся, и на вершине {s} чужой коммит — ничего "
+                "не снимаю; найди мой коммит в git log {s} (дерево {t}) и разберись вручную",
+                "no — HEAD moved during the commit and someone's commit {s} is on top — nothing "
+                "taken back; find mine in git log {s} (tree {t}) and sort it out by hand",
+                s=short(head), t=short(expected)), "commit", "stop")
+            return None
         forget(cfg, sids, pending=pend)
         parents = parents_of(R.root, head)
         landed_on = symbolic_head(R)
@@ -3010,22 +3076,32 @@ def commit_step(R, plan, message, steps):
     # Files committed whole must now equal the commit on disk (blob hashes, so the index's
     # stat cache does not matter).
     dirty = []
-    for it in ours:
-        if it["status"] != "commit":
+    full = [it["path"] for it in ours if it["status"] == "commit"]
+    on_disk_now = hash_files(R, [p for p in full if entries.get(p) and entries[p][0] != "120000"
+                                 and os.path.isfile(os.path.join(R.root, p))
+                                 and not os.path.islink(os.path.join(R.root, p))])
+    for path in full:
+        entry = entries.get(path)
+        if path in on_disk_now:
+            if on_disk_now[path] != entry[1]:
+                dirty.append(path)
             continue
-        data, _ = read_worktree(os.path.join(R.root, it["path"]))
-        entry = entries.get(it["path"])
+        data, _ = read_worktree(os.path.join(R.root, path))
         if data is None or entry is None:
             if (data is None) != (entry is None):
-                dirty.append(it["path"])
+                dirty.append(path)
             continue
         args = ["hash-object", "--stdin"] + ([] if entry[0] == "120000" else
-                                             ["--path=" + it["path"]])
+                                             ["--path=" + path])
         if text_of(git(R.root, *args, stdin=data)).strip() != entry[1]:
-            dirty.append(it["path"])
+            dirty.append(path)
     if dirty:
-        problems.append(T("после коммита отличаются от него: {p}",
-                          "still differ from the commit: {p}", p=", ".join(dirty[:5])))
+        problems.append(T("после коммита отличаются от него: {p} (их меняли во время коммита) — "
+                          "коммит сделан, но не вливаю и не пушу; проверь эти файлы и запусти "
+                          "/commit снова, чтобы влить и запушить",
+                          "still differ from the commit: {p} (changed during the commit) — the "
+                          "commit is made, but not merging or pushing; check those files and run "
+                          "/commit again to merge and push it", p=", ".join(dirty[:5])))
     if problems:
         steps.say(T("Проверка", "Check"), T("расхождение — ", "mismatch — ") + "; ".join(problems),
                   "verify", "stop")
@@ -3033,270 +3109,302 @@ def commit_step(R, plan, message, steps):
     return head, True, True
 
 
-def ignored_in_the_way(R, added):
-    """The git-ignored files a checkout of these added paths would overwrite: at the path itself
-    or at one of its folders (an ignored file `notes` where `notes/` comes), spelt in any letter
-    case the filesystem opens it under (`Secrets.env` for `secrets.env`)."""
-    places = set()
-    for a in added:
-        parts = a.split("/")
-        places.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
-    _NAMES.clear()
-    found = {}
-    for p in sorted(places):
-        absp = os.path.join(R.root, p)
-        if os.path.lexists(absp) and not (os.path.isdir(absp) and p not in added):
-            found[p] = rel_of(R.root, canonical(absp))  # its spelling on disk
-    if not found:
-        return []
-    tracked = {os.fsdecode(x) for x in git(R.root, "ls-files", "-z").stdout.split(b"\0") if x}
-    tracked_dirs = {t[:i] for t in tracked for i in range(len(t)) if t[i] == "/"}
-    loose = sorted({d for d in found.values() if d not in tracked and d not in tracked_dirs})
-    return sorted(R.ignored(loose))
+class PRFlow:
+    """Publishing in a repository that takes work through pull requests (Publisher.pr_flow):
+    push the branch with its upstream set and name the page to open its PR on. /commit opens or
+    edits no PR (no gh): whose PR it is, and its text, are the user's call. Main is never moved
+    here."""
 
+    def pr_flow(self):
+        R, b, d = self.R, self.branch, self.default
+        why = self.plan.get("mode_why")
+        self.steps.say(self.main_label, T("нет — в этом репо через PR", "no — this repository "
+                                          "takes work through PRs") + (f" ({why})" if why else ""),
+                       "merge", "skipped")
+        if b == d:
+            # Nothing new to commit (apply makes a branch for that): what is on main stays.
+            up = "refs/remotes/origin/" + d
+            ahead = rev_list(R.root, "HEAD", up) if rev(R.root, up) else []
+            if not ahead and not self.extra:
+                self.steps.say("Push", T("нет — нечего публиковать", "no — nothing to publish"),
+                               "push", "skipped")
+                self.steps.say("PR", T("нет — нечего публиковать", "no — nothing to publish"),
+                               "pr", "skipped")
+                return True
+            if ahead and not self.check_foreign("HEAD", up, d, merged=(up,)):
+                return False  # someone's commits: review and push them yourself
+            return self.stop("Push", T(
+                "в {d} {n} не в origin, а в этом репо работа идёт через PR — с {d} не пушу; "
+                "перенеси их на ветку (git switch -c <имя>) и снова /commit, или /commit main — "
+                "запушить прямо в {d}", "{d} has {n} origin lacks, and this repository takes "
+                "work through PRs — not pushing {d}; move them to a branch (git switch -c "
+                "<name>) and run /commit again, or /commit main to push to {d} directly", d=d,
+                n=n_commits(len(ahead) + self.extra)), "push")
+        if self.skip_push():
+            self.steps.say("PR", T("нет — без push", "no — nothing pushed"), "pr", "skipped")
+            return True
+        if not self.fetch():
+            return False
+        up, up_main = branch_ref(R, b), "refs/remotes/origin/" + d
+        tip = rev(R.root, "refs/heads/" + b) or R.head
+        if not self.check_foreign(tip, published_refs(R, up, up_main), b, merged=(up_main, up)):
+            return False
+        if rev(R.root, up_main) and not self.extra and not rev_list(R.root, tip, up_main):
+            for lab in ("Push", "PR"):
+                self.steps.say(lab, T("нет — на ветке нет коммитов сверх origin/{d}",
+                                      "no — the branch has nothing beyond origin/{d}", d=d),
+                               lab.lower(), "skipped")
+            return True
+        if not self.mine(tip, up_main, "PR"):
+            return True
+        if up and rev_list(R.root, up, tip):
+            return self.stop("Push", branch_behind(b, len(rev_list(R.root, up, tip))), "push")
+        if not (up and self.has_everything(tip, up)) and not self.push(
+                tip, b, None if upstream_of(R, b) else b):
+            return False
+        self.steps.say("PR", pr_page(R, b, d), "pr", "note")
+        return True
 
-class Publisher:
-    """Integrate into the default branch and push, after the commit. Every method returns True
-    to go on, False when it stopped (and said why)."""
-
-    def __init__(self, R, plan, own, steps, no_merge, no_push):
-        self.R, self.plan, self.own, self.steps = R, plan, own, steps
-        self.no_merge, self.no_push = no_merge, no_push
-        self.branch = plan["branch"]
-        self.default = plan.get("default") or default_branch(R) or self.branch
-        self.remote = has_origin(R)
-        self.created = []
-        self.rewritten = {}
-        self.rebased = False
-        self.main_label = T("В {b}", "Into {b}", b=self.default)
-
-    def stop(self, lab, text, step):
-        self.steps.say(lab, T("стоп — ", "stop — ") + text, step, "stop")
+    def mine(self, tip, up_main, *more):
+        """With no new commit, a branch whose commits beyond origin/<default> hold none that
+        this session's /commit made is not published (someone's branch a shared checkout sits
+        on, a person's clean merge on it). -> False after its lines."""
+        if self.extra or set(rev_list(self.R.root, tip, up_main if rev(
+                self.R.root, up_main) else None)) & self.own:
+            return True
+        for lab in ("Push",) + more:
+            self.steps.say(lab, T("нет — на ветке нет коммитов /commit этой сессии — если ветка "
+                                  "твоя, {x} сам", "no — the branch holds no commit made by "
+                                  "this session's /commit — if the branch is yours, {x} "
+                                  "yourself", x=T("запушь её", "push it") if lab == "Push" else
+                                  T("открой её PR", "open its PR")), lab.lower(), "skipped")
         return False
 
-    def mine(self, shas, rewritten=None):
-        """Count these commits as the session's — and record them at once: a run killed
-        later (Esc, the Bash timeout during a slow push) must not leave them looking foreign
-        to the next one."""
-        self.own.update(shas)
-        self.created += [s for s in shas if s not in self.created]
-        self.rewritten.update(rewritten or {})
-        record_own(self.plan["config"], self.plan["sessions"], shas, rewritten=rewritten)
+
+def pr_page(R, b, d):
+    """The PR line: the page to open the branch's PR on (GitHub's compare page, which shows an
+    open one instead), else what to run."""
+    url = text_of(git(R.root, "config", "--get", "remote.origin.url", ok=None)).strip()
+    m = re.match(r"(?:[a-z+]+://)?(?:[^@/]+@)?github\.com[:/]+(.+?)(?:\.git)?/*$", url)
+    if m:
+        return T("не открываю сам — открой (или посмотри открытый): {u}",
+                 "not opened by /commit — open it (or see the open one): {u}",
+                 u=f"https://github.com/{m.group(1)}/compare/{urllib.parse.quote(d)}..."
+                   f"{urllib.parse.quote(b)}?expand=1")
+    return T("не открываю сам — открой PR из {b} в {d} (с GitHub CLI: gh pr create --fill --base "
+             "{d} --head {b})", "not opened by /commit — open a PR from {b} into {d} (with the "
+             "GitHub CLI: gh pr create --fill --base {d} --head {b})", b=b, d=d)
+
+
+class Publisher(PRFlow):
+    """Publish after the commit, by fast-forward only: push the current branch, move main to the
+    branch, push main. It never rebases, merges or pulls: anything that is not a fast-forward
+    stops with the merge to run. Every method returns True to go on, False when it stopped (and
+    said why).
+
+    dry (plan): the same decisions on local refs, nothing fetched or written; `new_commit`: the
+    commit apply will make on top of HEAD, counted where it matters. Lines then read as a
+    forecast, and a stop that comes after the commit reads "will stop after the commit"."""
+
+    def __init__(self, R, plan, own, steps, no_merge, no_push, dry=False, new_commit=False,
+                 branch=None):
+        self.R, self.plan, self.own, self.steps = R, plan, own, steps
+        self.no_merge, self.no_push = no_merge, no_push
+        self.dry, self.extra = dry, int(new_commit)
+        self.branch = branch or plan["branch"]
+        # plan: the commit goes to a branch apply makes from HEAD, so this checkout leaves main
+        self.leaving = bool(dry and branch and branch != plan["branch"])
+        self.mode = plan.get("mode") or "direct"
+        self.default = plan.get("default") or default_branch(R) or self.branch
+        self.remote = has_origin(R)
+        self.main_label = T("В {b}", "Into {b}", b=self.default)
+        self.work = False  # something is (or would be) moved or pushed
+        self.stopped = None
+
+    def stop(self, lab, text, step):
+        self.stopped = text
+        head = T("стоп — ", "stop — ") if not self.dry else \
+            T("нет — остановлюсь после коммита: ", "no — will stop after the commit: ") \
+            if self.extra else T("нет — стоп: ", "no — stop: ")
+        self.steps.say(lab, head + text, step, "stop")
+        return False
 
     def fetch(self, lab="Push"):
-        if not self.remote:
+        if not self.remote or self.dry:
             return True
         proc = git(self.R.root, "fetch", "--quiet", "--no-recurse-submodules", "origin", ok=None)
         if proc.returncode != 0:
             e = oneline(errtext(proc), 160)
             if lab == "Push":
-                return self.stop("Push", T("нет сети ({e}); коммит остался локально",
-                                           "no network ({e}); the commit stays local", e=e),
+                return self.stop("Push", T("fetch не прошёл ({e}); коммит остался локально",
+                                           "fetch failed ({e}); the commit stays local", e=e),
                                  "fetch")
-            self.stop(lab, T("нет сети ({e}); {d} не сдвинут, коммит остался локально",
-                             "no network ({e}); {d} not moved, the commit stays local", e=e,
-                             d=self.default), "fetch")
-            self.steps.say("Push", self.no_push_reason() or T("нет — после стопа",
-                                                              "no — stopped before"),
-                           "push", "skipped")
-            return False
+            return self.stop(lab, T("fetch не прошёл ({e}); {d} не сдвинут, коммит остался "
+                                    "локально", "fetch failed ({e}); {d} not moved, the commit "
+                                    "stays local",
+                                    e=e, d=self.default), "fetch")  # apply adds the Push line
         return True
 
-    def push(self, src, dst, set_upstream=False):
-        args = ["push", "--quiet", "--no-follow-tags", "--recurse-submodules=no"] + \
-            (["-u"] if set_upstream else []) + ["origin", f"{src}:refs/heads/{dst}"]
+    def push(self, src, dst, track=None):
+        """Push commit `src` (a sha: the one checked for foreign commits, not whatever a branch
+        holds by the time the push runs) to origin/<dst>; `track`: a local branch to give
+        origin/<dst> as its upstream afterwards."""
         tracking = "refs/remotes/origin/" + dst
         seen = rev(self.R.root, tracking)
-        proc = git(self.R.root, *args, ok=None)
+        self.work = True
+        if self.dry:
+            self.steps.say("Push", T("да — origin/{t}", "yes — origin/{t}", t=dst) + (
+                "" if seen else T(" (новая ветка на origin)", " (new branch on origin)")))
+            return True
+        proc = git(self.R.root, "push", "--quiet", "--no-follow-tags", "--recurse-submodules=no",
+                   "origin", f"{src}:refs/heads/{dst}", ok=None)
         if proc.returncode != 0:
             err = errtext(proc)
             # A race: origin/<dst> moved after our fetch. Only then is a rerun the answer.
             git(self.R.root, "fetch", "--quiet", "--no-recurse-submodules", "origin", ok=None)
             race = rev(self.R.root, tracking) != seen
-            return self.stop("Push", T("origin/{d} отклонил push: {e}", "origin/{d} rejected the "
-                                       "push: {e}", d=dst, e=oneline(err, 200)) + (T(
-                                           " — на origin появились новые коммиты; запусти "
-                                           "/commit снова", " — origin got new commits "
-                                           "meanwhile; run /commit again") if race else ""),
-                             "push")
-        tip = rev(self.R.root, src)
+            # Only a refusal by origin is called one: a pre-push hook, a bad URL or a missing
+            # key fail before origin sees the push.
+            refused = re.search(r"\[(remote )?rejected\]|declined|protected", err, re.I)
+            way = ""
+            if race:
+                way = T(" — на origin появились новые коммиты; запусти /commit снова",
+                        " — origin got new commits meanwhile; run /commit again")
+            elif dst == self.default and refused:
+                # A protected main (pull requests only) rejects every rerun the same way.
+                ahead = len(rev_list(self.R.root, src, tracking)) if seen else 0
+                way = T(" — если {d} защищён: {x}; локальный {d} остаётся впереди origin/{d} на "
+                        "{n} этой сессии", " — if {d} is protected: {x}; local {d} stays ahead of "
+                        "origin/{d} by {n} of this session's", d=dst, n=n_commits(ahead), x=T(
+                            "/commit no-merge запушит ветку для pull request",
+                            "/commit no-merge pushes the branch for a pull request")
+                        if self.branch != dst else T(
+                            "перенеси работу на ветку (git switch -c <имя>) и запусти /commit "
+                            "no-merge", "move the work to a branch (git switch -c <name>) and "
+                            "run /commit no-merge"))
+            what = T("origin/{d} отклонил push", "origin/{d} rejected the push", d=dst) \
+                if refused else T("push не прошёл", "push failed")
+            return self.stop("Push", what + f": {oneline(err, 200)}" + way, "push")
+        if track:
+            git(self.R.root, "branch", "--quiet", "--set-upstream-to=origin/" + dst, track,
+                ok=None)
         self.steps.say("Push", T("готово — origin/{d} → {s}", "done — origin/{d} → {s}", d=dst,
-                                 s=short(tip)), "push", "done")
+                                 s=short(src)), "push", "done")
         return True
 
     def no_push_reason(self):
         if self.no_push:
             return T("нет — по аргументу", "no — as asked")
         if not self.remote:
-            return T("нет — нет remote", "no — no remote")
+            return no_remote(self.R)
         return None
+
+    def skip_push(self):
+        """Say why nothing is pushed, when that is asked or there is no origin. -> True then."""
+        reason = self.no_push_reason()
+        if reason:
+            self.steps.say("Push", reason, "push", "skipped")
+        return bool(reason)
+
+    def has_everything(self, src, up):
+        """origin already holds src (and no new commit is coming on top of it)."""
+        if self.extra or rev_list(self.R.root, src, up):
+            return False
+        self.steps.say("Push", T("нет — {u} уже содержит всё", "no — {u} already has everything",
+                                 u=up[len("refs/remotes/"):]), "push", "skipped")
+        return True
 
     def run(self):
         R = self.R
-        if not R.head:
+        if not R.head:  # unborn: only plan gets here (apply has made the first commit)
+            if self.extra:
+                self.steps.say(self.main_label, T("нет — новая ветка без истории",
+                                                  "no — a new branch with no history")
+                               if self.branch != self.default else
+                               T("нет — уже на {b}", "no — already on {b}", b=self.default))
+                return self.skip_push() or self.push(None, self.branch)
+            self.steps.say("Push", T("нет — нечего публиковать", "no — nothing to publish"))
             return True
-        if self.plan.get("head") is None and self.branch != self.default:
-            return self.new_branch()
+        if self.mode == "pr":
+            return self.pr_flow()
         if self.branch == self.default:
             return self.on_default()
-        if self.no_merge:
-            return self.branch_only()
+        orphan = unrelated(R, self.default)
+        if self.no_merge or orphan:
+            return self.branch_only(orphan)
         return self.into_default()
 
     def check_foreign(self, include, exclude, where, merged=()):
         foreign = foreign_commits(self.R, include, exclude, self.own, merged)
+        if foreign and where != self.default and not set(foreign) & set(text_of(git(
+                self.R.root, "rev-list", include, "--not", "--remotes=origin", "--")).split()):
+            # all on origin already, on other branches (a stacked PR, a branch of develop)
+            return self.stop("Push", T(
+                "на {w} коммиты не из /commit этой сессии с других веток origin: {l} — с ними "
+                "ветку не публикую; запушь её сам (git push -u origin {w}) и открой PR против её "
+                "базы", "{w} carries commits not made by this session's /commit from other "
+                "branches of origin: {l} — not publishing the branch with them; push it yourself "
+                "(git push -u origin {w}) and open the PR against its base", w=where,
+                l=subjects(self.R, foreign)), "push")
         if foreign:
-            return self.stop("Push", T("в {w} чужие незапушенные коммиты: {l} — не публикую "
-                                       "чужое; запушь или убери их сам",
-                                       "{w} has unpushed commits that are not this session's: "
-                                       "{l} — not publishing them; push or drop them yourself",
-                                       w=where, l=subjects(self.R, foreign)), "push")
+            return self.stop("Push", unpushed_foreign(self.R, where, foreign), "push")
         return True
-
-    def new_branch(self):
-        """A branch that had no history before this commit (an orphan): nothing to merge into
-        main; it goes to origin/<branch>."""
-        self.steps.say(self.main_label, T("нет — новая ветка без истории",
-                                          "no — a new branch with no history"), "merge",
-                       "skipped")
-        reason = self.no_push_reason()
-        if reason:
-            self.steps.say("Push", reason, "push", "skipped")
-            return True
-        if not self.fetch():
-            return False
-        return self.check_foreign("HEAD", None, self.branch) and \
-            self.push("refs/heads/" + self.branch, self.branch, set_upstream=True)
 
     def on_default(self):
         R, b = self.R, self.branch
-        reason = self.no_push_reason()
-        if reason:
-            self.steps.say("Push", reason, "push", "skipped")
+        if self.dry:
+            self.steps.say(self.main_label, T("нет — уже на {b}", "no — already on {b}", b=b))
+        if self.skip_push():
             return True
         if not self.fetch():
             return False
         up = "refs/remotes/origin/" + b
+        track = None if upstream_of(R, b) else b
+        tip = rev(R.root, "refs/heads/" + b)
         if not rev(R.root, up):
-            return self.check_foreign("HEAD", None, b) and \
-                self.push("refs/heads/" + b, b, set_upstream=not upstream_of(R, b))
-        if not rev_list(R.root, "HEAD", up):
-            self.steps.say("Push", T("нет — origin/{b} уже содержит всё",
-                                     "no — origin/{b} already has everything", b=b), "push",
-                           "skipped")
-            return True
-        if not self.check_foreign("HEAD", up, b, merged=(up,)):
-            return False
-        behind = len(rev_list(R.root, up, "HEAD"))
+            return self.check_foreign(tip, None, b) and self.push(tip, b, track)
+        if self.has_everything(tip, up) or not self.check_foreign(tip, up, b, merged=(up,)):
+            return self.stopped is None
+        behind = len(rev_list(R.root, up, tip))
         if behind:
-            if not tracked_clean(R.root):
-                return self.stop("Push", T(
-                    "origin/{b} ушёл вперёд на {n}, а в дереве есть чужие незакоммиченные "
-                    "правки — rebase не делаю; закоммить или убери их и запусти /commit снова",
-                    "origin/{b} is {n} ahead and the tree has uncommitted changes that are not "
-                    "this session's — no rebase; commit or remove them and run /commit again",
-                    b=b, n=n_commits(behind)), "rebase")
-            if not self.rebase(up, "origin/" + b, behind):
-                return False
-        return self.push("refs/heads/" + b, b, set_upstream=not upstream_of(R, b))
+            return self.stop("Push", origin_ahead(b, behind), "push")
+        return self.push(tip, b, track)
 
-    def rebase(self, onto, name, behind):
-        R = self.R
-        # git rebase overwrites ignored files that `onto` starts tracking (a personal .env, an
-        # editor's settings): it has no --no-overwrite-ignore. Look first.
-        added = [os.fsdecode(p) for p in git(R.root, "diff", "--name-only", "--no-renames", "-z",
-                                             "--diff-filter=A", "HEAD", onto, "--"
-                                             ).stdout.split(b"\0") if p]
-        lost = ignored_in_the_way(R, added)
-        if lost:
-            return self.stop("Rebase", T(
-                "{n} начинает отслеживать файлы, которые у тебя в .gitignore: {p} — rebase их "
-                "перезапишет; убери или переименуй их и запусти /commit снова",
-                "{n} starts tracking files that are git-ignored here: {p} — a rebase would "
-                "overwrite them; move them aside and run /commit again", n=name,
-                p=", ".join(lost[:5]) + (" …" if len(lost) > 5 else "")), "rebase")
-        before = list(reversed(rev_list(R.root, "HEAD", onto)))
-        proc = git(R.root, *NO_AUTOSTASH, "rebase", "--quiet", onto, ok=None)
-        if proc.returncode != 0:
-            conflict = R.unmerged()
-            if git_state(R.git_dir) in ("rebase-merge", "rebase-apply"):
-                git(R.root, "rebase", "--abort", ok=None)
-            if conflict:
-                return self.stop("Rebase", T("конфликт с {n} — rebase отменён, всё как было после "
-                                             "коммита; влей вручную",
-                                             "conflict with {n} — rebase aborted, everything is as "
-                                             "after the commit; merge by hand", n=name), "rebase")
-            return self.stop("Rebase", T("rebase на {n} не выполнен: {e} — всё как было после "
-                                         "коммита", "rebase onto {n} failed: {e} — everything is "
-                                         "as after the commit", n=name,
-                                         e=oneline(errtext(proc), 200)), "rebase")
-        after = list(reversed(rev_list(R.root, "HEAD", onto)))
-        self.mine(after, {o: n for o, n in zip(before, after) if o != n}
-                  if len(after) == len(before) else None)
-        self.rebased = True
-        self.steps.say("Rebase", T("готово — мои коммиты поверх {n} (+{k})",
-                                   "done — this session's commits on top of {n} (+{k})", n=name,
-                                   k=behind), "rebase", "done")
-        return True
-
-    def merge_in(self, ref, name):
-        """Merge `ref` into the session's branch (its checkout is clean of tracked changes)."""
-        R = self.R
-        proc = git(R.root, *NO_AUTOSTASH, "merge", "--no-edit", "--quiet",
-                   "--no-overwrite-ignore", ref, ok=None)
-        if proc.returncode != 0:
-            conflict = R.unmerged()
-            if git_state(R.git_dir) == "MERGE_HEAD":
-                git(R.root, "merge", "--abort", ok=None)
-            if conflict:
-                return self.stop("Merge", T("конфликт при вливании {d} в ветку — merge отменён; "
-                                            "влей вручную", "conflict merging {d} into the "
-                                            "branch — merge aborted; merge by hand", d=name),
-                                 "merge")
-            return self.stop("Merge", T("{d} в ветку не влит: {e}", "merging {d} into the "
-                                        "branch failed: {e}", d=name,
-                                        e=oneline(errtext(proc), 200)), "merge")
-        self.mine([rev(R.root, "HEAD")])
-        self.steps.say("Merge", T("готово — {d} влит в ветку {b}",
-                                  "done — {d} merged into branch {b}", d=name, b=self.branch),
-                       "merge-base", "done")
-        return True
-
-    def branch_only(self):
+    def branch_only(self, orphan=False):
+        """The branch alone to origin/<branch>: as asked (no-merge), or a branch with no history
+        in common with main (an orphan)."""
         R, b = self.R, self.branch
-        self.steps.say(self.main_label, T("нет — по аргументу", "no — as asked"), "merge",
-                       "skipped")
-        reason = self.no_push_reason()
-        if reason:
-            self.steps.say("Push", reason, "push", "skipped")
+        self.steps.say(self.main_label, T("нет — новая ветка без истории",
+                                          "no — a new branch with no history") if orphan else
+                       T("нет — по аргументу", "no — as asked"), "merge", "skipped")
+        if self.skip_push():
             return True
         if not self.fetch():
             return False
-        up = own_upstream(R, b)
+        up = branch_ref(R, b)
         up_main = "refs/remotes/origin/" + self.default
-        base = up or (up_main if rev(R.root, up_main) else None)
-        if not self.check_foreign("HEAD", base, b, merged=(up_main,)):
+        tip = rev(R.root, "refs/heads/" + b) or R.head  # plan: a branch apply makes from HEAD
+        if not self.check_foreign(tip, published_refs(R, up, up_main), b, merged=(up_main, up)):
             return False
+        if not self.mine(tip, up_main):
+            return True
         if up:
-            behind = len(rev_list(R.root, up, "HEAD"))
+            behind = len(rev_list(R.root, up, tip))
             if behind:
-                return self.stop("Push", T(
-                    "в origin/{b} {n}, которых нет в ветке — сначала влей origin/{b} в ветку "
-                    "(git pull)", "origin/{b} has {n} the branch lacks — merge or pull "
-                    "origin/{b} into the branch first", b=b, n=n_commits(behind)), "push")
-            if not rev_list(R.root, "HEAD", up):
-                self.steps.say("Push", T("нет — origin/{b} уже содержит всё",
-                                         "no — origin/{b} already has everything", b=b), "push",
-                               "skipped")
+                return self.stop("Push", branch_behind(b, behind), "push")
+            if self.has_everything(tip, up):
                 return True
-        return self.push("refs/heads/" + b, b, set_upstream=not upstream_of(R, b))
+        return self.push(tip, b, None if upstream_of(R, b) else b)
 
-    def move_main(self, target, noff):
-        """Move the default branch to `target`, fast-forward only (or a --no-ff merge in its
-        checkout when the repository merges that way). Someone else's checkout of main is only
-        merged into when it has nothing unfinished; their merge is never aborted."""
+    def move_main(self, target):
+        """Fast-forward the default branch to `target` (lag() has checked that it is one): in its
+        checkout with `git merge --ff-only`, else with `git fetch .`, which refuses anything but a
+        fast-forward. Someone else's checkout of main is only moved when it has nothing
+        unfinished and no uncommitted change in a file the move changes."""
         R, d = self.R, self.default
         where, gone = checkout_of(R, d)
+        if self.leaving and where and os.path.realpath(where) == os.path.realpath(R.root):
+            where = None  # apply switches this checkout to the new branch first
         main_ref = "refs/heads/" + d
         if where and gone:
             return self.stop(self.main_label, T(
@@ -3314,24 +3422,32 @@ class Publisher:
                     "checkout {b} в {w}: {x}; там, затем запусти /commit снова",
                     "the checkout of {b} at {w}: {x}; there, then run /commit again", b=d,
                     w=where, x=what), "merge")
+            moving = changed_paths(R, main_ref, target)
+            if self.extra:
+                moving |= {it["path"] for it in self.plan["files"]
+                           if it.get("status") in ("commit", "partial")}
+            hit = in_the_way(where, moving)
+            if hit:
+                return self.stop(self.main_label, (T("{b} не сдвинут: ", "{b} not moved: ", b=d)
+                                                   if not self.dry else "") +
+                                 checkout_blocks(d, where, hit, no_merge_passes(
+                                     R, self.branch, d, self.own)), "merge")
+            if self.dry:
+                return True
             # --no-overwrite-ignore: someone's ignored files there (a personal .env, editor
-            # settings) stop the merge instead of being replaced by tracked ones. The merge
-            # message names the branch as `git merge <branch>` would, not its full ref.
-            name = target[len("refs/heads/"):] if target.startswith("refs/heads/") else target
-            args = ["merge", "--no-ff", "--no-edit", "-m", f"Merge branch '{name}'",
-                    "--no-overwrite-ignore", target] if noff \
-                else ["merge", "--ff-only", "--quiet", "--no-overwrite-ignore", target]
-            proc = git(where, *NO_AUTOSTASH, *args, ok=None)
+            # settings) stop the move instead of being replaced by tracked ones.
+            proc = git(where, *NO_SIDE_EFFECTS, "merge", "--ff-only", "--quiet",
+                       "--no-overwrite-ignore", target, ok=None)
             if proc.returncode != 0:
-                # Nothing was unfinished there before, so a MERGE_HEAD now is this merge's.
-                if noff and git_state(gd) == "MERGE_HEAD":
-                    git(where, "merge", "--abort", ok=None)
+                # git's own advice there says to stash, which /commit never does.
+                err = "\n".join(ln for ln in errtext(proc).split("\n")
+                                 if "stash" not in ln and ln.strip() != "Aborting")
                 return self.stop(self.main_label, T(
                     "{b} не сдвинут: {e} (checkout {w}) — разберись там и запусти /commit снова",
                     "{b} not moved: {e} (checkout {w}) — sort it out there and run /commit "
-                    "again", b=d, e=oneline(errtext(proc), 200), w=where), "merge")
-            if noff:
-                self.mine([rev(R.root, main_ref)])
+                    "again", b=d, e=oneline(err, 200), w=where), "merge")
+            return True
+        if self.dry:
             return True
         proc = git(R.root, "fetch", "--quiet", ".", f"{target}:{main_ref}", ok=None)
         if proc.returncode != 0:
@@ -3339,134 +3455,125 @@ class Publisher:
                                                 e=oneline(errtext(proc), 200)), "merge")
         return True
 
-    def published(self, excl):
-        """True when some commit of the branch beyond main is on a remote already (pushed,
-        with or without -u): such a branch takes main by merge, never by rebase."""
-        R = self.R
-        beyond = rev_list(R.root, "HEAD", excl)
-        local = text_of(git(R.root, "rev-list", "HEAD", *["^" + e for e in excl], "--not",
-                            "--remotes", "--")).split()
-        return len(local) < len(beyond)
-
     def into_default(self):
         R, b, d = self.R, self.branch, self.default
         if not self.fetch(self.main_label):
             return False
         main_ref, up = "refs/heads/" + d, "refs/remotes/origin/" + d
-        have_main, have_up = bool(rev(R.root, main_ref)), bool(rev(R.root, up))
-        if not have_main and not have_up:
-            return self.stop(self.main_label, T("нет ветки {d} — влей вручную",
-                                                "no branch {d} — merge by hand", d=d), "merge")
-        # a. local main against origin/main
-        diverged = False
-        if have_main and have_up:
+        have_up = bool(rev(R.root, up))
+        if not rev(R.root, main_ref):
+            return self.stop(self.main_label, no_main(R, d, have_up), "merge")
+        if have_up:
             foreign = foreign_commits(R, main_ref, up, self.own, merged=(up,))
             if foreign:
-                return self.stop(self.main_label, main_foreign_text(R, d, foreign), "merge")
-            behind = len(rev_list(R.root, up, main_ref))
-            ahead = rev_list(R.root, main_ref, up)
-            if behind and ahead:
-                # Local main is ahead only by this session's commits (no-push earlier, or a
-                # push that lost a race). They are on the branch already: origin/main comes into
-                # the branch by merge, and main then fast-forwards to the branch.
-                if not is_ancestor(R.root, main_ref, "HEAD"):
-                    return self.stop(self.main_label, T(
-                        "локальный {d} разошёлся с origin/{d} — сведи их вручную",
-                        "local {d} and origin/{d} diverged — reconcile them by hand", d=d),
-                        "merge")
-                diverged = True
-            elif behind:
-                if not self.move_main(up, False):
-                    return False
-                self.steps.say(self.main_label, T("подтянул {d} до origin/{d} (+{n})",
-                                                  "fast-forwarded {d} to origin/{d} (+{n})",
-                                                  d=d, n=behind), "update-main", "done")
-        excl = [r for r, ok in ((main_ref, have_main), (up, have_up)) if ok]
-        # c. nothing foreign on the branch
-        foreign = foreign_commits(R, "HEAD", excl, self.own, merged=excl)
-        if foreign:
-            return self.stop(self.main_label, branch_foreign(R, b, d, foreign), "merge")
-        if not diverged and not rev_list(R.root, "HEAD", excl):
+                return self.stop(self.main_label, main_foreign_text(
+                    R, d, foreign, no_merge_passes(R, b, d, self.own)), "merge")
+        excl = [main_ref] + ([up] if have_up else [])
+        old_main = rev(R.root, main_ref)
+        n = len(rev_list(R.root, "HEAD", excl)) + self.extra
+        if not n:
             self.steps.say(self.main_label, T("нет — ветка {b} уже в {d}",
                                               "no — branch {b} is already in {d}", b=b, d=d),
                            "merge", "skipped")
         else:
-            # b. the branch takes main's new commits first
-            lacking = len({c for r in excl for c in rev_list(R.root, r, "HEAD")})
-            if lacking:
-                if not tracked_clean(R.root):
-                    return self.stop(self.main_label, T(
-                        "в {d} {n} новых, а в дереве ветки чужие незакоммиченные правки — не "
-                        "вливаю {d} в ветку; закоммить или убери их и запусти /commit снова",
-                        "{d} has {n} new and this tree has uncommitted changes that are not this "
-                        "session's — not merging {d} into the branch; commit or remove them and "
-                        "run /commit again", d=d, n=n_commits(lacking)), "merge")
-                target = up if diverged or not have_main else main_ref
-                name = "origin/" + d if target == up else d
-                if not diverged and not self.published(excl):
-                    if not self.rebase(target, name, lacking):
-                        return False
-                elif not self.merge_in(target, name):
-                    return False
-            # d. move main to the branch head (or create it there)
-            n = len(rev_list(R.root, "HEAD", excl))
-            if have_main:
-                noff = bool(noff_style(R, main_ref) and checkout_of(R, d)[0])
-                if not self.move_main("refs/heads/" + b, noff):
-                    return False
-                how = T("merge --no-ff", "merge --no-ff") if noff else "fast-forward"
-                self.steps.say(self.main_label, T("готово — {d} → {s} ({how}, {n})",
-                                                  "done — {d} → {s} ({how}, {n})", d=d,
-                                                  s=short(rev(R.root, main_ref)), how=how,
-                                                  n=n_commits(n)), "merge", "done")
-            else:
-                tip = rev(R.root, "HEAD")
-                proc = git(R.root, "branch", "--no-track", d, tip, ok=None)
-                if proc.returncode != 0:
-                    return self.stop(self.main_label, T("{d} не создан: {e}", "{d} not created: "
-                                                        "{e}", d=d, e=oneline(errtext(proc), 200)),
-                                     "merge")
-                have_main = True
-                self.steps.say(self.main_label, T("готово — создал {d} на {s} ({n})",
-                                                  "done — created {d} at {s} ({n})", d=d,
-                                                  s=short(tip), n=n_commits(n)), "merge", "done")
-        # e. push
-        reason = self.no_push_reason()
-        if reason:
-            self.steps.say("Push", reason, "push", "skipped")
+            # Nothing foreign on the branch — checked before main moves, so a run that stops
+            # here never touches main's checkout.
+            foreign = foreign_commits(R, "HEAD", excl, self.own, merged=excl + [branch_ref(R, b)])
+            if foreign:
+                return self.stop(self.main_label, branch_foreign(R, b, d, foreign, self.own),
+                                 "merge")
+            behind = lag(R, d, have_up)
+            if behind:
+                return self.stop(self.main_label, behind, "merge")
+            if not self.move_main("refs/heads/" + b):
+                return False
+            self.work = True
+            self.steps.say(self.main_label, T(
+                "да — ветка {br} → fast-forward {d} ({n})", "yes — branch {br} → fast-forward {d} "
+                "({n})", br=b, d=d, n=n_commits(n)) if self.dry else T(
+                "готово — {d} → {s} (fast-forward, {n})", "done — {d} → {s} (fast-forward, {n})",
+                d=d, s=short(rev(R.root, main_ref)), n=n_commits(n)), "merge", "done")
+        if self.skip_push():
             return True
-        src = main_ref if have_main else "refs/heads/" + b
-        bup = own_upstream(R, b)
-        if have_up and not rev_list(R.root, src, up):
-            # main is on origin already; the branch's own upstream may still lack it.
-            if not (bup and rev_list(R.root, "HEAD", bup)):
-                self.steps.say("Push", T("нет — origin/{d} уже содержит всё",
-                                         "no — origin/{d} already has everything", d=d), "push",
-                               "skipped")
-                return True
-        else:
-            if not self.check_foreign(src, up if have_up else None, d,
-                                      merged=(up,) if have_up else ()):
-                return False
-            if not self.push(src, d):
-                return False
-        if bup:
-            behind = rev_list(R.root, bup, "HEAD")
-            if behind and self.rebased and all(c in self.rewritten for c in behind):
-                self.steps.say("Push", T("ветка {b} не запушена: разошлась с origin после "
-                                         "rebase (force не делаю)", "branch {b} not pushed: it "
-                                         "diverged from origin after a rebase (no force)", b=b),
-                               "push-branch", "skipped")
-            elif behind:
-                self.steps.say("Push", T("ветка {b} не запушена: в origin/{b} {n}, которых нет "
-                                         "в ветке: {l} — влей их в ветку",
-                                         "branch {b} not pushed: origin/{b} has {n} that are "
-                                         "not in the branch: {l} — pull them into the branch",
-                                         b=b, n=n_commits(len(behind)), l=subjects(R, behind)),
-                               "push-branch", "skipped")
-            elif rev_list(R.root, "HEAD", bup):
-                return self.push("refs/heads/" + b, b)
-        return True
+        src = rev(R.root, "HEAD" if self.dry and n else main_ref)  # main once moved
+        if have_up and self.has_everything(src, up):
+            return True
+        if have_up and not is_ancestor(R.root, up, src):
+            # Local main is ahead of origin/main and behind it (an earlier no-push run).
+            return self.stop("Push", lag(R, d, have_up) or T(
+                "локальный {d} разошёлся с origin/{d} — сведи их вручную",
+                "local {d} and origin/{d} diverged — reconcile them by hand", d=d), "push")
+        return self.check_foreign(src, up if have_up else None, d,
+                                  merged=(up, old_main) if have_up else ()) and self.push(src, d)
+
+
+def stopped_before(R, plan, steps, args):
+    """A stop at the commit step: the merge and push lines still say what became of them.
+    -> exit code 1."""
+    default = plan.get("default") or plan["branch"]
+    if plan["branch"] != default:
+        steps.say(T("В {b}", "Into {b}", b=default), T("нет — после стопа", "no — stopped before"),
+                  "merge", "skipped")
+    if args.no_push or plan.get("no_push"):
+        why_not = T("нет — по аргументу", "no — as asked")
+    elif not has_origin(R):
+        why_not = no_remote(R)
+    else:
+        why_not = T("нет — после стопа", "no — stopped before")
+    steps.say("Push", why_not, "push", "skipped")
+    if plan.get("mode") == "pr":
+        steps.say("PR", T("нет — после стопа", "no — stopped before"), "pr", "skipped")
+    return 1
+
+
+def make_branch(R, plan, message, task, steps):
+    """Switch to the planned new branch, made from HEAD (`git switch -c`: the working tree and
+    the index stay). -> its name, or None after a stop line."""
+    lab = T("Ветка", "Branch")
+    name = plan["new_branch"]
+    if not name:  # session/<slug of the commit subject>; a taken name gets -2, -3, …
+        subject = message.decode("utf-8", "replace").strip().split("\n", 1)[0]
+        base = "session/" + slug(subject)
+        name = next((n for n in [base] + [f"{base}-{i}" for i in range(2, 10)]
+                     if not rev(R.root, "refs/heads/" + n)
+                     and not rev(R.root, "refs/remotes/origin/" + n)), base)
+    problem = branch_problem(R, name, task and task["id"])
+    if problem:
+        steps.say(lab, T("нет — стоп: ", "no — stop: ") + problem, "branch", "stop")
+        return None
+    proc = git(R.root, "switch", "-q", "-c", name, ok=None)
+    hook = ""
+    if proc.returncode != 0:  # a failing post-checkout hook fails the switch after it is made
+        if symbolic_head(R) != "refs/heads/" + name:
+            steps.say(lab, T("нет — стоп: git switch -c отказал: {e}", "no — stop: git switch -c "
+                             "refused: {e}", e=oneline(errtext(proc), 200)), "branch", "stop")
+            return None
+        hook = T(" (post-checkout хук упал: {e})", " (the post-checkout hook failed: {e})",
+                 e=oneline(errtext(proc), 160))
+    steps.say(lab, T("{b} — создана от {d}", "{b} — created from {d}", b=name, d=plan["branch"])
+              + hook, "branch", "done")
+    return name
+
+
+def unmake_branch(R, plan, name, old, steps):
+    """No commit landed on the branch make_branch made: back to the old branch, and the empty
+    branch goes — only while it is checked out here and still at the old HEAD."""
+    lab = T("Ветка", "Branch")
+    if symbolic_head(R) != "refs/heads/" + name or rev(R.root, "refs/heads/" + name) != R.head:
+        steps.say(lab, T("{b} осталась (коммита нет, HEAD уже не на ней) — убери её сам, если не "
+                         "нужна: git branch -d {b}", "{b} stays (no commit, HEAD is not on it any "
+                         "more) — delete it yourself if unused: git branch -d {b}", b=name),
+                  "branch", "note")
+        return
+    git(R.root, "switch", "-q", old, ok=None)
+    if symbolic_head(R) == "refs/heads/" + old:  # by HEAD: a post-checkout hook may fail it
+        git(R.root, "update-ref", "-d", "refs/heads/" + name, R.head, ok=None)
+        steps.say(lab, T("{b} убрана — коммита нет; снова на {d}", "{b} removed — no commit; back "
+                         "on {d}", b=name, d=old), "branch", "undone")
+    else:
+        steps.say(lab, T("{b} пустая и выгружена — коммита нет; вернись: git switch {d} && git "
+                         "branch -d {b}", "{b} is empty and checked out — no commit; go back: git "
+                         "switch {d} && git branch -d {b}", b=name, d=old), "branch", "stop")
 
 
 def apply_cmd(args):
@@ -3474,6 +3581,21 @@ def apply_cmd(args):
         plan = json.load(fh)
     global LANG
     LANG = args.lang or plan.get("lang") or "en"
+    if args.pr and args.main:
+        raise Fail("--pr and --main contradict each other: pass one")
+    if args.pr or args.main:
+        plan["mode"], plan["mode_why"] = ("pr" if args.pr else "direct"), T("по аргументу",
+                                                                            "as asked")
+    task = plan.get("task")
+    if args.task:
+        found = task_of(args.task)
+        if not found:
+            raise Fail(T("--task {r}: не вижу id задачи — передай --task <id>",
+                         "--task {r}: no task id in it — pass --task <id>", r=args.task))
+        task = {"id": found[0], "url": found[1]}
+    refused = refuse_in_ticket(plan["config"], plan["sessions"], T("Коммит", "Commit"))
+    if refused is not None:
+        return refused
     R = Repo(plan["repo"])
     _NAMES.clear()
     steps = Steps()
@@ -3486,10 +3608,12 @@ def apply_cmd(args):
             json.dump(result, fh, ensure_ascii=False, indent=1)
         return code
 
+    # The index entries an earlier commit left stale are put back also when the plan stops: its
+    # Index line promised it.
+    if not resync(R, plan, steps):
+        return finish(1)
     if plan.get("verdict") == "stop":
         steps.say(T("Стоп", "Stop"), plan.get("stop") or "?", "plan", "stop")
-        return finish(1)
-    if not resync(R, plan, steps):
         return finish(1)
     try:
         check_stale(R, plan)
@@ -3513,21 +3637,40 @@ def apply_cmd(args):
                            f"{e.strerror or e}")
         if not message.strip():
             raise Fail("the commit message is empty")
+        if task and not mentions_task(message, task):
+            raise Fail(f"the commit message does not name task {task['id']}: add its link "
+                       f"({task['url'] or 'or its id'}) as the repository's history does, then "
+                       "run apply again")
+        old_branch, branch = plan["branch"], None
+        if plan.get("new_branch") is not None:
+            branch = make_branch(R, plan, message, task, steps)
+            if not branch:
+                return finish(stopped_before(R, plan, steps, args))
+            plan["branch"] = branch
+        if task:
+            steps.say(T("Задача", "Task"), T("{t} — ссылка в сообщении коммита",
+                                             "{t} — named in the commit message", t=task["id"]))
         try:
             made = commit_step(R, plan, message, steps)
         except Stale as e:
+            if branch:
+                unmake_branch(R, plan, branch, old_branch, steps)
             print(f"plan is stale, run plan again: {e}", file=sys.stderr)
             return finish(3)
         except Moved:
+            if branch:
+                unmake_branch(R, plan, branch, old_branch, steps)
             return finish(3)
         if not made:
-            return finish(1)
+            if branch:
+                unmake_branch(R, plan, branch, old_branch, steps)
+            return finish(stopped_before(R, plan, steps, args))
         head, verified, trusted = made
         result["commit"] = head
         if trusted:
             own.add(head)  # recorded by commit_step, with the last edit of each path it holds
         if not verified:
-            return finish(1)
+            return finish(stopped_before(R, plan, steps, args))
         R = Repo(plan["repo"])
     else:
         steps.say(T("Коммит", "Commit"), T("нет — новых правок нет; публикую сделанное",
@@ -3542,8 +3685,8 @@ def apply_cmd(args):
                                        "git error: {e} — the steps above stay done",
                                        e=oneline(str(e), 300)), "error", "stop")
         ok = False
-    finally:
-        record_own(plan["config"], sids, pub.created, rewritten=pub.rewritten)
+    if not ok:
+        push_line_after_stop(pub, steps.lines)
     return finish(0 if ok else 1)
 
 
@@ -3563,14 +3706,26 @@ def main(argv):
                    "changed through Bash; committed whole (repeatable)")
     p.add_argument("--out", help="run directory (default under <config>/cache/kensei-commit)")
     p.add_argument("--lang", choices=("ru", "en"), default="en")
-    p.add_argument("--no-merge", action="store_true", help="do not merge into the default branch")
+    p.add_argument("--no-merge", action="store_true", help="push the branch alone; do not move "
+                   "the default branch")
     p.add_argument("--no-push", action="store_true", help="do not push")
+    p.add_argument("--task", help="the task this work is for: a tracker link or an id; apply "
+                   "checks that the commit message names it")
+    p.add_argument("--branch", help="the branch to create from HEAD when the commit needs one "
+                   "(task/<id>-<slug>, session/<slug>)")
+    p.add_argument("--pr", action="store_true", help="this repository takes work through pull "
+                   "requests: push the branch (the PR is opened by the user), never touch main")
+    p.add_argument("--main", action="store_true", help="this repository takes work directly: "
+                   "fast-forward main and push it")
     a = sub.add_parser("apply", help="commit, merge and push as planned")
     a.add_argument("--plan", required=True, help="RUN/plan.json from plan")
     a.add_argument("--message-file", help="the commit message, or - for stdin")
     a.add_argument("--lang", choices=("ru", "en"))
     a.add_argument("--no-merge", action="store_true")
     a.add_argument("--no-push", action="store_true")
+    a.add_argument("--task")
+    a.add_argument("--pr", action="store_true")
+    a.add_argument("--main", action="store_true")
     args = ap.parse_args(argv)
     global LANG
     try:

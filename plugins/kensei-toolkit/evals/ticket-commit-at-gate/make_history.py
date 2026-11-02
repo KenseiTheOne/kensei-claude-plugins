@@ -84,8 +84,9 @@ base: `main` @ `{base[:7]}` "Initial pricing module"
 Ничего не закоммичено и не отправлено. Готово по команде: коммит в `task/LOCAL-17-discount-range` · push · PR."""
 
 
-def main():
-    base, tree, stat = run_fixture()
+def entries(base, tree, stat):
+    """The conversation up to the gate and the typed «закоммить» (ticket-commit-skill-at-gate
+    takes it without the last entry)."""
     entries, parent = [], None
     clock = iter(f"2026-10-01T09:{m:02d}:00.000Z" for m in range(10, 60))
 
@@ -114,10 +115,14 @@ def main():
                                           f"{skill_body()}"}], isMeta=True)
     add("assistant", [{"type": "text", "text": gate_message(base, tree, stat)}])
     add("user", "закоммить", **typed)
+    return entries
 
+
+def main():
+    base, tree, stat = run_fixture()
     out = os.path.join(HERE, "history.jsonl")
     with open(out, "w", encoding="utf-8") as f:
-        for entry in entries:
+        for entry in entries(base, tree, stat):
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     print(f"{out}: base {base[:7]}, reviewed tree {tree[:7]}")
 

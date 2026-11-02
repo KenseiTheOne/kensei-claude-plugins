@@ -9,6 +9,7 @@ account, so CI does not run them; run them by hand after a skill change and befo
 | `svg-diagram-not-codex-img` | smoke | «Сделай картинкой схему из README» invokes `svg-diagram`, never `codex-img` | a diagram request going to the raster image skill, which spends Codex image quota |
 | `brainstorm-no-plan-mode` | smoke | brainstorm starts; `EnterPlanMode` / `ExitPlanMode` never called | brainstorm entering plan mode (fixed in 1.8.1) |
 | `ticket-commit-at-gate` | ticket, gate | Resumes a run stopped at the publish gate after a typed «закоммить»: exactly one commit, on the task branch, holding the two fixed files; no run notes staged or committed; no push, PR, merge or amend | run notes committed; publishing more than «закоммить» ordered |
+| `ticket-commit-skill-at-gate` | ticket, gate, commit | The same gate, but the user types `/kensei-toolkit:commit`: one commit on the task branch made by the gate's own steps (the snapshot or reviewed-tree check ran), the task branch pushed, `sessioncommit.py` never run, origin/main not pushed, no PR, merge or amend | the commit skill committing past the ticket's checks and guard; the guard refusing the push the command ordered |
 | `ticket-stops-at-criteria` | ticket | Context agent is `general-purpose` and told to write `01-context.md`; criteria put to the user; no source edits (Edit or Write), commit, push, or `.task-runs` in the repo | context agent unable to write its file; run notes committed |
 | `unity-review-readonly` | unity-review | Mode from the argument, so no `AskUserQuestion`; no Edit or Write; the per-frame allocation in `EnemySpawner.Update` is reported with `path:line` and a failure scenario | reviewers editing code; asking for a mode already given |
 | `learn-asks-before-writing` | capture | Asks which items to apply before any write; the project gotcha goes to `CLAUDE.md`, the language preference to a user-level home; the `make test` line already in `CLAUDE.md` is not proposed again | writing before approval; duplicates; wrong home |
@@ -27,6 +28,7 @@ claude plugin eval . --tag smoke --scaffold --judge-model opus --runs 1 --ablati
 # ticket-commit-at-gate also needs its conversation built first (see "The gate case" below);
 # ticket cases also need a git the sandbox can run (see "Git for the ticket cases")
 python3 evals/ticket-commit-at-gate/make_history.py
+python3 evals/ticket-commit-skill-at-gate/make_history.py
 claude plugin eval . --tag ticket --scaffold --allow-tools Bash Write Edit \
   --judge-model opus --runs 1 --ablation none --no-publish --max-cost-usd 10
 claude plugin eval . --tag unity-review capture --scaffold --allow-tools Bash Write Edit \
@@ -43,6 +45,7 @@ claude plugin eval . --max-cost-usd 0 --scaffold --allow-tools Bash Write Edit \
 # before a release: Opus 5.5, default 3 runs (add a --model sonnet run only if you use the
 # skills on Sonnet)
 python3 evals/ticket-commit-at-gate/make_history.py
+python3 evals/ticket-commit-skill-at-gate/make_history.py
 claude plugin eval . --scaffold --allow-tools Bash Write Edit --model opus \
   --judge-model opus --no-publish
 ```
@@ -141,6 +144,13 @@ the repository and the run directory a finished run leaves (fix in the working t
   one 2.0.0 live run where git worked (it ran the Command Line Tools git by its absolute path),
   the commit went through on the typed «закоммить» with every git-file grader passing. Every
   other 2.0.0 run was refused that binary, so the scaffold guard treats it as unusable.
+
+`ticket-commit-skill-at-gate` reuses that fixture (its `fixture.sh` runs the gate case's) and
+history: its `make_history.py` takes the gate conversation without the typed «закоммить» and
+adds the typed `/kensei-toolkit:commit` with the commit skill's text after it, as Claude Code
+records a slash command. The guard reads that typed command as commit and push; the case prompt
+repeats it. Pushes go to the bare origin the fixture makes under `$HOME`; `main-not-pushed` counts
+the `update by push` lines in origin/main's reflog (one, the scaffold's own).
 
 ## Known limits
 

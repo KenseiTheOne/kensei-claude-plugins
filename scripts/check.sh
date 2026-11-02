@@ -17,6 +17,7 @@ run_tests() {
   "$PYTHON" plugins/kensei-toolkit/skills/commit/sessioncommit_test.py
   "$PYTHON" plugins/kensei-toolkit/skills/codex-img/codex_img_test.py
   "$PYTHON" plugins/kensei-toolkit/skills/svg-diagram/diagram_kit_test.py
+  "$PYTHON" plugins/kensei-toolkit/skills/game-vfx/vfx_test.py  # skips without numpy, Pillow, imageio-ffmpeg
   "$PYTHON" plugins/kensei-statusline/scripts/statusline_test.py
 }
 

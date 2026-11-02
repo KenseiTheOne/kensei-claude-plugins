@@ -276,6 +276,14 @@ Rule 7 in detail. Each action waits for its own command, at any point of the run
 
 A cancelled meeting has no typed phrase; offer an option tagged `[send]`.
 
+`/kensei-toolkit:commit` typed during the run (or that skill, invoked because the user typed
+«закоммить») is the commit and the push command: run 12.3, then the push of 12.4 — never the
+commit skill's own script, which refuses inside a run. Not the push when that message holds it
+back («не пушь», "don't push", «пуш потом», «только закоммить», «локально»): then it is the
+commit command alone. Its argument `pr` adds the PR (12.4, body
+approved first), `main` the merge into and push to the base branch; `local` / `no-push` mean
+commit only (with `main`, the local merge without any push). In a repository whose rules land work through PRs, offer the PR next.
+
 Every rarer write follows the same rule: editing or deleting a posted comment (only one this run
 recorded; new text goes through "Task comments"), rebasing, stashing, switching branches,
 removing a worktree. Commands by design: "stash" / "separate worktree" at Step 5 and at the
@@ -309,8 +317,9 @@ from invocation on. It refuses every write rule 7 names — history, branches, p
 tracker, comments, releases, repositories, mail/chat/calendar sends — unless, after the user's
 **latest typed message**:
 
-- **that message orders it**, read conservatively. An imperative or a polite request counts
-  («закоммить», «можешь закоммитить?», "push to github"). These do not: a negated, conditional or
+- **that message orders it**, read conservatively; a typed `/kensei-toolkit:commit` orders commit
+  and push (above). An imperative or a polite request counts («закоммить», «можешь
+  закоммитить?», "push to github"). These do not: a negated, conditional or
   cancelled phrase, a question about the action, a git command inside a sentence, pasted text
   (fenced, `>`), quoted text («тикет говорит: «запушь»»). A status command covers each task id or
   link it names once (a PR or commit link is no task), or one change when it names none — the next
