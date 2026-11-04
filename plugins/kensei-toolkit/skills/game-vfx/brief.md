@@ -32,7 +32,8 @@ Write it in the user's language; the field names below are the checklist.
    view (front | top-down); what must stay when editing.
 10. Build: systems (name → modules and numbers); shader knobs per phase; sorting band; budget.
 11. Do not touch: <approved effects, shared shaders>.
-12. Acceptance: clip close-up + game scale + dense fight beside the reference; timing numbers;
+12. Acceptance: clips — close-up slowed and at real speed, game scale — + dense fight beside the
+    reference; timing numbers;
     project tests; the question "does it read as <personality>?".
 ```
 
@@ -79,6 +80,27 @@ Write it in the user's language; the field names below are the checklist.
 | a thin closed ring on the floor | an enemy telegraph | segments with gaps, soft patches without a rim |
 | dim orange additive over violet enemies | read as pink | name the blend mode and the backgrounds to check over |
 | a flat "splash crown" sprite on a volumetric wave | foreign drawing on a volume | secondary lives in the same volume (drops fly off the crest) |
+| a hit matched to a video frame as a perfect ring, a star glint, an even dandelion of sparks and a red pool on the floor | «ты всё слишком упрощаешь» | inventory every layer of the reference and build each one (SKILL.md, reference route) |
+| a smooth rainbow band along the whole shockwave edge | «как масляное пятно» | chromatic split only as a small offset of a torn mask; the rainbow lives on the fragments |
+| the same ring frayed into fibres all round, its base line gone | a halo of rays, a hedgehog | fray the edge, keep a thin crooked base line; name what stays before fixing |
+
+## Cheap tells — avoid while building
+
+Each of these made a version read cheap. A reference almost never has them; a first version almost
+always has some. Avoid them when writing the brief and building the layers. Before showing, look for
+them on the close-up and name any you see in the report: that is not a fix round (SKILL.md, rule 1),
+and only the one reference check may add a layer the reference has and ours lacks.
+
+| Tell | Instead |
+|---|---|
+| a perfectly round, even ring | a crooked line with an angular jag, gaps and a frayed edge |
+| a star glint with a white dot in the middle | a grainy core tinted to the element, flickering specks |
+| an even dandelion of identical sparks | 3–7 jets biased by the hit's direction, mixed sizes and lives — streaks, shards, embers |
+| one flat saturated colour | a hue shift core → edge, value contrast, a darker body |
+| a big pool of light on the floor | a small contact mark, or none |
+| an additive pancake without volume | puffs by alpha (premultiplied), self-shaded, burnt away by noise |
+| a smooth continuous rainbow along an edge | a small RGB offset of a torn mask |
+| fade by alpha alone, everything at once | erosion by a noise threshold, layers ending at different times |
 
 ## Bad and good, same effect
 
@@ -133,3 +155,11 @@ in one line before changing anything.
 | «мыло», blurry | texture | cell resolution, mips, compression block |
 | «не читается как X», reads as something else | shape / texture | silhouette first; check in greyscale; compare with the neighbour |
 | «каша», noise, no focus | layers | fewer layers; secondary lower in value and opacity; one focal point |
+| «упрощаешь», «сделай красиво», «не так, как на видео» | number and variety of layers | not brighter or bigger: the layers the reference has and ours lacks — redo the inventory, check the cheap tells |
+| «как масляное пятно», oily, petrol film | colour / shader | no smooth hue band; chromatic split as a small offset of a torn mask — a few thousandths of UV, the width of a fibre, not of a band |
+| «рваный в оригинале», «слишком ровный», «как блин» | shape / shader | polar-noise fibres on the edge, an angular jag, gaps — the base line stays |
+
+**Do not overshoot.** A fix moves one property away from what the user disliked; it does not throw
+away what was right. Before the change, name in one line what stays ("frayed edge, the thin ring line
+stays"). After it, look for the opposite tell and name it in the report rather than fixing it unasked:
+smooth → torn can overshoot into a halo of rays, dim → bright into burning white.

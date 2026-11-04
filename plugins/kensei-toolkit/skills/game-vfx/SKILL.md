@@ -1,13 +1,16 @@
 ---
 name: game-vfx
-description: Make or fix a game visual effect (VFX) in Unity — fire, explosion, lightning, water, wind, magic, hit, projectile, aura, ground zone — built from Particle System layers and shaders, with textures as shader data that a script computes or Codex draws as single elements after an approved concept — Codex draws only the concept the user approves, never the effect itself. For a new effect it writes the brief first (one-line personality, three-phase timing in seconds, layers, hex palette, bans with reasons) and blocks the timing in with grey primitives; for a complaint about an existing one it films it, names the layer at fault and changes only that. Prompts Codex from templates, cleans every image with a script, films a fixed-rate clip, measures its timing and makes a numbered contact sheet, and shows each version to the user before the next change. Reads the project's own VFX rules first. Use when the user asks for a visual effect, a texture for one, or a change to one — "make a fire VFX", "the explosion feels weak", "particles for the hit", "a texture for the spark particles", «сделай эффект», «эффект взрыва», «VFX», «партиклы», «текстура для партиклов», «вспышка удара», «эффект снаряда», «эффект какой-то вялый», «фаербол вялый», «взрыв висит», «молния выгорает в белое», «переделай огонь». Not for UI animation, a post-processing setup alone, or a picture that is not part of a game effect (that is codex-img).
+description: Make or fix a game visual effect (VFX) in Unity — fire, explosion, lightning, water, wind, magic, hit, projectile, aura, ground zone — built from Particle System layers and shaders, with textures as shader data a script computes or Codex draws as single elements — Codex draws only the concept the user approves, never the effect itself. For a new effect it writes the brief first (personality, three-phase timing in seconds, layers, hex palette, bans) and blocks the timing in with grey primitives; for a complaint about an existing one it films it, names the layer at fault and changes only that. For a frame or clip to match it lists every layer and compares ours beside it. Prompts Codex from templates, cleans every image with a script, films a fixed-rate clip, measures its timing and makes a numbered contact sheet, and shows each version to the user before the next change. Reads the project's own VFX rules first. Use when the user asks for a visual effect, a texture for one, or a change to one — "make a fire VFX", "the explosion feels weak", "particles for the hit", "a texture for the spark particles", «сделай эффект», «эффект взрыва», «VFX», «партиклы», «текстура для партиклов», «вспышка удара», «эффект снаряда», «эффект какой-то вялый», «фаербол вялый», «взрыв висит», «молния выгорает в белое», «переделай огонь», «сделай как на видео», «как на референсе». Not for UI animation, a post-processing setup alone, or a picture that is not part of a game effect (that is codex-img).
 argument-hint: "[effect name or what to change]"
 ---
 
 # game-vfx — game effects from a brief, one version at a time
 
-A good effect is three to six simple layers with different timing, whose silhouette reads even in
-greyscale — not one beautiful texture. So the work goes in this order: what the effect says and when
+A good effect is several simple layers with different timing, whose silhouette reads even in
+greyscale — not one beautiful texture. Three to six layers is the floor for a small, frequent hit, not
+a ceiling: an effect matched to a reference gets every layer the reference has, each with its own
+character, and cutting it down to "a ring, a flash and sparks" is the commonest rejection («ты всё
+упрощаешь»). So the work goes in this order: what the effect says and when
 (brief, timing), then shape, then textures and colour. Codex draws the concept — a picture of how the
 effect should look, for the user to agree on. The effect itself is textures as data for a shader
 (masks, noise, ramps, growth order, crack maps) plus the particles and shaders that build its form over
@@ -25,9 +28,16 @@ you write for the project follow the project's language.
    Before showing you may fix, once, only a *measurable* miss: a red project test, a mechanical
    texture failure (`check` problems), an impact whose `timing` note says the peak is late, a life
    that differs from the brief, a Codex picture standing in for the effect (rule 3). Never taste.
+   When the user gave a reference frame or clip, one more check is allowed before showing: the
+   reference's layer inventory against our frame (reference route) — each item present or missing,
+   plus measured numbers from `vfx_clip.py compare` (core colour, near-white, clipped share) — and at
+   most one fix of what is missing or measurably off. A check of presence and numbers, not a score
+   and not a second round.
 2. **Timing before textures.** For a new effect, no Codex image is generated before the rhythm is
    settled on grey primitives and the user has seen it (Step 2). Re-timing a grey ball is cheap; a
-   texture drawn for the wrong rhythm is quota spent twice.
+   texture drawn for the wrong rhythm is quota spent twice. The one exception is the reference route,
+   when the reference clip already fixes the timing (or the effect is a sandbox piece): the brief says
+   the block-in is skipped and why.
 3. **Codex draws the concept, not the effect.** A Codex image is a reference: it fixes the look —
    palette, character, amount of detail — and the user approves it. It never goes into the game as a
    picture that only appears, fades, scales or moves. The effect is textures as shader data —
@@ -57,8 +67,9 @@ you write for the project follow the project's language.
   cleaning, import. Read before Step 3.
 - `project-rules-template.md` — the shape of a project's VFX rules file.
 - `vfx_tex.py` — textures: `prep`, `check`, `tile`, `noise`, `glow`, `ring`, `ramp`.
-- `vfx_clip.py` — clips: `timing` (events, onset, peak, life, peak share, bright time, near-white) and
-  `sheet` (numbered contact sheet over the effect, optional reference below).
+- `vfx_clip.py` — clips: `timing` (events, onset, peak, life, peak share, bright time, near-white),
+  `sheet` (numbered contact sheet over the effect, optional reference below) and `compare` (a
+  reference frame or still beside ours at the same height, zoomed rows, colour and white numbers).
 
 ## Setup — the tools' Python
 
@@ -88,7 +99,9 @@ Rules that contradict this skill (no HDR so no Bloom; gravity forbidden; colour 
 masks; a different capture rate) — follow the project and drop the skill's advice silently.
 
 Then choose the route: **a new effect** → Steps 1–7. **A change to an existing effect** («вялый»,
-«висит», «сделай ярче», a new texture for it) → the change route below.
+«висит», «сделай ярче», a new texture for it) → the change route below. **A frame or clip to match**
+(«сделай как на видео», a still from another game) → the reference route below, then Steps 1–7 with
+the reference as the brief's source.
 
 ## Change route — an existing effect
 
@@ -102,6 +115,30 @@ Then choose the route: **a new effect** → Steps 1–7. **A change to an existi
    layer is the one at fault. A brief is written only if the effect has none — then just the
    personality line and the storyboard read off the clip.
 4. Step 5 (measure, project tests), then Step 6 (show and wait).
+
+## Reference route — "make it like this"
+
+The user gives a frame or a clip of an effect to match. The reference is the brief's main source and
+the acceptance; a first version that keeps only its outline is rejected even when it is tidy.
+
+1. Save it beside the effect's files (`ref/<name>.png`, a clip as it is) and crop the effect at full
+   resolution; crop the part the user talks about (a ring, a core) once more, zoomed.
+2. **Inventory of layers.** Write down every element you see, in material words, none merged or
+   dropped: "grainy lilac core with flickering specks", "torn front of radial fibres on a thin
+   crooked base line", "rainbow only on the torn fragments", "coral puffs burnt away by noise,
+   self-shaded", "streaks and shards thrown toward the shooter", "dark haze behind the ring". Per item:
+   shape, colour sampled from the reference in hex, blend, when it appears. The number of layers
+   comes from here, not from the floor of three to six.
+3. Hold the inventory against the cheap tells (`brief.md`): the reference almost never has them, a
+   first version almost always does — name the ones you will avoid.
+4. The brief (Step 1) takes its personality, palette and layers from the inventory; timing from the
+   clip (`timing` on the reference clip) or, for a still, from the effect's neighbours and the user.
+   The grey block-in round (Step 2) may be skipped when the reference clip fixes the timing or the
+   effect is a sandbox piece — say so in the brief.
+5. Before showing: `vfx_clip.py compare <reference> <our clip or frame> <out.png>` — the whole effect,
+   plus a `--zoom` row on the part the user named, at the same moment on both sides (Step 5) — and the
+   one inventory check of rule 1.
+6. Show (Step 6) with the comparison image next to the clips.
 
 ## Step 1 — The brief (new effect)
 
@@ -182,12 +219,32 @@ anything is shown.
 
 - Capture at a constant rate with fixed seeds — the project's capture tool and rate, else Unity
   Recorder with Playback = Constant at 30 or 60 fps. One cast per clip; start before the effect spawns
-  so the first frame is a clean background. Film close-up and game scale (the player's camera and
-  resolution), plus a dense-fight shot when the effect repeats.
-- `vfx_clip.py timing <clip>` first. At game scale the effect is small in the frame: pass
-  `--roi x,y,w,h` around it. If the effect is already on screen in frame 0, use `--baseline last`.
+  so the first frame is a clean background. Film three views: **close-up slowed down** (×4),
+  **the same close-up at real speed**, and **game scale** (the player's camera and resolution), plus a
+  dense-fight shot when the effect repeats. A fast effect is judged on the slowed close-up —
+  differences the user missed at game scale showed there — but how it *works* is judged at real
+  speed, and the user asks for it next. The close-up is rendered once, at four times the clip rate
+  (Recorder: Playback = Constant, target 240 fps for 60 fps clips); that file plays at real speed. Both
+  close-ups come from it with ffmpeg (`imageio_ffmpeg.get_ffmpeg_exe()`), no new render:
+  slowed `ffmpeg -i cap.mp4 -vf "setpts=4*PTS,fps=60" -an slow.mp4`, real speed
+  `ffmpeg -stream_loop 3 -i cap.mp4 -vf fps=60 -an real.mp4` (the loop only for a clip shorter than
+  ~2 s; `-an` keeps a recorded sound track from outlasting the video; quote the filter, zsh globs `*`).
+  When the project's tool already records slowed (time scale 0.25), the real-speed one is
+  `-vf "setpts=PTS/4,fps=60" -an` instead.
+- `vfx_clip.py timing <clip>` first — on a real-time clip with one cast: the capture itself or the
+  game-scale clip, never the slowed close-up (every second reads four times too long) or the looped
+  one (it counts four events). The same goes for `sheet`, whose tiles are labelled in seconds. At
+  game scale the effect is small in the frame: pass `--roi x,y,w,h` around it. If the effect is
+  already on screen in frame 0, use `--baseline last`.
 - Then `vfx_clip.py sheet <clip> <out.png>` — by default it spans the effect, not the empty lead-in;
   add `--ref <approved clip>` to put the reference below.
+- With a reference to match (a still or a clip): `vfx_clip.py compare <ref> <ours> <out.png>` with
+  `--ref-crop` / `--crop` framing the effect alike in both, and `--zoom` on the part in question
+  (repeat `--zoom` for more rows). A clip side without a frame gives its peak inside the crop; a still
+  is one moment, so give `--frame` for the same moment of ours (the note says when the two sides are
+  picked differently). A reference clip that opens on the effect needs `--ref-baseline last` or
+  `--ref-frame`; a phone recording `--ref-cfr 30`. Look at the frames it picked before using its
+  numbers.
 - Compare with the brief in seconds: life, rise, peak share (an impact peaks within the first quarter
   of life; a rise within ~0.1 s counts as instant), `bright_s` (how long the brightest pixels last —
   report it, do not "fix" it: a bright fire body counts too), near-white against the project ceiling
@@ -195,8 +252,9 @@ anything is shown.
 
 ## Step 6 — Show and take feedback
 
-Open the clip or sheet for the user (they must see it, not just read about it) and report in a few
-lines: what changed since the last version and in which layer, the measured timing against the brief,
+Open the clips — slowed close-up, real-speed close-up, game scale — and the sheet or comparison for
+the user (they must see them, not just read about them; pass absolute paths to the opener) and report
+in a few lines: what changed since the last version and in which layer, the measured timing against the brief,
 and one question — «читается ли как <personality>?». Then stop and wait.
 
 Turn the answer into a change with the feedback dictionary (`brief.md`): which layer, which knob,
@@ -212,6 +270,7 @@ the user's explicit command.
 
 ## Report
 
-After each version, in the user's language: the paths of the clip and sheet, the measured numbers
+After each version, in the user's language — also after long English tool output: the absolute
+paths of the clips and the sheet or comparison, the measured numbers
 against the brief, what changed and which layer, what was not touched, the one question. Do not paste
 diffs or describe pixels.

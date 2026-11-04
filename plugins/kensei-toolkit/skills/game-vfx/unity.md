@@ -19,6 +19,10 @@ silhouette and the focal point. Secondary is lower in value and opacity, simpler
 competes. On a projectile the primary is the leading edge (it deals the damage) and its hot point sits
 on the hitbox. "If everything is important, nothing is."
 
+A thin bright element — a shockwave line, an arc — reads only over something darker. Keep the smoke
+or cloud body back from the front so a dark band lies behind the line; a bright body pressed against
+the ring swallows it.
+
 ## Modules — how to write them in a brief
 
 | Module | Controls | Write it as |
@@ -87,12 +91,19 @@ on a bad shape stay a bad shape.
 | fresnel / rim | `pow(1 − dot(N, V), p)` for shields, spheres | power 2–8, colour |
 | vertex offset | waves, flame tongues on a mesh; only Sample Texture 2D LOD in the vertex stage | amplitude, frequency, mask |
 | soft particles | fade near geometry; needs the Depth Texture | fade distance |
+| radial fibres (torn front) | noise sampled in polar coordinates, stretched along the radius: (angle × many, radius × few); add it to the edge distance and threshold — fibres, not a smooth rim; a second low-frequency angular noise gives the jag and the gaps | fibre count, fray length, jag, gaps, line thickness |
+| chromatic split | sample the torn mask (the fibres, without the base line) three times for R, G, B with the UV offset along the angle or by a small noise vector, and add the split only where that mask is: the rainbow sits on the fragments. Offsetting the whole ring by radius colours the entire base line — the oily ring | spread (small), strength |
+| burning puff | premultiplied body; alpha = smoothstep of noise against a threshold that rises over life, so the puff burns away in holes; light from one side by the mask's gradient for self-shading | threshold curve, edge width, shade direction |
+| scene refraction | offset the scene colour behind the effect by the mask's gradient | strength, mask |
 
 Per-particle values reach the shader through **Custom Vertex Streams**: enable streams in the
 Renderer, Unity shows where each lands (UV → TEXCOORD0.xy, Custom1.xy → TEXCOORD0.zw, …). Give the
 agent the stream order as an explicit table: two streams written to one TEXCOORD break silently.
 Soft Particles need the Depth Texture; Camera Fading does not (it uses the fragment's own depth);
-Distortion samples the Opaque Texture.
+Distortion samples the Opaque Texture. Turning the Opaque Texture on is a change to the project's URP
+asset — every camera pays for it — so it is the project's decision, never a side effect of one
+effect. Without it, a sandbox or a capture can render the scene once into a render texture, set it as
+a global texture and let the refracting material sample that; in the game, follow the project rules.
 
 ## Mobile budget
 

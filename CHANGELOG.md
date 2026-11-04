@@ -3,6 +3,44 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.2.3 — 2026-11-04
+
+### game-vfx
+- **Reference route («сделай как на видео»).** A frame or clip to match is saved and cropped, every
+  element in it written down in material words with sampled hex (the layer inventory), held against
+  the cheap tells, and the brief built from it; the grey block-in may be skipped when the reference
+  clip fixes the timing (rule 2 names this one exception). "Three to six layers" is now the floor for
+  a small frequent hit, not a ceiling. Origin: a hit matched to a video frame as "ring + star glint +
+  sparks", rejected as «ты всё слишком упрощаешь».
+- **Rule 1 allows one reference check.** With a user's reference, before showing: the inventory
+  against our frame (present or missing) and `compare` numbers, at most one fix. Presence and
+  numbers, not taste and not a second round.
+- **Three clips per version:** close-up slowed ×4, the same close-up at real speed and game scale;
+  opened with absolute paths. The close-up is rendered once at four times the rate and both views are
+  made from it with ffmpeg (quoted filters, `-an`); `timing` and `sheet` run on a real-time clip with
+  one cast, never the slowed or looped one.
+- `vfx_clip.py compare REF OURS OUT.png`: an image (anything Pillow reads as one picture — `.tga`,
+  `.tif`, a phone's MPO jpeg; 16-bit grey scaled, transparency laid over black) or a clip on either
+  side; a clip gives `--frame`, else its peak inside the crop against its first frame or, with
+  `--ref-baseline` / `--baseline last`, its last; `--ref-cfr` / `--cfr` per side. Crops framed alike,
+  one height, `--zoom` rows; reports core colour (the effect's brightest pixels — those unlike the
+  crop's median — so a thin line, a dark puff on a light floor and a crop with a white damage number
+  in it each give the effect's own colour), near-white, clipped and bright shares per side, and notes
+  crops of unlike shape, two sides picked at different moments, and a clip that opens or ends on the
+  effect. `measure` streams the clip instead of holding every frame (a 10 s 1080p60 reference: ~0.6
+  GB instead of ~3.6). `sheet --ref` takes the reference's tiles at the same times when the two clips
+  differ in fps (a 240 fps capture against an approved 60 fps clip). A `--roi` / `--crop` outside the
+  frame is an error, not a traceback or an empty result. 9 new tests.
+- `brief.md`: a "cheap tells" table to avoid while building (even ring, star glint, dandelion of
+  sparks, flat colour, pool of light, additive pancake, smooth rainbow, alpha-only fade) — seen on a
+  version they are named in the report, not fixed in a round of their own; dictionary rows for
+  «упрощаешь», «масляное пятно», «рваный / как блин»; a "do not overshoot" rule (a torn ring that
+  lost its line read as a hedgehog); three rows in the rejected table.
+- `unity.md`: radial fibres from polar noise, chromatic split offset along the angle on the torn mask
+  only (a radial offset colours the whole base line), a burning self-shaded premultiplied puff, scene
+  refraction; a dark band behind a thin bright line; the Opaque Texture is the project's decision — a
+  sandbox can render the scene into a global texture.
+
 ## kensei-toolkit 2.2.2 — 2026-11-02
 
 ### game-vfx
