@@ -1,5 +1,5 @@
 {
-  "description": "ticket guard for subagents: in a session where /kensei-toolkit:ticket is active, subagents may not commit, push, write to the tracker, send mail or chat messages, or start remote or scheduled work. subagent-guard.sh exits at once for main-session calls, unmarked sessions or a missing guard.py, so Python starts only for subagent calls in a ticket session.",
+  "description": "PreToolUse — ticket guard for subagents: in a session where /kensei-toolkit:ticket is active, subagents may not commit, push, write to the tracker, send mail or chat messages, or start remote or scheduled work; subagent-guard.sh exits at once for main-session calls, unmarked sessions or a missing guard.py, so Python starts only for subagent calls in a ticket session. Stop — board nudge: in a session bound to a task board by /kensei-toolkit:board, a turn that did work without updating the board is handed back once; board-nudge.sh exits at once for sessions without a board marker, so Python starts only in board sessions.",
   "hooks": {
     "PreToolUse": [
       {
@@ -8,6 +8,17 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/subagent-guard.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/board-nudge.sh\"",
             "timeout": 15
           }
         ]

@@ -1,7 +1,7 @@
 # Kensei Claude Plugins
 
 Claude Code plugin marketplace: a statusline and a skill toolkit for tracker tasks, committing a
-session's own work, diff review, design brainstorms, Unity review and end-of-session capture. Release notes are in [CHANGELOG.md](CHANGELOG.md).
+session's own work, diff review, design brainstorms, task boards for plans, Unity review and end-of-session capture. Release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Installation
 
@@ -33,7 +33,7 @@ Inside a session the same works as `/plugin marketplace add …` and `/plugin in
 
 | Plugin | Description |
 |--------|-------------|
-| [kensei-toolkit](#kensei-toolkit) | Tracker task runner with a publish guard, commit of only this session's work (task link, task branch, PR or fast-forward into main), annotated diff tour, design brainstorm, image generation through Codex, SVG diagrams for READMEs, Unity game VFX, Unity code review, session learnings and loose ends |
+| [kensei-toolkit](#kensei-toolkit) | Tracker task runner with a publish guard, commit of only this session's work (task link, task branch, PR or fast-forward into main), annotated diff tour, design brainstorm, a task board for a plan, image generation through Codex, SVG diagrams for READMEs, Unity game VFX, Unity code review, session learnings and loose ends |
 | [kensei-statusline](plugins/kensei-statusline/README.md) | Multi-line statusline: model, effort and ultracode, context, tokens, cost, usage limits (incl. per-model ones like Fable), subagents, git, project stats |
 
 Versions live in each plugin's `.claude-plugin/plugin.json`; the CHANGELOG lists what each one changed.
@@ -49,7 +49,8 @@ answers in the language you write in.
 | [ticket](plugins/kensei-toolkit/skills/ticket/) | `/kensei-toolkit:ticket <url\|id> [probe\|fix\|full]` | manual, model | "take ticket CU-86c1234, fix mode" | Runs one tracker task end to end: context agent, acceptance criteria you approve, implementation, tests, fresh-agent review, then a publish gate. Commit, merge into main, push, PR (only with the body you approved), branch deletes, task comment, status, task creation, releases, repository settings and mail, chat or calendar sends happen only on your command (typed, or an answer tagged such as `[merge-local]`, `[delete-branch]`, `[create-task]`, `[publish]`, `[repo-admin]`, `[send]`), enforced by a guard hook that also covers subagents; a comment is fact-checked and shown in full before posting. Any tracker via MCP, CLI or browser |
 | [commit](plugins/kensei-toolkit/skills/commit/) | `/kensei-toolkit:commit [plan\|local\|no-merge\|no-push] [pr\|main]` | manual, model | "commit and merge into main" | Commits only what this session changed — its own edits and those of its subagents and workflow agents, read from the session's transcripts — and publishes it the way the repository takes work, with one status line per step (branch, task, commit, skipped files, what is left alone, into main, push, PR). In a file someone else also edited, only this session's hunks are committed and the rest stays in the working tree; a file it cannot split is skipped with a reason that points at declaring it. Work for a task carries the task link in its message (checked before committing) and, from main, gets a `task/<id>-<slug>` branch. A repository that takes work through pull requests (read from main's history, or `pr`) gets the branch pushed and a link to open its PR (it never opens or edits a PR itself), and main is never touched; elsewhere main is fast-forwarded to the branch and pushed. It never rebases, merges, stashes or forces — when main or origin moved ahead it commits and stops, naming the `git merge` to run. Never stages others' files or publishes commits this session's `/commit` did not make: it stops and says why. Inside a /ticket run it hands over to the ticket's publish gate. Files changed through Bash are committed when declared |
 | [diff-tour](plugins/kensei-toolkit/skills/diff-tour/) | `/kensei-toolkit:diff-tour [ref\|a..b]` | manual, model | "show the diff" | Self-review before a commit: the changes (untracked files included) as a local HTML page, side by side or unified, with notes on what and why placed under the lines they explain; every change no note explains is marked "Unexplained". Read-only: the git index and the repository are never touched |
-| [brainstorm](plugins/kensei-toolkit/skills/brainstorm/) | `/kensei-toolkit:brainstorm [topic]` | manual, model (on an explicit ask) | "let's brainstorm how to build an offline cache" | Design dialogue before implementation: focused questions, honest challenge, approaches, incremental validation. Ends with a design doc and a standalone plan, saved outside the project (`~/docs/brainstorms` unless the project names a place); implementation starts only when you say so |
+| [brainstorm](plugins/kensei-toolkit/skills/brainstorm/) | `/kensei-toolkit:brainstorm [topic]` | manual, model (on an explicit ask) | "let's brainstorm how to build an offline cache" | Design dialogue before implementation: focused questions, honest challenge, approaches, incremental validation. Ends with a design doc and a standalone plan, saved outside the project (`~/docs/brainstorms` unless the project names a place); implementation starts only when you say so, and the closing question also offers a task board for the plan |
+| [board](plugins/kensei-toolkit/skills/board/) | `/kensei-toolkit:board [plan.md\|board-url]` | manual, model | "make a board for this plan" | Turns a plan (or what this conversation agreed, after you approve the tasks) into a task board — a private claude.ai artifact with the plan's goal, acceptance criteria and file paths on top and one task per step in columns To do / In progress / Review / Done / Later — binds the session to it and stops; the work happens afterwards in the session. The board is read-only for you and readable from any device: questions waiting for your answer and work waiting for your check are marked on it, and you answer and accept in chat. Done only on your word. A board link continues the board in a new session |
 | [codex-img](plugins/kensei-toolkit/skills/codex-img/) | `/kensei-toolkit:codex-img [what to draw] [--out path]` | manual, model | "draw a fire stone icon with a transparent background to icons/fire.png" | Generates or edits images (icons, sprites, illustrations) through the Codex CLI's built-in image tool on your ChatGPT subscription — no API key. Saves each image under the name you choose, keeps a series in one style from reference images, checks that a transparent PNG really has alpha, runs a series from a manifest in the background after you confirm the cost, and stops on the image limit. The model, size and masks are not selectable: Codex decides |
 | [svg-diagram](plugins/kensei-toolkit/skills/svg-diagram/) | `/kensei-toolkit:svg-diagram [what to draw] [--out docs/diagrams/name.svg]` | manual, model | "replace the ASCII diagram in the README with a picture" | Draws an architecture, data-flow or pipeline diagram as a hand-built SVG in a dark gradient style (cards, labelled arrows, a highlighted special path, takeaway badges), one per README language, and embeds it. A small generator script with a stdlib kit copied next to it keeps the picture editable; `--strict` reports text overflowing its box, off the canvas or overlapping, and every language is rendered to PNG and looked at before it is handed over. Not for raster art (codex-img) or data charts |
 | [game-vfx](plugins/kensei-toolkit/skills/game-vfx/) | `/kensei-toolkit:game-vfx [effect name or what to change]` | manual, model | "the explosion feels weak" | Makes or fixes a Unity game effect (fire, explosion, lightning, hit, projectile, aura) from Particle System layers and shaders. A new effect starts from a brief — personality, three-phase timing in seconds, layers, hex palette, bans — and a grey block-in of the timing; a complaint about an existing one is filmed, the layer at fault named and only that layer changed. A frame or clip to match is broken down into every layer it has and compared with ours side by side at the same scale. Codex (through codex-img) draws a concept of the look for you to approve, never the effect itself: the effect is textures as shader data — computed by a script or drawn from the concept by templates and cleaned by a script — and a shader that builds the form over time; each version is filmed at a fixed rate — close-up slowed and at real speed, and at game scale — its timing measured and a numbered contact sheet made, and shown to you before the next change. Reads the project's own VFX rules first |
@@ -62,6 +63,12 @@ that applies the ticket guard to subagents while `/kensei-toolkit:ticket` is act
 over the main session comes from the skill's own hooks, which register when the skill is invoked:
 after `claude --resume`, invoke `/kensei-toolkit:ticket <same id>` again to turn it back on (the
 run continues from the step it reached).
+
+It also ships a `Stop` hook for boards: in a session bound to one by `/kensei-toolkit:board`, a turn
+that did work (edits, commands, agents) without writing to the board afterwards is handed back once
+to bring the board up to date, or to say that nothing on it moved. Sessions without a board pay one
+file check per turn. The binding is a marker in `~/.claude/task-boards/`; to continue in another
+session, run `/kensei-toolkit:board <board link>`.
 
 ### kensei-statusline
 
@@ -82,7 +89,8 @@ scripts/check.sh                           — release check: script tests, vali
 CHANGELOG.md                               — release notes for both plugins
 plugins/kensei-toolkit/
   .claude-plugin/plugin.json               — manifest, version
-  hooks/hooks.json                         — subagent guard while a ticket run is active
+  hooks/hooks.json                         — subagent guard while a ticket run is active,
+                                             board nudge (Stop) in sessions bound to a board
   skills/ticket/                           — SKILL.md, flow.md, publish.md, trackers.md,
                                              guard.py + guard_test.py, testdata/ (test fixtures)
   skills/commit/                           — SKILL.md, README.md (how files are split, gaps),
@@ -91,6 +99,8 @@ plugins/kensei-toolkit/
                                              assets/ (page template, CSS, JS),
                                              testdata/ (golden pages)
   skills/brainstorm/                       — SKILL.md
+  skills/board/                            — SKILL.md, board.html (page template),
+                                             board.py + board_test.py
   skills/codex-img/                        — SKILL.md, README.md (why a skill, not an MCP),
                                              codex_img.py + codex_img_test.py
   skills/svg-diagram/                      — SKILL.md, diagram_kit.py + diagram_kit_test.py,

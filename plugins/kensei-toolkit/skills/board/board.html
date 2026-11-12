@@ -1,0 +1,341 @@
+<title>__BOARD_TITLE__</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: plan brief (goal, progress, "needs you") on top, the status board below in work order; one column (status tabs) on a phone */
+:root {
+  --bg: #F3F4F7; --panel: #FFFFFF; --col: #E9EBF0; --fg: #161920; --muted: #5B6172; --line: #D8DBE3;
+  --accent: #2B55D9;
+  --s-todo: #5A6172; --s-progress: #2B55D9; --s-decision: #A65A00; --s-review: #6A3FC8; --s-done: #1E8A4C; --s-later: #8A8F9C;
+  --decision-soft: #FBEEDC; --review: #6A3FC8; --review-soft: #EEE7FB;
+  --body: "Golos Text", -apple-system, "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0F1116; --panel: #181B22; --col: #14171D; --fg: #ECEEF3; --muted: #9AA1B0; --line: #2B2F39;
+  --accent: #7E9DFF;
+  --s-todo: #B3B9C6; --s-progress: #8EA8FF; --s-decision: #F2B65A; --s-review: #B79BFF; --s-done: #5BD08A; --s-later: #7F8594;
+  --decision-soft: #33260F; --review: #B79BFF; --review-soft: #261D3D; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0F1116; --panel: #181B22; --col: #14171D; --fg: #ECEEF3; --muted: #9AA1B0; --line: #2B2F39;
+  --accent: #7E9DFF;
+  --s-todo: #B3B9C6; --s-progress: #8EA8FF; --s-decision: #F2B65A; --s-review: #B79BFF; --s-done: #5BD08A; --s-later: #7F8594;
+  --decision-soft: #33260F; --review: #B79BFF; --review-soft: #261D3D; color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 14px; line-height: 1.45; }
+.wrap { max-width: 1440px; margin: 0 auto; padding-block: 28px 56px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: flex; flex-direction: column; gap: 18px; }
+select, button { font-family: inherit; font-size: 13px; color: var(--fg); }
+select { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; }
+button { cursor: pointer; border-radius: 7px; border: 1px solid var(--line); background: var(--panel); padding: 6px 12px; }
+select { appearance: none; -webkit-appearance: none; cursor: pointer; padding-right: 30px; min-width: 96px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 16px) 55%, calc(100% - 11px) 55%; background-size: 5px 5px; background-repeat: no-repeat; }
+button:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* brief */
+.brief { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 24px; align-items: start; }
+.eyebrow { font-size: 12px; color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.eyebrow .px { font-family: var(--mono); text-transform: none; letter-spacing: 0; }
+h1 { margin: 4px 0 8px; font-size: 28px; font-weight: 700; letter-spacing: -0.015em; text-wrap: balance; overflow-wrap: anywhere; }
+.goal { margin: 0; max-width: 68ch; font-size: 15px; overflow-wrap: anywhere; }
+.facts { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.facts details { max-width: 68ch; }
+.facts summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); }
+.facts ul { margin: 8px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.files { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.file { display: flex; gap: 8px; align-items: center; min-width: 0; }
+.file .k { font-size: 12px; color: var(--muted); width: 64px; flex: none; }
+.file code { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; min-width: 0; }
+.file button { font-size: 11px; padding: 2px 8px; flex: none; }
+
+.progress { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.progress .big { display: flex; align-items: baseline; gap: 8px; }
+.progress .big b { font-family: var(--mono); font-size: 26px; font-variant-numeric: tabular-nums; }
+.progress .big span { color: var(--muted); font-size: 13px; }
+.bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--col); }
+.bar i { display: block; height: 100%; }
+.legend { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; font-size: 12px; color: var(--muted); }
+.legend span { display: flex; align-items: center; gap: 6px; }
+.legend b { margin-left: auto; font-family: var(--mono); color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+/* needs you */
+.ask summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); display: list-item; }
+.ask summary .cnt { margin-left: 6px; font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--s-decision); background: var(--decision-soft); border-radius: 999px; padding: 1px 7px; }
+.ask[open] summary { margin-bottom: 10px; }
+#askList { display: flex; flex-direction: column; gap: 8px; }
+.ask-row { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 6px 12px; padding: 12px 14px; border-radius: 9px; align-items: baseline; }
+.ask-row .kind { justify-self: start; border-radius: 999px; padding: 2px 8px; background: color-mix(in srgb, currentColor 14%, transparent); }
+.ask-row.decision { background: var(--decision-soft); }
+.ask-row.review { background: var(--review-soft); }
+.ask-row .kind { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.ask-row.decision .kind { color: var(--s-decision); }
+.ask-row.review .kind { color: var(--review); }
+.ask-row .what { font-weight: 600; overflow-wrap: anywhere; }
+.ask-row .what .id { font-family: var(--mono); font-size: 11px; color: var(--muted); font-weight: 400; margin-right: 6px; }
+.ask-row .why { grid-column: 2; color: var(--muted); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.fresh { text-transform: none; letter-spacing: 0; }
+
+/* board */
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.toolbar label { font-size: 12px; color: var(--muted); }
+.board { display: grid; grid-template-columns: repeat(5, minmax(220px, 1fr)); gap: 14px; align-items: start; overflow-x: auto; padding-bottom: 4px; }
+.column { background: var(--col); border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.col-head { display: flex; align-items: center; gap: 8px; padding: 4px 4px 2px; font-weight: 600; font-size: 13px; }
+.col-head .n { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.task { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px 10px; display: flex; flex-direction: column; gap: 8px; border-left: 3px solid var(--stripe, var(--line)); min-width: 0; }
+.task .top { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.task .id { font-family: var(--mono); font-size: 11px; color: var(--muted); flex: none; }
+.task .title { font-weight: 600; font-size: 13.5px; line-height: 1.35; min-width: 0; overflow-wrap: anywhere; }
+.task .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; }
+.chip-decision { font-size: 11px; font-weight: 600; border-radius: 999px; padding: 1px 8px; }
+.chip-decision { color: var(--s-decision); background: var(--decision-soft); }
+.when { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.task details { font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 7px; }
+.task details + details { border-top: 0; padding-top: 0; margin-top: -4px; }
+.task details summary { cursor: pointer; font-size: 12px; }
+.task details p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.more { font-size: 12px; color: var(--muted); background: transparent; border: 1px dashed var(--line); }
+.empty { font-size: 12px; color: var(--muted); padding: 8px 4px; }
+.tabs { display: none; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+.tabs button { --sc: var(--muted); flex: none; display: flex; align-items: center; gap: 6px; border-radius: 999px; font-weight: 600; font-size: 12.5px; color: var(--sc); background: var(--panel); border: 1px solid var(--line); padding: 5px 11px; }
+.tabs button .dot { background: var(--sc); }
+.tabs button .n { font-family: var(--mono); font-weight: 400; color: var(--muted); }
+.tabs button[aria-selected="true"] { background: color-mix(in srgb, var(--sc) 18%, var(--panel)); border-color: color-mix(in srgb, var(--sc) 50%, transparent); }
+
+.notice { font-size: 13px; color: var(--muted); background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; padding: 12px 14px; }
+
+@media (max-width: 900px) { .brief { grid-template-columns: 1fr; } }
+@media (max-width: 760px) {
+  .board { grid-template-columns: 1fr; overflow-x: visible; }
+  .tabs:not([hidden]) { display: flex; }
+  .board .column:not(.on) { display: none; }
+  .board .col-head { display: none; }
+  h1 { font-size: 23px; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <section class="brief" aria-label="Бриф">
+    <div>
+      <div class="eyebrow"><span>Доска плана</span><span id="dateLabel"></span><span class="fresh" id="fresh"></span></div>
+      <h1 id="title">Доска плана</h1>
+      <p class="goal" id="goal">Загружаю бриф…</p>
+      <div class="facts">
+        <details id="criteriaBox" hidden><summary>Критерии приёмки</summary><ul id="criteria"></ul></details>
+        <details id="filesBox" hidden><summary>Файлы</summary><div class="files" id="files"></div></details>
+      </div>
+    </div>
+    <aside class="progress" aria-label="Прогресс">
+      <div class="big"><b id="doneCount">0</b><span id="doneOf">из 0 принято</span></div>
+      <div class="bar" id="bar" role="img" aria-label="Распределение задач по статусам"></div>
+      <div class="legend" id="legend"></div>
+    </aside>
+  </section>
+
+  <details class="ask" id="ask" hidden>
+    <summary>Нужно от тебя<span class="cnt" id="askCount"></span></summary>
+    <div id="askList"></div>
+  </details>
+
+  <div id="notice" class="notice">Загружаю задачи…</div>
+
+  <div class="toolbar" id="toolbar" hidden>
+    <label for="areaFilter">Область</label>
+    <select id="areaFilter"><option value="">Все</option></select>
+  </div>
+  <div class="tabs" id="tabs" role="tablist" aria-label="Статусы" hidden></div>
+  <div class="board" id="board" hidden></div>
+</div>
+
+<script>
+// The page only shows the board: the session writes every change, the user talks to it in chat.
+const STATUSES = [
+  { id: "todo", name: "Сделать" },
+  { id: "progress", name: "В работе" },
+  { id: "decision", name: "Вопрос к тебе" },
+  { id: "review", name: "На проверке" },
+  { id: "done", name: "Готово" },
+  { id: "later", name: "Отложено" },
+];
+// a question waiting for the user is still work in progress; finished work waits in its own column
+const COLUMNS = [
+  { id: "todo", name: "Сделать", statuses: ["todo"] },
+  { id: "progress", name: "В работе", statuses: ["decision", "progress"] },
+  { id: "review", name: "На проверке", statuses: ["review"] },
+  { id: "done", name: "Готово", statuses: ["done"] },
+  { id: "later", name: "Отложено", statuses: ["later"] },
+];
+const $ = (id) => document.getElementById(id);
+let tasks = [];
+let brief = {};
+let showAllDone = false;
+const openDetails = new Set(); // "<task id>/<field>" of the folds that are expanded
+let tab = "progress";
+try { tab = localStorage.getItem("board-tab") || tab; } catch (e) {}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function taskId(t) { return (brief.prefix || "T") + "-" + String(t.n || 0).padStart(2, "0"); }
+function ago(iso) {
+  const t = Date.parse(iso || ""); if (!t) return "";
+  const m = Math.round((Date.now() - t) / 60000);
+  if (m < 1) return "только что";
+  if (m < 60) return m + " мин назад";
+  const h = Math.round(m / 60); if (h < 24) return h + " ч назад";
+  const d = Math.round(h / 24); return d + " дн назад";
+}
+
+function renderBrief() {
+  document.title = brief.title || document.title;
+  $("title").textContent = brief.title || "Доска плана";
+  $("goal").textContent = brief.goal || "";
+  $("dateLabel").textContent = brief.date || "";
+  const cr = Array.isArray(brief.criteria) ? brief.criteria : [];
+  $("criteria").textContent = "";
+  for (const c of cr) $("criteria").appendChild(el("li", null, c));
+  $("criteriaBox").hidden = !cr.length;
+  const files = [["План", brief.plan], ["Бриф", brief.doc]].filter((f) => f[1]);
+  $("files").textContent = "";
+  for (const [k, v] of files) {
+    const row = el("div", "file");
+    const b = el("button", null, "Копировать"); b.type = "button";
+    b.addEventListener("click", () => {
+      navigator.clipboard.writeText(v).then(() => { b.textContent = "Скопировано"; setTimeout(() => (b.textContent = "Копировать"), 1500); })
+        .catch(() => { const r = document.createRange(); r.selectNodeContents(row.querySelector("code")); const s = getSelection(); s.removeAllRanges(); s.addRange(r); });
+    });
+    row.append(el("span", "k", k), el("code", null, v), b);
+    $("files").appendChild(row);
+  }
+  $("filesBox").hidden = !files.length;
+}
+
+function renderProgress() {
+  const total = tasks.length;
+  const by = Object.fromEntries(STATUSES.map((s) => [s.id, tasks.filter((t) => t.status === s.id).length]));
+  $("doneCount").textContent = by.done;
+  $("doneOf").textContent = "из " + total + " готово";
+  const bar = $("bar"); bar.textContent = "";
+  for (const s of STATUSES) {
+    if (!by[s.id]) continue;
+    const i = el("i"); i.style.width = (by[s.id] / total * 100) + "%"; i.style.background = `var(--s-${s.id})`; bar.appendChild(i);
+  }
+  const lg = $("legend"); lg.textContent = "";
+  for (const s of STATUSES) {
+    const sp = el("span"); const d = el("i", "dot"); d.style.background = `var(--s-${s.id})`;
+    sp.append(d, document.createTextNode(s.name), el("b", null, by[s.id])); lg.appendChild(sp);
+  }
+}
+
+// what the session is waiting on: questions to answer and work to check — answered in chat
+function renderAsk() {
+  const items = tasks.filter((t) => t.status === "decision" || t.status === "review")
+    .sort((a, b) => (a.status === "decision" ? 0 : 1) - (b.status === "decision" ? 0 : 1) || (a.n || 0) - (b.n || 0));
+  const list = $("askList"); list.textContent = "";
+  for (const t of items) {
+    const dec = t.status === "decision";
+    const row = el("div", "ask-row " + (dec ? "decision" : "review"));
+    const what = el("div", "what"); what.append(el("span", "id", taskId(t)), document.createTextNode(t.title || ""));
+    row.append(el("span", "kind", dec ? "Ответь" : "Проверь"), what);
+    const why = dec ? (t.question || t.note) : (t.check || t.note);
+    if (why) row.appendChild(el("div", "why", why));
+    list.appendChild(row);
+  }
+  $("askCount").textContent = items.length;
+  $("ask").hidden = !items.length;
+}
+
+function renderFresh() {
+  const stamps = tasks.map((t) => t.updatedAt).concat(brief.updatedAt || []).map((s) => Date.parse(s) || 0);
+  const last = Math.max(0, ...stamps);
+  $("fresh").textContent = last ? "обновлена " + ago(new Date(last).toISOString()) : "";
+}
+
+function renderBoard() {
+  const areas = [...new Set(tasks.map((t) => t.area).filter(Boolean))].sort();
+  const af = $("areaFilter"); const cur = af.value;
+  af.textContent = ""; af.appendChild(el("option", null, "Все")).value = "";
+  for (const a of areas) { const o = el("option", null, a); o.value = a; if (a === cur) o.selected = true; af.appendChild(o); }
+  $("toolbar").hidden = !areas.length;
+  const area = areas.includes(cur) ? cur : "";
+  const shown = tasks.filter((t) => !area || t.area === area);
+  const board = $("board"); board.textContent = "";
+  const tabs = $("tabs"); tabs.textContent = "";
+  if (!COLUMNS.some((c) => c.id === tab)) tab = "progress"; // a tab remembered from an older page
+  for (const s of COLUMNS) {
+    const list = shown.filter((t) => s.statuses.includes(t.status));
+    // Done: newest first, three shown, the rest behind a button; in progress: questions first;
+    // other columns by number
+    if (s.id === "done") list.sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
+    else list.sort((a, b) => s.statuses.indexOf(a.status) - s.statuses.indexOf(b.status) || (a.n || 0) - (b.n || 0));
+    const column = el("section", "column" + (s.id === tab ? " on" : "")); column.setAttribute("aria-label", s.name);
+    const head = el("div", "col-head"); const d = el("span", "dot"); d.style.background = `var(--s-${s.id})`;
+    head.append(d, el("span", null, s.name), el("span", "n", list.length));
+    column.appendChild(head);
+    if (!list.length) column.appendChild(el("div", "empty", "Пусто"));
+    const cut = s.id === "done" && !showAllDone && list.length > 3 ? 3 : list.length;
+    for (const t of list.slice(0, cut)) column.appendChild(card(t));
+    if (s.id === "done" && list.length > 3) {
+      const more = el("button", "more", showAllDone ? "Свернуть" : "Ещё " + (list.length - 3)); more.type = "button";
+      more.addEventListener("click", () => { showAllDone = !showAllDone; render(); });
+      column.appendChild(more);
+    }
+    board.appendChild(column);
+    const tb = el("button"); tb.type = "button"; tb.setAttribute("role", "tab");
+    tb.setAttribute("aria-selected", String(s.id === tab)); tb.style.setProperty("--sc", `var(--s-${s.id})`);
+    tb.append(el("span", "dot"), el("span", null, s.name), el("span", "n", list.length));
+    tb.addEventListener("click", () => { tab = s.id; try { localStorage.setItem("board-tab", tab); } catch (e) {} render(); });
+    tabs.appendChild(tb);
+  }
+}
+
+function card(t) {
+  const c = el("article", "task"); c.style.setProperty("--stripe", `var(--s-${t.status})`);
+  const top = el("div", "top"); top.append(el("span", "id", taskId(t)), el("span", "when", ago(t.updatedAt)));
+  c.append(top, el("div", "title", t.title || ""));
+  const chips = el("div", "chips");
+  if (t.status === "decision") chips.appendChild(el("span", "chip-decision", "Вопрос к тебе"));
+  if (t.area) chips.appendChild(el("span", "tag", t.area));
+  if (chips.childNodes.length) c.appendChild(chips);
+  // the task as planned, the session's question, its notes on how to check — one fold each
+  for (const [field, label] of [["note", "Подробности"], ["question", "Вопрос"], ["check", "Как проверить"]]) {
+    if (!t[field]) continue;
+    const key = t.id + "/" + field;
+    const d = el("details"); d.appendChild(el("summary", null, label));
+    d.open = openDetails.has(key);
+    d.addEventListener("toggle", () => { if (d.open) openDetails.add(key); else openDetails.delete(key); });
+    d.appendChild(el("p", null, t[field]));
+    c.appendChild(d);
+  }
+  return c;
+}
+
+function render() { renderProgress(); renderAsk(); renderBoard(); renderFresh(); }
+setInterval(renderFresh, 60000);
+
+function showNotice(text) { const n = $("notice"); n.textContent = text; n.hidden = false; }
+
+async function start() {
+  $("areaFilter").addEventListener("change", render);
+  const timer = setTimeout(() => showNotice("Задачи не загрузились. Откройте страницу на claude.ai, войдя в аккаунт."), 10000);
+  let db = null;
+  try { db = await window.claude?.use?.("db"); } catch (e) { db = null; }
+  if (!db) { clearTimeout(timer); showNotice("Задачи хранятся в базе страницы, а она здесь недоступна. Откройте страницу на claude.ai, войдя в аккаунт."); return; }
+  db.doc("meta/brief").onSnapshot((snap) => { brief = (snap.exists && snap.data()) || {}; renderBrief(); render(); }, () => {});
+  db.collection("tasks").onSnapshot((snap) => {
+    clearTimeout(timer);
+    tasks = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+    $("notice").hidden = true; $("board").hidden = false; $("tabs").hidden = false;
+    if (!tasks.length) showNotice("Задач пока нет. Их заводит скилл board из плана.");
+    render();
+  }, () => { clearTimeout(timer); showNotice("Не удалось загрузить задачи: нет доступа или пропала связь."); });
+}
+start();
+</script>

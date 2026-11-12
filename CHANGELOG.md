@@ -3,6 +3,42 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.3.0 — 2026-11-12
+
+### board (new)
+- **`/kensei-toolkit:board [plan.md | board-url]`** turns a plan into a task board: a private
+  claude.ai artifact with the plan's brief on top (goal, acceptance criteria, file paths) and one
+  task per step in columns To do / In progress / Review / Done / Later. It binds the session to the
+  board and stops — the skill does not do the tasks. With no argument the tasks come from this
+  conversation, after the user approves the draft; a board link continues a board in a new session.
+- **Read-only for the user, written by the session.** A question waiting for an answer (`decision`)
+  stays in In progress, marked on the card; work waiting for a check (`review`) has its own column;
+  both are listed under "Нужно от тебя"; the user answers, accepts or sends work back in chat, and
+  the session puts it on the board. A card keeps the task as planned (`note`, "Подробности") apart
+  from the session's question (`question`) and its notes for the check (`check`, "Как проверить"),
+  each in its own fold. Done only on the user's word.
+- **Stop hook `board-nudge`.** In a session bound to a board (marker
+  `~/.claude/task-boards/<session>.json`, written by `board.py arm`), a turn that did work — Edit,
+  Write, NotebookEdit, Bash that does more than read, PowerShell, Agent, Workflow — and made no
+  successful write to that board afterwards is handed back once, asking to update the board or to
+  say in one line that nothing on it moved. Bash counts as reading only when every command in it is
+  a known reader (`cat`, `grep`, `ls`, `git status`/`log`/`diff`, `sed -n`, `find` without
+  `-delete`/`-exec`, …) and nothing is written to a file; anything unknown counts as work. A turn
+  starts at any prompt from outside the model — typed, a background-task notification, an agent's
+  report, an SDK prompt — so a notification turn never re-reads the work of the turn before it;
+  messages queued mid-turn do not end it. Never twice in a row (`stop_hook_active`); sessions
+  without a marker exit in the shell wrapper before Python starts; markers older than 14 days are
+  ignored.
+- Without Artifact tools (an SDK or `claude -p` run) the skill says the board cannot be created,
+  shows the drafted brief and tasks, and arms nothing.
+- `board_test.py` (38 tests, in `scripts/check.sh`); evals `board-from-plan` and
+  `brainstorm-offers-board`.
+
+### brainstorm
+- **The closing question offers "Create a board"** next to save only, start here and revise the
+  plan, and the hand-off shows a second launch line, `claude "/kensei-toolkit:board <plan>"`.
+  Brainstorm only offers the board; it never creates one on its own.
+
 ## kensei-toolkit 2.2.3 — 2026-11-04
 
 ### game-vfx

@@ -104,13 +104,15 @@ The brainstorm ends with two files on disk and a question, with implementation n
    - open questions the executor must ask the user about rather than decide
 
    Concrete over generic: real paths, real names, real commands. Every step says how, not just "implement X".
-4. Show both paths and the ready-to-paste launch line, using the plan's absolute path:
+4. Show both paths and the ready-to-paste launch lines, using the plan's absolute path — the first runs the plan as is, the second starts from a task board for it:
    ```
    claude "Implement the plan in /abs/path/to/…-plan.md — read it and the brainstorm doc it links first"
+   claude "/kensei-toolkit:board /abs/path/to/…-plan.md"
    ```
 5. Ask via AskUserQuestion — "Design and plan are saved. What's next?":
    - **Save only** — stop here; the user picks the plan up whenever and wherever it suits them
    - **Start here** — implement in this session, following the plan file step by step
+   - **Create a board** — invoke `/kensei-toolkit:board <plan path>`: it turns the plan into a task board artifact the user follows and steers from any device, binds this session to it, and stops; implementation still waits for the user to say when
    - **Revise the plan** — the user describes the change in Other; apply it to the plan file, then ask again. If they pick it without saying what to change, ask in plain text.
 
    Implementation starts only on an explicit **Start here**.

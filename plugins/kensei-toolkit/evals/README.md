@@ -14,6 +14,8 @@ account, so CI does not run them; run them by hand after a skill change and befo
 | `unity-review-readonly` | unity-review | Mode from the argument, so no `AskUserQuestion`; no Edit or Write; the per-frame allocation in `EnemySpawner.Update` is reported with `path:line` and a failure scenario | reviewers editing code; asking for a mode already given |
 | `learn-asks-before-writing` | capture | Asks which items to apply before any write; the project gotcha goes to `CLAUDE.md`, the language preference to a user-level home; the `make test` line already in `CLAUDE.md` is not proposed again | writing before approval; duplicates; wrong home |
 | `todo-asks-before-creating` | capture | Drafts with evidence, asks which to create, no task created, no `TODO.md` written | creating tasks before approval; a stray `TODO.md` |
+| `board-from-plan` | board | `/kensei-toolkit:board <plan>` fires the skill; with no Artifact tool in an eval session it says the board cannot be created, shows the drafted tasks and stops: no made-up link, no `board.py arm`, no source file written or edited | the skill starting the plan's work; arming the Stop hook without a board. Publishing itself needs Artifact tools an eval session does not have — check it live (see the plan's live-check step) |
+| `brainstorm-offers-board` | brainstorm, board | A brainstorm told to save early writes the doc and plan, and its closing question offers a task board next to save / start / revise; the `board` skill is never invoked, no source edit | brainstorm creating a board on its own; the board option missing |
 
 ## Running
 
@@ -31,7 +33,7 @@ python3 evals/ticket-commit-at-gate/make_history.py
 python3 evals/ticket-commit-skill-at-gate/make_history.py
 claude plugin eval . --tag ticket --scaffold --allow-tools Bash Write Edit \
   --judge-model opus --runs 1 --ablation none --no-publish --max-cost-usd 10
-claude plugin eval . --tag unity-review capture --scaffold --allow-tools Bash Write Edit \
+claude plugin eval . --tag unity-review capture board --scaffold --allow-tools Bash Write Edit \
   --judge-model opus --runs 1 --ablation none --no-publish --max-cost-usd 6
 
 # check that every case loads, without running a model or a scaffold (the flags match a real
