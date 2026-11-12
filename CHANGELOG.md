@@ -3,6 +3,18 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.3.1 — 2026-11-12
+
+### board
+- **"Ждёт решения" is its own column.** A task waiting for the user's answer (`decision`) no
+  longer sits in In progress, where it looked like work going on; the board now has six columns:
+  To do / In progress / Needs decision / Review / Done / Later. Boards published before keep their
+  old page.
+- **The Stop hook checks statuses.** A turn whose last write to a task leaves a status outside the
+  six (the page would hide the task) or `progress` for a task that waits for the user — a
+  `question`, or a note or check saying it waits — is handed back to fix it, before the usual
+  "work without a board write" check.
+
 ## kensei-toolkit 2.3.0 — 2026-11-12
 
 ### board (new)

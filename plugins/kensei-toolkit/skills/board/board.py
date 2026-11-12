@@ -9,8 +9,11 @@
       If this turn did work (Edit, Write, NotebookEdit, Bash that does more than read, PowerShell,
       Agent, Workflow) and made no successful write to the bound board after the last piece of
       it, print a Stop-hook block whose reason asks the model to bring the board up to date — or
-      to say in one line that nothing on it moved. Prints nothing otherwise. Never blocks twice in
-      a row (stop_hook_active).
+      to say in one line that nothing on it moved. Also blocks when a task's last status written
+      this turn is wrong: not one of the board's statuses (the page would not show the task), or
+      `progress` while the task waits for the user (a question, or a note or check saying it
+      waits) — that is `decision` or `review`. Prints nothing otherwise. Never blocks twice in a
+      row (stop_hook_active).
 
 A turn starts at a prompt from outside the model: a typed message, a background-task
 notification, an agent's report, an SDK prompt. Messages queued while the model works do not end
@@ -33,6 +36,9 @@ BOARDS = os.path.expanduser(os.environ.get("KENSEI_TASK_BOARDS_DIR") or "~/.clau
 MARK_TTL = 14 * 24 * 3600
 WORK_TOOLS = {"Edit", "Write", "NotebookEdit", "Bash", "PowerShell", "Agent", "Workflow"}
 BOARD_WRITES = {"set", "update", "delete", "str_replace", "batch"}
+STATUSES = {"todo", "progress", "decision", "review", "done", "later"}
+WAITING = re.compile(r"жд[её]т\s+(?:тво(?:ей|его)\s+|ваш(?:ей|его)\s+)?(?:при[её]мки|проверки|решения|ответа)"
+                     r"|waits?(?:ing)?\s+for\s+(?:the\s+user|your|you)", re.I)
 # the skill's own calls to this script are bookkeeping, not work on a task
 SELF_CALL = re.compile(r"\bboard\.py\S{0,3}\s+(?:arm|disarm)\b")
 ARTIFACT_ID = re.compile(r"claude\.ai/(?:code/)?artifact/([A-Za-z0-9_-]+)")
@@ -117,6 +123,13 @@ REASON = (
     "with ArtifactData (status, check, question; review when you finished, done only on the "
     "user's word). If nothing on the board moved, say so in one short line and stop — do not "
     "write to the board just to satisfy this check.")
+
+STATUS_REASON = (
+    "Board check (kensei-toolkit:board): statuses written to the task board {url} this turn are "
+    "wrong: {wrong}. Valid statuses are exactly todo/progress/decision/review/done/later. A task "
+    "waiting for the user's answer is decision (with the question in `question`); done and "
+    "checked by you, waiting for the user's check, is review (with `check`); progress only while "
+    "work is actually going on. Fix those tasks now, then finish.")
 
 
 def marker(session_id):
@@ -232,6 +245,45 @@ def is_board_write(use, board):
         not use.get("failed")
 
 
+def written_tasks(use):
+    """(doc id, fields) for every task document an ArtifactData write sets or updates."""
+    inp = use.get("input") or {}
+    docs = inp.get("writes") if inp.get("action") == "batch" else [dict(inp, op=inp.get("action"))]
+    out = []
+    for d in docs if isinstance(docs, list) else []:
+        if not isinstance(d, dict) or d.get("op") not in {"set", "update"} or d.get("collection") != "tasks":
+            continue
+        fields = d.get("data")
+        if not isinstance(fields, dict) and d.get("file_path"):
+            try:
+                with open(d["file_path"], encoding="utf-8") as f:
+                    fields = json.load(f)
+            except (OSError, ValueError):
+                fields = None
+        if isinstance(fields, dict):
+            out.append((d.get("doc_id") or "?", fields))
+    return out
+
+
+def wrong_statuses(uses, board):
+    """Tasks whose last status written this turn the page would misplace or hide."""
+    last = {}  # doc id → fields of the last write that set its status; a later write may fix one
+    for use in uses:
+        if is_board_write(use, board):
+            for doc, fields in written_tasks(use):
+                if "status" in fields:
+                    last[doc] = fields
+    wrong = []
+    for doc, f in sorted(last.items()):
+        status = f.get("status")
+        if status not in STATUSES:
+            wrong.append(f"{doc}: status {json.dumps(status, ensure_ascii=False)} is not shown on the board")
+        elif status == "progress" and (isinstance(f.get("question"), str) and f["question"].strip()
+                                       or WAITING.search(f"{f.get('note', '')} {f.get('check', '')}")):
+            wrong.append(f"{doc}: progress, but it waits for the user — decision or review")
+    return wrong
+
+
 def needs_nudge(uses, board):
     last_work = last_write = -1
     for i, use in enumerate(uses):
@@ -249,7 +301,12 @@ def nudge(payload):
     transcript = payload.get("transcript_path")
     if not mark or not transcript or not os.path.isfile(transcript):
         return None
-    if not needs_nudge(turn_tool_uses(turn_entries(transcript)), artifact_id(mark["url"])):
+    uses, board = turn_tool_uses(turn_entries(transcript)), artifact_id(mark["url"])
+    wrong = wrong_statuses(uses, board)
+    if wrong:
+        return {"decision": "block",
+                "reason": STATUS_REASON.format(url=mark["url"], wrong="; ".join(wrong[:8]))}
+    if not needs_nudge(uses, board):
         return None
     return {"decision": "block", "reason": REASON.format(url=mark["url"])}
 

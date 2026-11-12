@@ -80,7 +80,7 @@ h1 { margin: 4px 0 8px; font-size: 28px; font-weight: 700; letter-spacing: -0.01
 /* board */
 .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .toolbar label { font-size: 12px; color: var(--muted); }
-.board { display: grid; grid-template-columns: repeat(5, minmax(220px, 1fr)); gap: 14px; align-items: start; overflow-x: auto; padding-bottom: 4px; }
+.board { display: grid; grid-template-columns: repeat(6, minmax(200px, 1fr)); gap: 14px; align-items: start; overflow-x: auto; padding-bottom: 4px; }
 .column { background: var(--col); border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .col-head { display: flex; align-items: center; gap: 8px; padding: 4px 4px 2px; font-weight: 600; font-size: 13px; }
 .col-head .n { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--muted); }
@@ -156,15 +156,16 @@ h1 { margin: 4px 0 8px; font-size: 28px; font-weight: 700; letter-spacing: -0.01
 const STATUSES = [
   { id: "todo", name: "Сделать" },
   { id: "progress", name: "В работе" },
-  { id: "decision", name: "Вопрос к тебе" },
+  { id: "decision", name: "Ждёт решения" },
   { id: "review", name: "На проверке" },
   { id: "done", name: "Готово" },
   { id: "later", name: "Отложено" },
 ];
-// a question waiting for the user is still work in progress; finished work waits in its own column
+// what waits for the user — an answer or a check — has its own column, apart from work going on
 const COLUMNS = [
   { id: "todo", name: "Сделать", statuses: ["todo"] },
-  { id: "progress", name: "В работе", statuses: ["decision", "progress"] },
+  { id: "progress", name: "В работе", statuses: ["progress"] },
+  { id: "decision", name: "Ждёт решения", statuses: ["decision"] },
   { id: "review", name: "На проверке", statuses: ["review"] },
   { id: "done", name: "Готово", statuses: ["done"] },
   { id: "later", name: "Отложено", statuses: ["later"] },
@@ -271,10 +272,9 @@ function renderBoard() {
   if (!COLUMNS.some((c) => c.id === tab)) tab = "progress"; // a tab remembered from an older page
   for (const s of COLUMNS) {
     const list = shown.filter((t) => s.statuses.includes(t.status));
-    // Done: newest first, three shown, the rest behind a button; in progress: questions first;
-    // other columns by number
+    // Done: newest first, three shown, the rest behind a button; other columns by number
     if (s.id === "done") list.sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
-    else list.sort((a, b) => s.statuses.indexOf(a.status) - s.statuses.indexOf(b.status) || (a.n || 0) - (b.n || 0));
+    else list.sort((a, b) => (a.n || 0) - (b.n || 0));
     const column = el("section", "column" + (s.id === tab ? " on" : "")); column.setAttribute("aria-label", s.name);
     const head = el("div", "col-head"); const d = el("span", "dot"); d.style.background = `var(--s-${s.id})`;
     head.append(d, el("span", null, s.name), el("span", "n", list.length));

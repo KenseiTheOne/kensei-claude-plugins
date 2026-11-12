@@ -71,6 +71,10 @@ def board_write(url=URL, action="update"):
     return use("ArtifactData", action=action, url=url, collection="tasks", doc_id="t01")
 
 
+def status_write(url=URL, doc="t01", **fields):
+    return use("ArtifactData", action="update", url=url, collection="tasks", doc_id=doc, data=fields)
+
+
 def transcript(*entries):
     fd, path = tempfile.mkstemp(suffix=".jsonl")
     with os.fdopen(fd, "w") as f:
@@ -110,6 +114,35 @@ class NudgeTest(unittest.TestCase):
         out = self.nudge(human("go"), board_write(), result(), use("Bash", command="make test"),
                          result())
         self.assertEqual(out["decision"], "block")
+
+    def test_status_outside_the_board_blocks(self):
+        out = self.nudge(human("go"), edit(), status_write(status="open"))
+        self.assertIn('t01: status "open"', out["reason"])
+
+    def test_progress_waiting_for_the_user_blocks(self):
+        for fields in ({"note": "Сделано, ждёт твоей проверки"}, {"check": "waiting for the user"},
+                       {"question": "Какой вариант?"}):
+            out = self.nudge(human("go"), status_write(status="progress", **fields))
+            self.assertIn("t01: progress, but it waits for the user", out["reason"])
+
+    def test_batch_status_is_checked(self):
+        batch = use("ArtifactData", action="batch", url=URL, writes=[
+            {"op": "set", "collection": "tasks", "doc_id": "t02", "data": {"status": "todo"}},
+            {"op": "update", "collection": "tasks", "doc_id": "t03", "data": {"status": "open"}}])
+        out = self.nudge(human("go"), batch)
+        self.assertIn("t03", out["reason"])
+        self.assertNotIn("t02", out["reason"])
+
+    def test_later_write_fixes_the_status(self):
+        self.assertIsNone(self.nudge(human("go"), edit(), status_write(status="progress", note="ждёт решения"),
+                                     status_write(status="decision", question="Какой?")))
+
+    def test_right_statuses_are_quiet(self):
+        self.assertIsNone(self.nudge(human("go"), status_write(status="review", check="ждёт твоей проверки"),
+                                     status_write(doc="t02", status="progress", note="делаю", question={"__delete__": True})))
+
+    def test_status_on_another_board_is_not_checked(self):
+        self.assertIsNone(self.nudge(human("go"), status_write(url=OTHER, status="open")))
 
     def test_read_only_turn_is_quiet(self):
         self.assertIsNone(self.nudge(human("что там?"), use("Read", file_path="/x"), result(),
