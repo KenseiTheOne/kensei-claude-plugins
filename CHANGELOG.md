@@ -3,6 +3,28 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.4.0 — 2026-11-20
+
+### diff-tour
+- **The page opens on a queue.** Two fresh reviewers read the whole diff from a brief
+  (`triage.md`) and raise *suspected* failures (a concrete input → wrong result) and *risks*
+  worth a human's look; the script's risk rules (serialized format, destructive commands,
+  build settings, weakened tests, the project's `.claude/review-risk`) and the author's own
+  note `kind` raise more. Everything else is folded, a click away in the whole diff. Only the
+  script folds: nobody — the author, the reviewers — can take a unit out of the queue.
+- **Notes do not move units.** A unit without a note is counted under the queue and marked
+  Unexplained in the whole diff, but not raised for that alone.
+- **Rules come from the base.** The noise list, the risk rules and `.gitattributes` are read at
+  the base of the change (`git --attr-source`, git 2.40+), so a change cannot hide its own lines
+  or switch its own rules off; `build` re-reads them instead of trusting `hunks.json`. Noise files
+  still go through the risk rules.
+- **The test rule raises only weakening**: fewer tests or asserts, a skip added, a file moved out
+  of the test path. Swift `@Test`, `#expect`, `XCTAssert` and `*.spec.*` are recognised.
+- **Build checks the triage**: two reviewer files are required; a broken, oversized or
+  out-of-range file is reported, not a crash; a reviewer that read only part of the diff is
+  named on the page.
+- **git 2.40 or newer** is now required for diff-tour.
+
 ## kensei-toolkit 2.3.1 — 2026-11-12
 
 ### board

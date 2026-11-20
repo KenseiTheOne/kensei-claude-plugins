@@ -11,16 +11,21 @@
       A and B may be commits or tree ids (a `git write-tree` result). A...B: from the merge-base
       of two commits. Run directories go under DIR/<repo>/ (default ~/.cache/kensei-diff), private
       to the user; the newest KEEP_RUNS per repository are kept.
-  difftour.py build RUN_DIR [--open]
-      Check RUN_DIR/notes.json against the snapshot, render RUN_DIR/index.html, print the
-      counts and every unexplained unit. Exit 1 with the list of problems if notes.json is
-      invalid; exit 2 on any other error.
+  difftour.py build RUN_DIR [--open] [--all]
+      Check RUN_DIR/notes.json and the reviewers' RUN_DIR/triage-*.json against the snapshot,
+      render RUN_DIR/index.html, print the queue, the counts and every unexplained unit. The
+      page opens on the queue: suspected failures, then units worth a look (a reviewer's
+      question, a risk rule, an author's flag, no note), the rest folded. --all: the whole diff
+      only, no triage files needed. Exit 1 with the list of problems if notes.json or a triage
+      file is invalid, or there are no triage files without --all; exit 2 on any other error.
 
 A unit is one @@ hunk (id hN), or a whole file when the file has no hunks (binary, pure rename,
 mode change — also hN) or matches a noise pattern (nN). Code reaches the page only from
 patch.diff; notes.json refers to units by id, anchors a note under one line by quoting a piece
 of it, and never carries code. A unit no note mentions is shown as "Unexplained" — that is the
-page's signal, not an error. Nothing here writes to the repository or its index.
+page's signal, not an error. Risk rules (built-in, plus .claude/review-risk read from the base)
+and the reviewers can only raise a unit into the queue; only the script folds the rest. Nothing
+here writes to the repository or its index.
 """
 
 import argparse
@@ -41,7 +46,41 @@ import webbrowser
 
 OUT_ROOT = os.path.expanduser("~/.cache/kensei-diff")
 KEEP_RUNS = 20         # run directories kept per repository; older ones are deleted by collect
-NOISE_FILE = ".claude/diff-tour-noise"
+NOISE_FILE = ".claude/diff-tour-noise"  # project noise patterns, read from the base commit
+RISK_FILE = ".claude/review-risk"        # project risk rules, read from the base commit
+# Risk rules: what puts a unit into the queue's risk list whatever the reviewers say. One rule
+# per line: `path <glob>` (noise-file syntax, old or new path), `line <regex>` (an added or
+# removed line), `section <regex>` (the code around the change: the hunk's @@ context or any
+# of its unchanged lines, e.g. the enum whose members it edits).
+DEFAULT_RISK = [
+    # serialized and networked format
+    r"line \[MemoryPack(Order|able|Ignore|Union|Constructor)\b",
+    r"line \bIRpcCommand\b|\[Ghost(Field|Component)\b",
+    r"line \[Meta(Method|Service)\b|\bExecutionMode\.",
+    r"section \benum\b",
+    r"line \benum\s+\w+",
+    r"line \b(MajorMinor|ClientVersion|bundleVersion|schema_?[vV]ersion)\b|\"schema\"\s*:",
+    # who may do what
+    r"line \b(forbidden_paths|deny_tools|allowed_?tools|trusted_authors|RequirePermission)\b",
+    # destructive operations
+    r"line \bprocess\.kill\b|\bkill(Tree|Orphans)?\(|\bfs\.rm\b|\b(rm|rmdir|unlink)Sync\(",
+    r"line \brm -[a-zA-Z]*[rf]|\b(Directory|File)\.Delete\(|AssetDatabase\.DeleteAsset\(",
+    r"line (reset --hard|clean -[a-z]*f|worktree remove|branch -D|push\b.*(--force|\s-f\b))",
+    # build and module boundaries
+    "path *.asmdef", "path *.asmref", "path ProjectSettings/", "path Packages/manifest.json",
+    "path appsettings*.json", "path .github/workflows/",
+    # what decides how this tour itself folds and shows the diff
+    "path " + NOISE_FILE, "path " + RISK_FILE, "path .gitattributes",
+]
+RISK_KINDS = ("path", "line", "section")
+TEST_PATH = re.compile(r"(^|/)(?i:tests?|__tests__)/|\.Tests?(\.|/)|Tests?\.(cs|swift)$|"
+                       r"\.(test|spec)\.[a-z]+$|(^|/)test_[^/]*\.py$|_test\.(py|go)$")
+TEST_DEF = re.compile(r"\[(Test|UnityTest|TestCase|Fact|Theory)\b|@Test\b|^\s*(test|it)\(|"
+                      r"^\s*(async\s+)?def test_|\bfunc test\w*\(")
+ASSERT = re.compile(r"\bAssert\.|\bassert\w*\b|\bexpect\(|#require\(|\bXCTAssert|\bShould\b")
+SKIP = re.compile(r"\[(Ignore|Explicit)\b|@(unittest\.)?skip|pytest\.mark\.(skip|xfail)|"
+                  r"\.(skip|only)\(|\b(xit|xdescribe|xtest)\(|Assert\.(Ignore|Inconclusive)\(|"
+                  r"\bXCTSkip|\bt\.Skip\(|#\[ignore\]")
 DEFAULT_NOISE = [
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
     "Cargo.lock", "poetry.lock", "Pipfile.lock", "uv.lock", "Gemfile.lock", "composer.lock",
@@ -147,14 +186,16 @@ def take(root, spec):
 
     Untracked files join the diff as intent-to-add entries of a throwaway copy of the index, so
     git shows them the way a commit would (a symlink stays a link, never followed) in one call.
-    The user's index is only read."""
+    The user's index is only read. Attributes come from the base, so a change cannot hide its
+    own lines behind a new `-diff` or `binary` in .gitattributes."""
+    attrs = "--attr-source=" + base_of(root, spec)
     if spec["mode"] == "range":
-        return git(root, "diff", *DIFF_FLAGS, "-M", spec["range"], "--"), []
+        return git(root, attrs, "diff", *DIFF_FLAGS, "-M", spec["range"], "--"), []
     listing = git(root, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
     skipped = [os.fsdecode(p) for p in listing if p.endswith(b"/")]  # nested repositories
     untracked = [p for p in listing if p and not p.endswith(b"/")]
     if not untracked:
-        return git(root, "diff", *DIFF_FLAGS, "-M", spec["sha"], "--"), skipped
+        return git(root, attrs, "diff", *DIFF_FLAGS, "-M", spec["sha"], "--"), skipped
     scratch = tempfile.mkdtemp(prefix="difftour-")
     try:
         index = os.path.join(scratch, "index")
@@ -166,7 +207,8 @@ def take(root, spec):
         git(root, "-c", "core.splitIndex=false", "--literal-pathspecs", "add", "-N",
             "--pathspec-from-file=-", "--pathspec-file-nul", index=index,
             stdin=b"\0".join(untracked))
-        return git(root, "diff", *DIFF_FLAGS, "-M", spec["sha"], "--", index=index), skipped
+        return (git(root, attrs, "diff", *DIFF_FLAGS, "-M", spec["sha"], "--", index=index),
+                skipped)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -356,13 +398,116 @@ def parse(text):
     return files
 
 
-def project_noise(root):
-    try:
-        with open(os.path.join(root, NOISE_FILE), encoding="utf-8") as fh:
-            lines = [ln.strip() for ln in fh]
-    except OSError:
-        return []
+def patterns_of(text):
+    lines = [ln.strip() for ln in text.splitlines()]
     return [ln for ln in lines if ln and not ln.startswith("#")]
+
+
+def base_of(root, spec):
+    """The commit (or tree) the diff starts from — the state the change could not have edited."""
+    if spec["mode"] == "worktree":
+        return spec["sha"]
+    a, dots, b = spec["range"].partition("...")
+    if dots:
+        base = git(root, "merge-base", a or "HEAD", b or "HEAD", ok=(0, 1)).decode().strip()
+        if not base:
+            raise Fail(f"{a or 'HEAD'} and {b or 'HEAD'} share no history: use a..b")
+        return base
+    return spec["range"].partition("..")[0] or "HEAD"
+
+
+def new_of(spec):
+    """The commit or tree of the diff's new side, or None for the working tree."""
+    if spec["mode"] == "worktree":
+        return None
+    return spec["range"].replace("...", "..").partition("..")[2] or "HEAD"
+
+
+def base_patterns(root, spec, name):
+    """The project's patterns file as the base has it: a change that edits or adds the file is
+    still judged by the old list, so it cannot take its own lines out of the queue."""
+    base = base_of(root, spec)
+    if not git(root, "rev-parse", "--verify", "--quiet", base + "^{tree}", ok=(0, 1)).strip():
+        raise Fail(f"the base {base} is not in the repository any more")
+    out = git(root, "show", f"{base}:{name}", ok=(0, 128))
+    return patterns_of(out.decode("utf-8", "replace"))
+
+
+def rules_at_base(root, spec):
+    """(noise patterns, risk rules): the built-in ones and the project's, both from the base."""
+    return (DEFAULT_NOISE + base_patterns(root, spec, NOISE_FILE),
+            DEFAULT_RISK + base_patterns(root, spec, RISK_FILE))
+
+
+def risk_rules(rules):
+    """(kind, body, compiled regex or None) per valid rule, and the rules that are not valid."""
+    out, bad = [], []
+    for r in rules:
+        kind, _, body = r.partition(" ")
+        body = body.strip()
+        if kind not in RISK_KINDS or not body:
+            bad.append(r)
+            continue
+        if kind == "path":
+            out.append((kind, body, None))
+            continue
+        try:
+            out.append((kind, body, re.compile(body)))
+        except re.error:
+            bad.append(r)
+    return out, bad
+
+
+def short(s, n=90):
+    s = s.strip()
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def unit_risk(f, hunks, rules):
+    """Why the script puts a unit — the hunks of file `f` it covers, none for a file without
+    hunks — into the risk list: (kind, detail) pairs. A file moved out of a risky path is still
+    risky, and so is a test file moved out of the tests."""
+    out = []
+    for kind, body, rx in rules:
+        if kind == "path":
+            if any(is_noise(p, [body]) for p in (f["old"], f["new"]) if p):
+                out.append(("path", body))
+            continue
+        for h in hunks:
+            if kind == "section":
+                hit = next((t for t in [h["section"]] + [t for tag, t in h["lines"] if tag == " "]
+                            if rx.search(t)), None)
+            else:
+                hit = next((t for tag, t in h["lines"] if tag in "+-" and rx.search(t)), None)
+            if hit is not None:
+                out.append((kind, short(hit)))
+                break
+    out += weakened_test(f, hunks)
+    seen = set()
+    return [x for x in out if not (x in seen or seen.add(x))]
+
+
+def weakened_test(f, hunks):
+    """An existing test that checks less: fewer tests or asserts than before, a skip added, or
+    the file moved out of the tests. A rewritten assert with the same count is the reviewers'
+    to judge — the script cannot tell a tighter one from a looser one."""
+    if not (f["old"] and TEST_PATH.search(f["old"])):
+        return []
+    if f["new"] and not TEST_PATH.search(f["new"]):
+        return [("test", f"moved out of the tests: {f['new']}")]
+
+    def count(tag, rx):
+        return sum(1 for h in hunks for t, s in h["lines"] if t == tag and rx.search(s))
+    tests = (count("-", TEST_DEF), count("+", TEST_DEF))
+    asserts = (count("-", ASSERT), count("+", ASSERT))
+    out = []
+    if tests[0] > tests[1] or asserts[0] > asserts[1]:
+        out.append(("test", f"tests −{tests[0]} +{tests[1]}, asserts −{asserts[0]} "
+                            f"+{asserts[1]}"))
+    skip = next((s for h in hunks for t, s in h["lines"] if t == "+" and SKIP.search(s)), None)
+    if skip is not None:
+        out.append(("test", short(skip)))
+    return out
 
 
 def is_noise(path, patterns):
@@ -387,25 +532,32 @@ def is_noise(path, patterns):
     return False
 
 
-def make_units(files, patterns):
+def make_units(files, patterns, risk=()):
+    """One unit per hunk, or per file without hunks; a noise file is one unit, and the risk
+    rules still read all of it."""
+    rules, _ = risk_rules(risk)
     units, h, n = [], 0, 0
     for fi, f in enumerate(files):
         f["noise"] = is_noise(f["new"] or f["old"], patterns)
         if f["noise"]:
             n += 1
-            units.append({"id": f"n{n}", "file": fi, "hunk": None})
+            units.append({"id": f"n{n}", "file": fi, "hunk": None,
+                          "risk": unit_risk(f, f["hunks"], rules)})
         elif not f["hunks"]:
             h += 1
-            units.append({"id": f"h{h}", "file": fi, "hunk": None})
+            units.append({"id": f"h{h}", "file": fi, "hunk": None,
+                          "risk": unit_risk(f, [], rules)})
         else:
-            for hi in range(len(f["hunks"])):
+            for hi, hunk in enumerate(f["hunks"]):
                 h += 1
-                units.append({"id": f"h{h}", "file": fi, "hunk": hi})
+                units.append({"id": f"h{h}", "file": fi, "hunk": hi,
+                              "risk": unit_risk(f, [hunk], rules)})
     return units
 
 
 def load_snapshot(run_dir):
-    """Re-parse patch.diff, after checking it is the file collect wrote."""
+    """Re-parse patch.diff, after checking it is the file collect wrote. The noise patterns and
+    risk rules are read again from the base, not taken from hunks.json, which anyone can edit."""
     try:
         with open(os.path.join(run_dir, "hunks.json"), encoding="utf-8") as fh:
             meta = json.load(fh)["meta"]
@@ -416,7 +568,11 @@ def load_snapshot(run_dir):
     if sha256(patch) != meta["sha256"]:
         raise Fail("patch.diff was modified after collect — rerun collect")
     files = parse(patch.decode("utf-8", "replace"))
-    return meta, files, make_units(files, meta["patterns"])
+    try:
+        patterns, risk = rules_at_base(meta["root"], meta["spec"])
+    except (Fail, OSError) as e:
+        raise Fail(f"cannot re-read the noise and risk rules at the base: {e}") from None
+    return meta, files, make_units(files, patterns, risk)
 
 
 # --- unit descriptions -------------------------------------------------------------------
@@ -463,7 +619,8 @@ def index_entry(files, u):
         where = (src["header"] + " " + src["section"]).strip()
     tags = ", ".join(INDEX_FACTS[k].format(**a) for k, a in facts(f))
     return {"id": u["id"], "status": f["status"], "path": unit_path(f), "where": where,
-            "facts": tags, "added": src["added"], "removed": src["removed"], "line": src["line"]}
+            "facts": tags, "risk": [f"{k}: {d}" for k, d in u["risk"]],
+            "added": src["added"], "removed": src["removed"], "line": src["line"]}
 
 
 # --- collect -----------------------------------------------------------------------------
@@ -540,18 +697,21 @@ def collect(arg, out_root):
         for path in skipped:
             print(f"Skipped untracked nested repository: {path}")
         return 0
-    patterns = DEFAULT_NOISE + project_noise(root)
     files = parse(patch.decode("utf-8", "replace"))
     if not files:
         first = patch.decode("utf-8", "replace").strip().splitlines()[0]
         raise Fail(f"git printed a diff diff-tour cannot read (it starts with {first!r})")
-    units = make_units(files, patterns)
+    patterns, risk = rules_at_base(root, spec)
+    _, bad_rules = risk_rules(risk)
+    units = make_units(files, patterns, risk)
     repo = os.path.basename(root)
     run_dir = new_run_dir(out_root, repo)
     with open(os.path.join(run_dir, "patch.diff"), "wb") as fh:
         fh.write(patch)
+    # old_rev / new_rev: where a reviewer reads a file's context (new_rev None: the working tree)
     meta = {"root": root, "repo": repo, "branch": branch(root), "spec": spec,
-            "patterns": patterns, "skipped": skipped, "sha256": sha256(patch),
+            "old_rev": base_of(root, spec), "new_rev": new_of(spec),
+            "patterns": patterns, "risk": risk, "skipped": skipped, "sha256": sha256(patch),
             "collected": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
     index = [index_entry(files, u) for u in units]
     with open(os.path.join(run_dir, "hunks.json"), "w", encoding="utf-8") as fh:
@@ -570,6 +730,11 @@ def collect(arg, out_root):
         line += (f" (noise: {len(noisy)} files, +{sum(f['added'] for f in noisy)}"
                  f" -{sum(f['removed'] for f in noisy)})")
     print(line)
+    risky = [u for u in units if u["risk"]]
+    if risky:
+        print(f"Risk rules (built-in + {RISK_FILE} at the base): {len(risky)} units")
+    for r in bad_rules:
+        print(f"WARNING: {RISK_FILE}: not a valid rule, skipped: {r!r}")
     patch_lines = patch.count(b"\n")
     print(f"patch.diff: {patch_lines} lines")
     for path in skipped:
@@ -581,6 +746,8 @@ def collect(arg, out_root):
     width = max(len(e["path"]) for e in index)
     for e in index:
         tags = f"[{e['facts']}]" if e["facts"] else ""
+        if e["risk"]:
+            tags += f" [risk {'; '.join(e['risk'])}]"
         text = " ".join(x for x in (e["where"], tags) if x)
         print(f"{e['id']:<5} {e['status']}  {e['path']:<{width}}  {text}  "
               f"+{e['added']} -{e['removed']}  L{e['line']}")
@@ -754,6 +921,81 @@ def validate(notes, files, units):
     return errs
 
 
+# --- triage ------------------------------------------------------------------------------
+
+TRIAGE_KEYS = {"units_seen", "suspects", "risks"}
+TRIAGE_ITEMS = (("suspects", "text"), ("risks", "check"))
+
+
+TRIAGE_MIN = 2  # reviewers the triage step runs; build waits for all of them
+
+
+def load_triage(run_dir, units):
+    """Every triage-<name>.json a fresh reviewer wrote, as [{name, units_seen, suspects, risks}],
+    and the problems in them. Each reviewer has a file of its own; nothing is merged away."""
+    ids = {u["id"] for u in units}
+    reviews, errs = [], []
+    names = sorted(fn for fn in os.listdir(run_dir)
+                   if fn.startswith("triage-") and fn.endswith(".json"))
+    if 0 < len(names) < TRIAGE_MIN:
+        errs.append(f"{len(names)} triage file(s) ({', '.join(names)}) — the triage step runs "
+                    f"{TRIAGE_MIN} reviewers; wait for the others")
+    for fn in names:
+        try:
+            with open(os.path.join(run_dir, fn), encoding="utf-8") as fh:
+                t = json.load(fh)
+        except (OSError, ValueError, RecursionError) as e:
+            errs.append(f"{fn}: not valid JSON ({e})")
+            continue
+        if not isinstance(t, dict):
+            errs.append(f"{fn}: must be an object")
+            continue
+        for k in sorted(set(t) - TRIAGE_KEYS):
+            errs.append(f"{fn}: unknown key {k!r}")
+        seen = t.get("units_seen")
+        if not isinstance(seen, int) or isinstance(seen, bool) or not 0 <= seen <= len(units):
+            errs.append(f"{fn}: units_seen must be the number of units the reviewer read "
+                        f"(0–{len(units)})")
+        for key, field in TRIAGE_ITEMS:
+            items = t.get(key, [])
+            if not isinstance(items, list):
+                errs.append(f"{fn}: {key} must be a list")
+                continue
+            for i, it in enumerate(items):
+                if not isinstance(it, dict) or not isinstance(it.get("unit"), str) \
+                        or it["unit"] not in ids:
+                    errs.append(f"{fn}: {key}[{i}]: unit must be an id from hunks.json")
+                elif not text_ok(it.get(field)):
+                    errs.append(f"{fn}: {key}[{i}]: {field} must be non-empty text")
+        reviews.append({"name": fn[len("triage-"):-len(".json")], "units_seen": seen,
+                        "suspects": t.get("suspects", []), "risks": t.get("risks", [])})
+    return reviews, errs
+
+
+def queue(units, notes, reviews):
+    """(suspects, reasons): suspects are units a reviewer named a concrete failure in, as
+    {unit id: [(reviewer, text)]}; reasons are why any unit is worth a look whatever the
+    reviewers think — the script's risk rules, a reviewer's risk list, the author's own flags —
+    as {unit id: [(source, key, text)]}. Only the script folds: a unit leaves the queue when
+    nobody and no rule raised it; nothing raised can be dropped here. Having a note or not
+    moves no unit either way: on a big diff most units have none, and a note is the author's
+    word, not a check."""
+    suspects, reasons = {}, {}
+    for r in reviews:
+        for s in r["suspects"]:
+            suspects.setdefault(s["unit"], []).append((r["name"], s["text"]))
+    for u in units:
+        for k, d in u["risk"]:
+            reasons.setdefault(u["id"], []).append(("script", k, d))
+    for r in reviews:
+        for it in r["risks"]:
+            reasons.setdefault(it["unit"], []).append(("reviewer", r["name"], it["check"]))
+    for n in notes["notes"]:
+        if n.get("kind"):
+            reasons.setdefault(n["unit"], []).append(("author", n["kind"], ""))
+    return suspects, reasons
+
+
 # --- moved blocks ------------------------------------------------------------------------
 
 MOVED_MIN = 3         # lines in a block before it is shown as moved
@@ -821,12 +1063,28 @@ LABELS = {
         "nonl": "no newline at end of file",
         "flag": {"untested": "Untested", "decision": "Debatable decision",
                  "temporary": "Temporary code", "stray": "Stray change"},
-        "fact": {"noise": "noise", "new": "new file", "deleted": "deleted",
+        "fact": {"noise": "noise",
+                 "new": "new file", "deleted": "deleted",
                  "renamed": "renamed from {old} ({pct}%)", "mode": "mode {a} → {b}",
                  "binary": "binary", "empty": "empty file"},
         "body": {"binary": "Binary content changed — not shown.",
                  "renamed": "Renamed without content changes.",
                  "mode": "Only the file mode changed.", "empty": "Empty file."},
+        "q": {"title": "What to look at", "mode": "Page", "queue": "Queue", "all": "Whole diff",
+              "verdict": "{s} suspected · {r} worth a look · {k} of {t} units folded",
+              "empty": "Nothing to look at: no reviewer and no rule raised any unit.",
+              "suspects": "Suspected failures", "risks": "Worth a look",
+              "folded": "The other {k} units are folded: neither the reviewers nor the risk "
+                        "rules found anything there. They are in the whole diff.",
+              "code": "code", "by_all": "all reviewers", "by": "reviewer {name}",
+              "partial": "reviewer {name} read only {seen} of {total} units: what it did not "
+                         "read was checked by the other reviewers and the rules alone",
+              "loose_count": "{n} units have no author note. That alone does not raise them: "
+                             "they are listed in the Self-check panel and marked in the whole "
+                             "diff.",
+              "why": {"path": "path", "line": "line", "section": "inside",
+                      "test": "test weakened"},
+              "author": "author: {flag}"},
     },
     "ru": {
         "unexplained": "Не объяснено", "no_what": "без описания", "selfcheck": "Самопроверка",
@@ -852,12 +1110,29 @@ LABELS = {
         "nonl": "нет перевода строки в конце файла",
         "flag": {"untested": "Не проверено", "decision": "Спорное решение",
                  "temporary": "Временный код", "stray": "Лишнее в хунке"},
-        "fact": {"noise": "шум", "new": "новый файл", "deleted": "удалён",
+        "fact": {"noise": "шум",
+                 "new": "новый файл", "deleted": "удалён",
                  "renamed": "переименован из {old} ({pct}%)", "mode": "режим {a} → {b}",
                  "binary": "бинарный", "empty": "пустой файл"},
         "body": {"binary": "Бинарное содержимое изменено — не показано.",
                  "renamed": "Переименование без изменений содержимого.",
                  "mode": "Изменился только режим файла.", "empty": "Пустой файл."},
+        "q": {"title": "Что смотреть", "mode": "Страница", "queue": "Очередь",
+              "all": "Весь дифф",
+              "verdict": "подозрений: {s} · стоит взглянуть: {r} · свёрнуто {k} из {t} блоков",
+              "empty": "Смотреть нечего: ни ревьюеры, ни правила не подняли ни одного блока.",
+              "suspects": "Подозрения", "risks": "Стоит взглянуть",
+              "folded": "Остальные {k} блоков свёрнуты: ни ревьюеры, ни правила риска там "
+                        "ничего не нашли. Они есть во всём диффе.",
+              "code": "код", "by_all": "все ревьюеры", "by": "ревьюер {name}",
+              "partial": "ревьюер {name} прочёл только {seen} из {total} блоков: остальное "
+                         "проверили лишь другие ревьюеры и правила",
+              "loose_count": "Без заметки автора: {n} блоков. Сами по себе они в очередь не "
+                             "поднимаются — список в «Самопроверке», во всём диффе они "
+                             "помечены.",
+              "why": {"path": "путь", "line": "строка", "section": "внутри",
+                      "test": "тест ослаблен"},
+              "author": "автор: {flag}"},
     },
 }
 
@@ -877,6 +1152,8 @@ def asset(name):
 PAGE = string.Template(asset("page.html"))
 CSS = asset("page.css").replace("%DARK%", asset("dark.css")) + "\n"
 PAGE_JS = asset("page.js") + "\n"
+QUEUE_CSS = asset("queue.css") + "\n"
+QUEUE_JS = asset("queue.js") + "\n"
 
 
 def esc(s):
@@ -954,6 +1231,7 @@ class Page:
         self.loose = [u for u in units if u["id"] not in noted]
         self.loose_ids = {u["id"] for u in self.loose}
         self.what = notes.get("unexplained", {})
+        self.notes = notes["notes"]
         self.hunk_unit = {(u["file"], u["hunk"]): u for u in units if u["hunk"] is not None}
         self.file_unit = {u["file"]: u for u in units if u["hunk"] is None}
         self.units_of = {}
@@ -1032,17 +1310,22 @@ class Page:
         rows = [f'<table class="diff unified{" solo" if solo else ""}"{attr}>']
         for hi, h in enumerate(f["hunks"]):
             rows += self.hunk_row(fi, hi, h, 4)
-            for r in numbered(h):
-                if (fi, hi, r["li"]) in self.moved:
-                    cls, sign = "moved", "−" if r["tag"] == "-" else "+"
-                else:
-                    cls, sign = {"+": ("add", "+"), "-": ("del", "−"), " ": ("", " ")}[r["tag"]]
-                rows.append(f'<tr class="{cls}"><td class="ln">{r["o"]}</td>'
-                            f'<td class="ln">{r["n"]}</td><td class="sign">{sign}</td>'
-                            f'{self.cell(r)}</tr>')
-                rows += self.rows_of(self.after(fi, hi, r), 4)
+            rows += self.unified_rows(fi, hi, h)
         rows.append("</table>")
         return "".join(rows)
+
+    def unified_rows(self, fi, hi, h):
+        rows = []
+        for r in numbered(h):
+            if (fi, hi, r["li"]) in self.moved:
+                cls, sign = "moved", "−" if r["tag"] == "-" else "+"
+            else:
+                cls, sign = {"+": ("add", "+"), "-": ("del", "−"), " ": ("", " ")}[r["tag"]]
+            rows.append(f'<tr class="{cls}"><td class="ln">{r["o"]}</td>'
+                        f'<td class="ln">{r["n"]}</td><td class="sign">{sign}</td>'
+                        f'{self.cell(r)}</tr>')
+            rows += self.rows_of(self.after(fi, hi, r), 4)
+        return rows
 
     def side(self, fi, hi, r, num, changed):
         if r is None:
@@ -1081,6 +1364,85 @@ class Page:
                             rows += self.rows_of(self.after(fi, hi, r2), 4)
         rows.append("</table>")
         return "".join(rows)
+
+    # queue
+
+    def queue_item(self, u, cls, lines):
+        f = self.files[u["file"]]
+        where = ""
+        if u["hunk"] is not None:
+            h = f["hunks"][u["hunk"]]
+            head = f'{h["header"]} {h["section"]}'.strip()
+            where = f'<span class="where">{esc(head)}</span>'
+        out = [f'<li class="qi {cls}"><div class="qhead"><a href="#f{u["file"]}" '
+               f'data-unit="{esc(u["id"])}">{esc(u["id"])}</a><span class="fpath">'
+               f'{esc(unit_path(f))}</span>{where}</div>'
+               f'<ul class="qwhy">{"".join(lines)}</ul>']
+        if u["hunk"] is not None:
+            h = f["hunks"][u["hunk"]]
+            lang = lang_of(unit_path(f)) if self.highlight else None
+            attr = f' data-lang="{lang}"' if lang else ""
+            out.append(f'<details class="qcode"><summary>{esc(self.L["q"]["code"])}</summary>'
+                       f'<div class="scroll"><table class="diff unified solo"{attr}>'
+                       f'{"".join(self.unified_rows(u["file"], u["hunk"], h))}</table></div>'
+                       f'</details>')
+        out.append("</li>")
+        return "".join(out)
+
+    def reason_line(self, src, key, text):
+        Q = self.L["q"]
+        if src == "script":
+            return (f'<li><span class="pill warn">{esc(Q["why"][key])}</span>'
+                    f'<span><code>{esc(text)}</code></span></li>')
+        if src == "reviewer":
+            return (f'<li><span class="pill warn">?</span><span>{prose(text)} '
+                    f'<span class="by">{esc(Q["by"].format(name=key))}</span></span></li>')
+        flag = Q["author"].format(flag=self.L["flag"][key])
+        return f'<li><span class="pill warn">{esc(flag)}</span><span></span></li>'
+
+    def queue(self, reviews):
+        Q = self.L["q"]
+        suspects, reasons = queue(self.units, {"notes": self.notes}, reviews)
+        sus = [u for u in self.units if u["id"] in suspects]
+        risk = [u for u in self.units if u["id"] in reasons and u["id"] not in suspects]
+        folded = len(self.units) - len(sus) - len(risk)
+        names = [r["name"] for r in reviews]
+        verdict = Q["verdict"].format(s=len(sus), r=len(risk), k=folded, t=len(self.units))
+        out = [f'<section class="queue"><p class="verdict">{esc(verdict)}</p>']
+        partial = [Q["partial"].format(name=r["name"], seen=r["units_seen"], total=len(self.units))
+                   for r in reviews if r["units_seen"] < len(self.units)]
+        if partial:
+            out.append(f'<ul class="warns">{"".join(f"<li>{esc(p)}</li>" for p in partial)}</ul>')
+        if self.loose:
+            loose = Q["loose_count"].format(n=len(self.loose))
+            out.append(f'<p class="folded">{esc(loose)}</p>')
+        if not sus and not risk:
+            out.append(f'<p class="empty">{esc(Q["empty"])}</p>')
+        if sus:
+            out.append(f'<h2>{esc(Q["suspects"])}</h2><ol>')
+            for u in sus:
+                by = {}
+                for name, text in suspects[u["id"]]:
+                    by.setdefault(text, []).append(name)
+                lines = []
+                for text, who in by.items():
+                    label = Q["by_all"] if len(names) > 1 and set(who) == set(names) else \
+                        Q["by"].format(name=", ".join(who))
+                    lines.append(f'<li><span class="pill bad">!</span><span>{prose(text)} '
+                                 f'<span class="by">{esc(label)}</span></span></li>')
+                lines += [self.reason_line(*r) for r in reasons.get(u["id"], [])]
+                out.append(self.queue_item(u, "suspect", lines))
+            out.append("</ol>")
+        if risk:
+            out.append(f'<h2>{esc(Q["risks"])}</h2><ol>')
+            for u in risk:
+                out.append(self.queue_item(u, "risk",
+                                           [self.reason_line(*r) for r in reasons[u["id"]]]))
+            out.append("</ol>")
+        if folded:
+            out.append(f'<p class="folded">{esc(Q["folded"].format(k=folded))}</p>')
+        out.append("</section>")
+        return "".join(out)
 
     # file cards
 
@@ -1149,7 +1511,9 @@ def unit_links(page, ids, limit=12):
     return " ".join(links)
 
 
-def render(meta, files, units, notes, drift, run_dir):
+def render(meta, files, units, notes, drift, run_dir, reviews=None):
+    """The page. With `reviews` (the triage files), it opens on the queue — what is worth a
+    look — with a switch to the whole diff; without, it is the whole diff alone."""
     page = Page(files, units, notes)
     L = page.L
     flagged = [n for n in notes["notes"] if n.get("kind")]
@@ -1209,6 +1573,14 @@ def render(meta, files, units, notes, drift, run_dir):
             body = f'<ul class="checks">{body}</ul>'
         panels.append(f'<div class="panel"><h2>{esc(p["title"])}</h2>{body}</div>')
     out.append(f'<section class="summary">{"".join(panels)}</section>')
+    if reviews is not None:
+        Q = L["q"]
+        out.append(f'<div class="modebar"><span class="lbl">{esc(Q["mode"])}</span>'
+                   f'<div class="modes" role="group" aria-label="{esc(Q["mode"])}">'
+                   f'<button type="button" data-mode="queue" aria-pressed="true">'
+                   f'{esc(Q["queue"])}</button><button type="button" data-mode="all" '
+                   f'aria-pressed="false">{esc(Q["all"])}</button></div></div>')
+        out.append(page.queue(reviews))
 
     seg = ""
     if page.split:
@@ -1237,8 +1609,11 @@ def render(meta, files, units, notes, drift, run_dir):
     if page.highlight:
         hl = (f'<script src="{HLJS}" integrity="{HLJS_SRI}" crossorigin="anonymous" '
               f'referrerpolicy="no-referrer"></script>\n')
+    style, script = CSS, PAGE_JS
+    if reviews is not None:
+        style, script = CSS + QUEUE_CSS, PAGE_JS + QUEUE_JS
     doc = PAGE.substitute(lang=esc(notes.get("lang", "en")), title=esc(plain(notes["title"])),
-                          style=CSS, body="\n".join(out), highlight=hl, script=PAGE_JS)
+                          style=style, body="\n".join(out), highlight=hl, script=script)
     return doc, page.loose
 
 
@@ -1267,7 +1642,7 @@ def open_in_browser(path):
         webbrowser.open(pathlib.Path(path).as_uri())
 
 
-def build(run_dir, open_page):
+def build(run_dir, open_page, whole=False):
     run_dir = os.path.abspath(os.path.expanduser(run_dir))
     meta, files, units = load_snapshot(run_dir)
     try:
@@ -1279,13 +1654,21 @@ def build(run_dir, open_page):
         print(f"notes.json: 1 problem — fix it and rerun build:\n  - not valid JSON: {e}")
         return 1
     problems = validate(notes, files, units)
+    reviews = None
+    if not whole:
+        reviews, bad = load_triage(run_dir, units)
+        problems += bad
+        if not reviews and not bad:
+            print(f"no triage-*.json in {run_dir} — run the triage step (fresh reviewers write "
+                  f"them), or pass --all for the whole diff without a queue")
+            return 1
     if problems:
-        print(f"notes.json: {len(problems)} problem(s) — fix them and rerun build:")
+        print(f"notes.json / triage: {len(problems)} problem(s) — fix them and rerun build:")
         for p in problems:
             print(f"  - {p}")
         return 1
     drift = check_drift(meta)
-    page, loose = render(meta, files, units, notes, drift, run_dir)
+    page, loose = render(meta, files, units, notes, drift, run_dir, reviews)
     path = os.path.join(run_dir, "index.html")
     with open(path, "w", encoding="utf-8", errors="replace") as fh:
         fh.write(page)
@@ -1307,6 +1690,19 @@ def build(run_dir, open_page):
         for u in loose:
             print(f"  {u['id']:<5} {unit_path(files[u['file']]):<{width}}  "
                   f"{what.get(u['id']) or '(no description)'}")
+    if reviews is not None:
+        suspects, reasons = queue(units, notes, reviews)
+        risky = [u for u in units if u["id"] in reasons and u["id"] not in suspects]
+        print(f"queue: {len(suspects)} suspected · {len(risky)} worth a look · "
+              f"{len(units) - len(suspects) - len(risky)} folded "
+              f"(reviewers: {', '.join(r['name'] for r in reviews)})")
+        for r in reviews:
+            if r["units_seen"] < len(units):
+                print(f"WARNING: reviewer {r['name']} read only {r['units_seen']} of "
+                      f"{len(units)} units")
+        for u in units:
+            for name, text in suspects.get(u["id"], []):
+                print(f"  ! {u['id']:<5} {unit_path(files[u['file']])}  [{name}] {text}")
     if open_page:
         open_in_browser(path)
     return 0
@@ -1322,11 +1718,13 @@ def main(argv):
     b = sub.add_parser("build", help="check notes.json and render index.html")
     b.add_argument("run_dir")
     b.add_argument("--open", action="store_true", help="open the page in the system browser")
+    b.add_argument("--all", action="store_true", dest="whole",
+                   help="the whole diff only: no triage files, no queue")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "collect":
             return collect(args.target, args.out_root)
-        return build(args.run_dir, args.open)
+        return build(args.run_dir, args.open, args.whole)
     except Fail as e:
         print(f"diff-tour: {e}", file=sys.stderr)
         return 2

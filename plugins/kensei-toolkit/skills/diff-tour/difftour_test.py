@@ -68,7 +68,13 @@ def by_path(run_dir):
 def build(run_dir, notes):
     with open(os.path.join(run_dir, "notes.json"), "w", encoding="utf-8") as fh:
         json.dump(notes, fh, ensure_ascii=False)
-    return run(run_dir, "build", run_dir)
+    return run(run_dir, "build", run_dir, "--all")
+
+
+def triage(run_dir, name, **data):
+    data.setdefault("units_seen", len(index(run_dir)))
+    with open(os.path.join(run_dir, f"triage-{name}.json"), "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False)
 
 
 def page(run_dir):
@@ -197,6 +203,39 @@ class Collect(unittest.TestCase):
         self.assertIn("noise", units["generated/x.cs"]["facts"])
         self.assertIn("noise", units["src/a.g.cs"]["facts"])
         self.assertNotIn("noise", units["src/c.cs"]["facts"])
+
+    def test_noise_patterns_come_from_the_base(self):
+        path = repo({"src/a.cs": "1\n"})
+        write(path, ".claude/diff-tour-noise", "src/\n")  # added by the change itself
+        write(path, "src/a.cs", "2\n")
+        units = by_path(collect(path)[0])
+        self.assertNotIn("noise", units["src/a.cs"]["facts"])
+        self.assertEqual(units[".claude/diff-tour-noise"]["risk"],
+                         ["path: .claude/diff-tour-noise"])
+
+    def test_attributes_come_from_the_base(self):
+        path = repo({"a.cs": "one\n"})
+        write(path, ".gitattributes", "*.cs -diff\n")  # would show a.cs as "Binary files differ"
+        write(path, "a.cs", "two\n")
+        run_dir, _ = collect(path)
+        _, files, _ = difftour.load_snapshot(run_dir)
+        a = next(f for f in files if f["new"] == "a.cs")
+        self.assertFalse(a["binary"])
+        self.assertIn(["+", "two"], a["hunks"][0]["lines"])
+        self.assertEqual(by_path(run_dir)[".gitattributes"]["risk"], ["path: .gitattributes"])
+
+    def test_snapshot_records_where_to_read_context(self):
+        path = repo({"a.txt": "1\n"})
+        write(path, "a.txt", "2\n")
+        git(path, "commit", "-qam", "two")
+        write(path, "a.txt", "3\n")
+        for args, new in (((), None), (("HEAD~1..HEAD",), "HEAD"), (("HEAD~1..",), "HEAD")):
+            with self.subTest(args=args):
+                run_dir, _ = collect(path, *args)
+                with open(os.path.join(run_dir, "hunks.json"), encoding="utf-8") as fh:
+                    meta = json.load(fh)["meta"]
+                self.assertEqual(meta["new_rev"], new)
+                self.assertTrue(meta["old_rev"])
 
     def test_nested_repository_is_reported_not_diffed(self):
         path = repo({"a.txt": "a\n"})
@@ -494,6 +533,264 @@ class Noise(unittest.TestCase):
         for path, patterns, expected in cases:
             with self.subTest(path=path, patterns=patterns):
                 self.assertEqual(difftour.is_noise(path, patterns), expected)
+
+
+class Risk(unittest.TestCase):
+
+    def risk_of(self, run_dir):
+        return {u["id"]: u["risk"] for u in index(run_dir)}
+
+    def path_risk(self, run_dir):
+        return {u["path"]: u["risk"] for u in index(run_dir)}
+
+    def test_project_rules_are_read_from_the_base(self):
+        r = repo({".claude/review-risk": "# money\npath src/pay/\nline \\bcharge\\(\n",
+                  "src/pay/a.py": "1\n", "src/ui/b.py": "1\n", "src/ui/c.py": "1\n"})
+        write(r, "src/pay/a.py", "2\n")
+        write(r, "src/ui/b.py", "2\n")
+        write(r, "src/ui/c.py", "charge(10)\n")
+        run_dir, out = collect(r)
+        risk = self.path_risk(run_dir)
+        self.assertEqual(risk["src/pay/a.py"], ["path: src/pay/"])
+        self.assertEqual(risk["src/ui/b.py"], [])
+        self.assertEqual(risk["src/ui/c.py"], ["line: charge(10)"])
+        self.assertIn("Risk rules (built-in + .claude/review-risk at the base): 2 units", out)
+
+    def test_change_cannot_edit_its_own_rules(self):
+        r = repo({".claude/review-risk": "path src/pay/\n", "src/pay/a.py": "1\n"})
+        write(r, ".claude/review-risk", "path docs/\n")
+        write(r, "src/pay/a.py", "2\n")
+        self.assertEqual(self.path_risk(collect(r)[0])["src/pay/a.py"], ["path: src/pay/"])
+
+    def test_rules_added_by_the_change_do_not_apply_yet(self):
+        r = repo({"src/pay/a.py": "1\n"})
+        write(r, ".claude/review-risk", "path src/pay/\n")
+        write(r, "src/pay/a.py", "2\n")
+        self.assertEqual(self.path_risk(collect(r)[0])["src/pay/a.py"], [])
+
+    def test_file_moved_out_of_a_risky_path_stays_risky(self):
+        body = "".join(f"line {i}\n" for i in range(20))
+        r = repo({".claude/review-risk": "path src/pay/\n", "src/pay/a.py": body})
+        git(r, "mv", "src/pay/a.py", "src/a.py")
+        self.assertEqual(self.path_risk(collect(r)[0])["src/a.py"], ["path: src/pay/"])
+
+    def test_range_reads_rules_from_its_left_side(self):
+        r = repo({".claude/review-risk": "path src/pay/\n", "src/pay/a.py": "1\n"})
+        write(r, ".claude/review-risk", "")
+        write(r, "src/pay/a.py", "2\n")
+        git(r, "commit", "-qam", "edit")
+        for spec in ("HEAD~1..HEAD", "HEAD~1...HEAD"):
+            with self.subTest(spec=spec):
+                risk = self.path_risk(collect(r, spec)[0])
+                self.assertEqual(risk["src/pay/a.py"], ["path: src/pay/"])
+
+    def test_bad_rule_is_reported_not_fatal(self):
+        r = repo({".claude/review-risk": "src/pay/\nline (\n", "a.py": "1\n"})
+        write(r, "a.py", "2\n")
+        _, out = collect(r)
+        self.assertIn("not a valid rule, skipped: 'src/pay/'", out)
+        self.assertIn("not a valid rule, skipped: 'line ('", out)
+
+    def test_built_in_rules_are_per_hunk(self):
+        far = "".join(f"x{i}\n" for i in range(40))
+        r = repo({"Net.cs": "enum Kind { A }\n" + far + "int y = 1;\n",
+                  "tool.js": "a()\n", "Game.asmdef": "{}\n"})
+        write(r, "Net.cs", "enum Kind { A, B }\n" + far + "int y = 2;\n")
+        write(r, "tool.js", "process.kill(pid)\n")
+        write(r, "Game.asmdef", '{"name": "Game"}\n')
+        risk = [(u["path"], u["risk"]) for u in index(collect(r)[0])]
+        self.assertEqual([v for p, v in risk if p == "Net.cs"],
+                         [["line: enum Kind { A }"], []])  # the far hunk is not raised
+        self.assertEqual([v for p, v in risk if p == "tool.js"], [["line: process.kill(pid)"]])
+        self.assertEqual([v for p, v in risk if p == "Game.asmdef"], [["path: *.asmdef"]])
+
+    def test_weakened_test_is_risky_a_new_test_is_not(self):
+        old = "def test_a():\n    assert f() == 1\n\ndef test_b():\n    assert g()\n"
+        r = repo({"tests/test_x.py": old})
+        write(r, "tests/test_x.py", "def test_a():\n    assert f() == 1\n")
+        write(r, "tests/test_new.py", "def test_c():\n    pass\n")
+        risk = self.path_risk(collect(r)[0])
+        self.assertEqual(risk["tests/test_x.py"], ["test: tests −1 +0, asserts −1 +0"])
+        self.assertEqual(risk["tests/test_new.py"], [])
+
+    def test_skipped_or_moved_test_is_risky(self):
+        r = repo({"Tests/HubTests/ATests.swift": "@Test func a() {\n    #expect(x == 1)\n}\n",
+                  "py/tests/test_b.py": "def test_b():\n    assert b()\n",
+                  "src/c.spec.ts": "it('c', () => {\n  expect(c()).toBe(1)\n})\n"})
+        write(r, "Tests/HubTests/ATests.swift",
+              "@Test(.disabled) func a() {\n    #expect(x == 1)\n}\n")
+        write(r, "py/tests/test_b.py", "@unittest.skip('flaky')\ndef test_b():\n    assert b()\n")
+        git(r, "mv", "src/c.spec.ts", "src/c.ts")
+        risk = self.path_risk(collect(r)[0])
+        self.assertEqual(risk["py/tests/test_b.py"], ["test: @unittest.skip('flaky')"])
+        self.assertEqual(risk["src/c.ts"], ["test: moved out of the tests: src/c.ts"])
+        # @Test(.disabled) keeps the counts: no rule for it — the reviewers judge it
+        self.assertEqual(risk["Tests/HubTests/ATests.swift"], [])
+
+    def test_enum_members_raised_by_the_code_around_them(self):
+        r = repo({"Kind.cs": "public enum Kind\n{\n    A = 0,\n    B = 1,\n}\n"})
+        write(r, "Kind.cs", "public enum Kind\n{\n    A = 0,\n    X = 1,\n    B = 2,\n}\n")
+        self.assertEqual(self.path_risk(collect(r)[0])["Kind.cs"],
+                         ["section: public enum Kind"])
+
+    def test_rewritten_assert_is_left_to_the_reviewers(self):
+        r = repo({"Tests/ATests.cs": "Assert.That(x, Is.EqualTo(new[] { 1, 2 }));\n"})
+        write(r, "Tests/ATests.cs", "Assert.That(x, Has.Length.EqualTo(2));\n")
+        self.assertEqual(self.path_risk(collect(r)[0])["Tests/ATests.cs"], [])
+
+    def test_noise_is_still_read_by_the_rules(self):
+        r = repo({".claude/diff-tour-noise": "gen/\n", "gen/Net.cs": "int a;\n"})
+        write(r, "gen/Net.cs", "[MemoryPackOrder(3)] int a;\n")
+        u = by_path(collect(r)[0])["gen/Net.cs"]
+        self.assertEqual(u["id"], "n1")
+        self.assertEqual(u["risk"], ["line: [MemoryPackOrder(3)] int a;"])
+
+    def test_build_reads_the_rules_again(self):
+        r = repo({".claude/review-risk": "path src/pay/\n", "src/pay/a.py": "1\n"})
+        write(r, "src/pay/a.py", "2\n")
+        run_dir, _ = collect(r)
+        with open(os.path.join(run_dir, "hunks.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["meta"]["risk"], data["meta"]["patterns"] = [], ["*"]  # edited after collect
+        with open(os.path.join(run_dir, "hunks.json"), "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        _, _, units = difftour.load_snapshot(run_dir)
+        self.assertEqual([(u["id"], u["risk"]) for u in units], [("h1", [("path", "src/pay/")])])
+
+    def test_lost_base_stops_build(self):
+        r = repo({"a.py": "1\n"})
+        write(r, "a.py", "2\n")
+        run_dir, _ = collect(r)
+        shutil.rmtree(r)
+        with self.assertRaises(difftour.Fail) as cm:
+            difftour.load_snapshot(run_dir)
+        self.assertIn("cannot re-read the noise and risk rules", str(cm.exception))
+
+
+class Triage(unittest.TestCase):
+    """Only the script folds: reviewers and rules can only raise a unit into the queue."""
+
+    def setUp(self):
+        r = repo({"a.cs": "one\n", "b.cs": "two\n", "c.cs": "three\n", "d.js": "x\n"})
+        write(r, "a.cs", "ONE\n")
+        write(r, "b.cs", "TWO\n")
+        write(r, "c.cs", "THREE\n")
+        write(r, "d.js", "fs.rm(dir)\n")
+        self.run_dir, _ = collect(r)
+        with open(os.path.join(self.run_dir, "notes.json"), "w", encoding="utf-8") as fh:
+            json.dump({"title": "t", "lede": "l", "notes": [
+                {"unit": "h1", "source": "session", "text": "a"},
+                {"unit": "h2", "source": "session", "kind": "untested", "text": "b"},
+                {"unit": "h4", "source": "session", "text": "d"}]}, fh)
+
+    def build(self, *args):
+        return run(self.run_dir, "build", self.run_dir, *args)
+
+    def queue(self):
+        return page(self.run_dir).split('<section class="queue">')[1].split("</section>")[0]
+
+    def test_build_needs_triage_or_all(self):
+        code, out, _ = self.build()
+        self.assertEqual(code, 1)
+        self.assertIn("no triage-*.json", out)
+        self.assertFalse(os.path.exists(os.path.join(self.run_dir, "index.html")))
+        code, _, err = self.build("--all")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('class="queue"', page(self.run_dir))
+
+    def test_queue_sections(self):
+        triage(self.run_dir, "1", suspects=[{"unit": "h1", "text": "wrong `sign`"}], risks=[])
+        triage(self.run_dir, "2", suspects=[{"unit": "h1", "text": "wrong `sign`"}],
+               risks=[{"unit": "h1", "check": "callers"}])
+        code, out, err = self.build()
+        self.assertEqual(code, 0, err)
+        # h1: suspect; h2: author's flag; h4: fs.rm; h3 has no note, and that alone folds
+        self.assertIn("queue: 1 suspected · 2 worth a look · 1 folded (reviewers: 1, 2)", out)
+        self.assertIn("  ! h1    a.cs  [1] wrong `sign`", out)
+        q = self.queue()
+        self.assertEqual(q.count('<li class="qi suspect">'), 1)
+        self.assertEqual(q.count('<li class="qi risk">'), 2)
+        self.assertIn("wrong <code>sign</code> <span class=\"by\">all reviewers</span>", q)
+        self.assertIn("callers", q)
+        self.assertIn("<code>fs.rm(dir)</code>", q)
+        self.assertIn("author: Untested", q)
+        self.assertIn("1 units have no author note", q)
+        self.assertNotIn('data-unit="h3"', q)
+        self.assertNotIn("data-unit=\"h1\"><td", q)  # code copies are not link targets
+        self.assertNotIn('<tr class="hunk"', q)
+        html = page(self.run_dir)
+        self.assertIn('data-mode="queue" aria-pressed="true"', html)
+        self.assertIn(difftour.QUEUE_JS, html)
+        self.assertIn("<main>", html)  # the whole diff is still there
+
+    def test_what_nobody_raised_is_folded(self):
+        with open(os.path.join(self.run_dir, "notes.json"), "w", encoding="utf-8") as fh:
+            json.dump({"title": "t", "lede": "l", "notes": [
+                {"unit": u, "source": "session", "text": "x"} for u in ("h1", "h2", "h3", "h4")
+            ]}, fh)
+        triage(self.run_dir, "1", suspects=[], risks=[])
+        triage(self.run_dir, "2", suspects=[], risks=[])
+        code, out, err = self.build()
+        self.assertEqual(code, 0, err)
+        self.assertIn("queue: 0 suspected · 1 worth a look · 3 folded", out)
+        self.assertIn("The other 3 units are folded", self.queue())
+
+    def test_empty_queue_says_so(self):
+        r = repo({"a.cs": "one\n"})
+        write(r, "a.cs", "ONE\n")
+        run_dir, _ = collect(r)
+        with open(os.path.join(run_dir, "notes.json"), "w", encoding="utf-8") as fh:
+            json.dump({"title": "t", "lede": "l", "lang": "ru",
+                       "notes": [{"unit": "h1", "source": "session", "text": "x"}]}, fh)
+        triage(run_dir, "1", suspects=[], risks=[])
+        triage(run_dir, "2", suspects=[], risks=[])
+        code, _, err = run(run_dir, "build", run_dir)
+        self.assertEqual(code, 0, err)
+        self.assertIn("Смотреть нечего", page(run_dir))
+
+    def test_partial_reading_is_flagged(self):
+        triage(self.run_dir, "1", units_seen=2, suspects=[], risks=[])
+        triage(self.run_dir, "2", suspects=[], risks=[])
+        code, out, _ = self.build()
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING: reviewer 1 read only 2 of 4 units", out)
+        self.assertIn("reviewer 1 read only 2 of 4 units: what it did not read", self.queue())
+
+    def test_one_reviewer_is_not_enough(self):
+        triage(self.run_dir, "1", suspects=[], risks=[])
+        code, out, _ = self.build()
+        self.assertEqual(code, 1)
+        self.assertIn("1 triage file(s) (triage-1.json) — the triage step runs 2 reviewers", out)
+
+    def test_bad_triage_files(self):
+        triage(self.run_dir, "1", suspects=[{"unit": "h9", "text": "x"}],
+               risks=[{"unit": "h1", "check": " "}], extra=1)
+        triage(self.run_dir, "2", units_seen="all")
+        with open(os.path.join(self.run_dir, "triage-3.json"), "w") as fh:
+            fh.write("{oops")
+        triage(self.run_dir, "4", units_seen=99, suspects=[{"unit": ["h1"], "text": "x"}])
+        with open(os.path.join(self.run_dir, "triage-5.json"), "w") as fh:
+            fh.write("[" * 100000 + "]" * 100000)
+        code, out, err = self.build()
+        self.assertEqual(code, 1, err)
+        for msg in ("triage-1.json: unknown key 'extra'",
+                    "triage-1.json: suspects[0]: unit must be an id from hunks.json",
+                    "triage-1.json: risks[0]: check must be non-empty text",
+                    "triage-2.json: units_seen must be",
+                    "triage-3.json: not valid JSON",
+                    "triage-4.json: units_seen must be the number of units the reviewer read "
+                    "(0–4)",
+                    "triage-4.json: suspects[0]: unit must be an id from hunks.json",
+                    "triage-5.json: not valid JSON"):
+            self.assertIn(msg, out)
+
+    def test_page_without_triage_matches_the_old_page(self):
+        meta, files, units = difftour.load_snapshot(self.run_dir)
+        with open(os.path.join(self.run_dir, "notes.json"), encoding="utf-8") as fh:
+            notes = json.load(fh)
+        old, _ = difftour.render(meta, files, units, notes, None, "x")
+        self.assertNotIn(difftour.QUEUE_CSS, old)
+        self.assertNotIn("data-mode", old)
 
 
 # --- parser ------------------------------------------------------------------------------
@@ -966,7 +1263,7 @@ class Build(unittest.TestCase):
         run_dir, _ = collect(three_changes())
         with open(os.path.join(run_dir, "notes.json"), "w", encoding="utf-8") as fh:
             fh.write('{"title": "cut \\ud83d", "lede": "l", "notes": []}')
-        code, _, err = run(run_dir, "build", run_dir)
+        code, _, err = run(run_dir, "build", run_dir, "--all")
         self.assertEqual(code, 0, err)
         self.assertGreater(os.path.getsize(os.path.join(run_dir, "index.html")), 1000)
 

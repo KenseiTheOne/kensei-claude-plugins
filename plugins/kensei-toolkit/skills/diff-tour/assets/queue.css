@@ -1,0 +1,35 @@
+.modebar{display:flex;align-items:center;gap:10px;margin:0 0 14px}
+.modebar .lbl{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;
+color:var(--muted)}
+.modes{display:inline-flex;border:1px solid var(--rule);border-radius:6px;overflow:hidden;
+background:var(--surface)}
+.modes button{font:500 13px var(--sans);color:var(--muted);background:transparent;border:0;
+padding:5px 12px;cursor:pointer}
+.modes button[aria-pressed="true"]{background:var(--accent);color:var(--on-accent)}
+.modes button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+:root[data-mode="queue"] .files-nav,:root[data-mode="queue"] .toolbar,
+:root[data-mode="queue"] main{display:none}
+:root[data-mode="all"] .queue{display:none}
+.queue{display:grid;gap:14px;margin-bottom:18px}
+.queue .verdict{margin:0;font-family:var(--mono);font-size:13px;color:var(--muted)}
+.queue .warns{margin:0;padding:8px 12px;border:1px solid var(--note-rule);border-radius:8px;
+background:var(--warn-bg);font-size:14px;list-style:none;display:grid;gap:4px}
+.queue h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;
+color:var(--muted);margin:6px 0 0}
+.queue ol{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.qi{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:12px 14px;
+display:grid;gap:8px;min-width:0}
+.qi.suspect{border-left:4px solid var(--loose-rule)}
+.qi.risk{border-left:4px solid var(--note-rule)}
+.qhead{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;min-width:0}
+.qhead a{font-family:var(--mono);font-size:12px;color:var(--accent);text-decoration:none}
+.qhead .fpath{font-family:var(--mono);font-size:13px;overflow-wrap:anywhere}
+.qhead .where{font-family:var(--mono);font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.qwhy{margin:0;padding:0;list-style:none;display:grid;gap:4px;font-size:14px}
+.qwhy li{display:flex;gap:8px;align-items:baseline;min-width:0}
+.qwhy li>span:last-child{min-width:0;overflow-wrap:anywhere}
+.qwhy .by{font-size:12px;color:var(--muted);white-space:nowrap}
+.qcode summary{cursor:pointer;font-size:13px;color:var(--muted)}
+.qcode .scroll{margin-top:6px;border:1px solid var(--rule);border-radius:6px}
+.queue .empty{margin:0}
+.queue .folded{margin:0;color:var(--muted);font-size:14px}

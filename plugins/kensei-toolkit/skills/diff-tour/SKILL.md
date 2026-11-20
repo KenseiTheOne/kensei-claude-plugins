@@ -1,7 +1,7 @@
 ---
 name: diff-tour
-description: Annotated diff for self-review before a commit — renders the changes (uncommitted work with untracked files, or a ref or range) as a local HTML page in the system browser, file by file, side by side or unified, with notes on what each change does and why it was made in this conversation, and marks every change no note explains as "Unexplained". Use when the user asks to see the changes — "show the diff", "what changed", "review before commit", "diff tour", «покажи дифф», «что поменялось», «дифф-тур», «ревью перед коммитом» — or when another skill or the user's CLAUDE.md says to show changes this way. Read-only — it never stages, commits or edits the repository. Run it when showing the changes is asked for, not on your own after every edit.
-argument-hint: "[ref | a..b]"
+description: Annotated diff for self-review before a commit — renders the changes (uncommitted work with untracked files, or a ref or range) as a local HTML page in the system browser that opens on a queue of what the user should look at (suspected failures and risky changes raised by two fresh reviewers and the script's risk rules, everything else folded), with the whole diff a click away — file by file, side by side or unified, with notes on what each change does and why it was made in this conversation, and every change no note explains marked "Unexplained". Use when the user asks to see the changes — "show the diff", "what changed", "review before commit", "diff tour", «покажи дифф», «что поменялось», «дифф-тур», «ревью перед коммитом» — or when another skill or the user's CLAUDE.md says to show changes this way. Read-only — it never stages, commits or edits the repository. Run it when showing the changes is asked for, not on your own after every edit.
+argument-hint: "[all] [ref | a..b]"
 ---
 
 # diff-tour — what changed, and why, before you commit
@@ -11,10 +11,21 @@ The built-in `/diff` already shows *what* changed. This page adds *why*, and its
 **Unexplained**: changes that no note from this conversation accounts for — leftover debug code,
 a stray edit, work from an earlier session.
 
-The page: a headline and a plain-language paragraph, summary panels (the script's own
-self-check first), a sticky bar with the file list and a side-by-side / unified switch, then one
-card per file with notes placed under the lines they explain. It is a local file; nothing is
-uploaded.
+The page opens on the **queue** — what is worth the user's attention, so the rest can stay out
+of sight: *suspected failures* that a fresh reviewer can state concretely, then units *worth a
+look* — raised by a reviewer with a question to check, by the script's risk rules (serialized
+format, destructive commands, build settings, weakened tests, the project's own
+`.claude/review-risk`), or by the author's own flags. Everything else is folded.
+**Only the script folds; nobody can take a unit out of the queue** — the model and the
+reviewers can only add to it. Notes do not move units either way: a unit without a note is
+counted under the queue and marked Unexplained in the whole diff, but not raised for that
+alone (on a big diff most units have none), and a note — `session` or `inferred` — takes
+nothing out.
+
+A switch shows the whole diff: a headline and a plain-language paragraph, summary panels (the
+script's own self-check first), a sticky bar with the file list and a side-by-side / unified
+switch, then one card per file with notes placed under the lines they explain. It is a local
+file; nothing is uploaded.
 
 Design rationale (the owner's notes, not shipped with the plugin):
 `~/docs/brainstorms/2026-09-24-diff-tour-skill.md`.
@@ -43,6 +54,9 @@ Design rationale (the owner's notes, not shipped with the plugin):
    as a pill with `warn: true` — never leave it out to look finished.
 6. **Read-only.** Nothing is staged, committed, stashed, reverted or edited in the repository.
    Only the run directory is written. What to do about unexplained units is the user's call.
+7. **The queue is the reviewers' and the script's, not yours.** Never write or edit a
+   `triage-*.json` or `hunks.json`, and never tell a reviewer what to find or leave out. You
+   can still raise a unit yourself through a note `kind`; nothing you write can fold one.
 
 ## Steps
 
@@ -51,6 +65,8 @@ Design rationale (the owner's notes, not shipped with the plugin):
    ```
    python3 "${CLAUDE_SKILL_DIR}/difftour.py" collect $ARGUMENTS
    ```
+
+   Pass the arguments without the word `all`: that one only skips the triage step.
 
    - No argument: HEAD against the working tree, untracked included. When nothing is
      uncommitted (the work was just committed), collect compares HEAD with its upstream
@@ -76,14 +92,28 @@ Design rationale (the owner's notes, not shipped with the plugin):
      history with <ref>` (an orphan branch with its own commits), say so and ask which ref or
      range to compare with.
    - Exit 2 → show the error and stop.
+   - A `[risk …]` tag on a unit — the script's risk rules raised it; it will be in the queue
+     whatever anyone writes.
    - A size `WARNING` → mention it to the user and carry on with the tour. Collect again with a
      narrower ref only if the user asks for one.
 
-2. **Read the units.** Read `<run dir>/patch.diff` in one pass when collect reports up to
+2. **Triage** — skip it when the argument has `all`. Launch two
+   fresh reviewers at once, in the background, with the Agent tool: `general-purpose`, effort
+   `xhigh`, the model not overridden (this is the safety net — do not save on it). Their
+   prompt names only the brief, the run directory, their name (`1`, `2`) and the user's
+   language:
+
+   > Follow `${CLAUDE_SKILL_DIR}/triage.md`. Run directory: `<run dir>`. Your name: `1`.
+   > Write `text` and `check` in Russian.
+
+   Nothing about the change, its purpose or your own view — an independent read is the point.
+   While they work, go on with steps 3–4; build refuses to run on fewer than two triage files.
+
+3. **Read the units.** Read `<run dir>/patch.diff` in one pass when collect reports up to
    2000 lines; otherwise read it in pieces by the `L` offsets, so that every unit is read once.
    Recall from this conversation why each change was made.
 
-3. **Write `<run dir>/notes.json`.** An example for a Russian-speaking user:
+4. **Write `<run dir>/notes.json`.** An example for a Russian-speaking user:
 
    ```json
    {
@@ -140,19 +170,24 @@ Design rationale (the owner's notes, not shipped with the plugin):
      only: `backticks` for code, `**bold**` (may contain code), line breaks. Nothing else; HTML
      is shown as text. Panel titles, pills, roles and the link label are plain text.
 
-4. **Build:**
+5. **Build**, once both reviewers have finished (`--all` instead of triage when the argument
+   has `all`):
 
    ```
    python3 "${CLAUDE_SKILL_DIR}/difftour.py" build "<run dir>" --open
    ```
 
-   Exit 1 lists every problem in notes.json — fix all of them and run build again. Never rerun
-   collect to get past a notes problem: it takes a new snapshot with new ids.
+   Exit 1 lists every problem in notes.json and the triage files — fix the notes yourself; for
+   a triage file, send the problem back to the reviewer that wrote it (SendMessage) rather
+   than editing it. Start a fresh reviewer in its place only when that one cannot be reached,
+   and only over a problem build reported — never because of what it found or left out. Without triage files and without `--all`, build stops and says so. Never
+   rerun collect to get past a problem: it takes a new snapshot with new ids.
    `--open` shows the page in the system browser. Never open it with a bare `open`: terminals
    such as cmux shadow `open` on PATH and put the page in a side pane instead.
 
-5. **Report** in the user's language: the page path, the base when collect fell back to one,
-   the counts line, and the Unexplained list as build printed it. If build printed the drift
+6. **Report** in the user's language: the page path, the base when collect fell back to one,
+   the queue line and every suspected failure as build printed them, a reviewer `WARNING` if
+   one read only part of the diff, then the counts line and the Unexplained list. If build printed the drift
    `WARNING`, say it first — the page no longer matches what a commit would contain. Then
    stop. No follow-up action unless the user asks for one.
 
@@ -170,7 +205,8 @@ steps are the same, with these differences:
 - The calling skill's agreed criteria, test runs and review findings in this conversation
   are reasons you can point to, so notes built on them are `session`; the rules above still
   apply unchanged.
-- Hand back the `Page:` path and the counts line from build's output instead of the full
-  report; the caller decides what to show.
+- The triage step runs as usual unless the caller asks for `all`.
+- Hand back the `Page:` path, the queue line and the counts line from build's output instead
+  of the full report; the caller decides what to show.
 
 Run directories are private to the user (mode 0700).
