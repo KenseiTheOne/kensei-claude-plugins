@@ -2,10 +2,10 @@
 """diff-tour — an annotated diff page for self-review before a commit.
 
   difftour.py collect [REF | A..B] [--out-root DIR]
-      Snapshot the diff into a new run directory (patch.diff + hunks.json) and print the index
-      of its units. No argument: HEAD against the working tree, untracked files included; when
-      nothing is uncommitted, the commits HEAD has beyond its upstream (or else the default
-      branch) instead; a HEAD that shares no history with any of them (an orphan branch) shows
+      Snapshot the diff into a new run directory (patch.diff, hunks.json, index.txt) and print
+      the index of its units; a leading `all` (the skill's switch) is dropped. No argument:
+      HEAD against the working tree, untracked files included; when nothing is uncommitted,
+      the commits HEAD has beyond its upstream (or else the default branch) instead; a HEAD that shares no history with any of them (an orphan branch) shows
       nothing and says so. REF: the merge-base of REF and HEAD against the working tree, untracked
       included (for a REF that HEAD descends from, that is REF itself). A..B: that range only —
       A and B may be commits or tree ids (a `git write-tree` result). A...B: from the merge-base
@@ -15,7 +15,7 @@
       Check RUN_DIR/notes.json and the reviewers' RUN_DIR/triage-*.json against the snapshot,
       render RUN_DIR/index.html, print the queue, the counts and every unexplained unit. The
       page opens on the queue: suspected failures, then units worth a look (a reviewer's
-      question, a risk rule, an author's flag, no note), the rest folded. --all: the whole diff
+      question, a risk rule, an author's flag), the rest folded. --all: the whole diff
       only, no triage files needed. Exit 1 with the list of problems if notes.json or a triage
       file is invalid, or there are no triage files without --all; exit 2 on any other error.
 
@@ -51,23 +51,31 @@ RISK_FILE = ".claude/review-risk"        # project risk rules, read from the bas
 # Risk rules: what puts a unit into the queue's risk list whatever the reviewers say. One rule
 # per line: `path <glob>` (noise-file syntax, old or new path), `line <regex>` (an added or
 # removed line), `section <regex>` (the code around the change: the hunk's @@ context or any
-# of its unchanged lines, e.g. the enum whose members it edits).
+# of its unchanged lines). Enum members and MemoryPack layout are not rules but checks that read
+# the file at the base (enum_risk, memorypack_risk): a regex cannot tell an append from an insertion.
 DEFAULT_RISK = [
     # serialized and networked format
-    r"line \[MemoryPack(Order|able|Ignore|Union|Constructor)\b",
     r"line \bIRpcCommand\b|\[Ghost(Field|Component)\b",
     r"line \[Meta(Method|Service)\b|\bExecutionMode\.",
-    r"section \benum\b",
-    r"line \benum\s+\w+",
     r"line \b(MajorMinor|ClientVersion|bundleVersion|schema_?[vV]ersion)\b|\"schema\"\s*:",
+    r'line ^\s*"unity(Release)?"\s*:',
     # who may do what
     r"line \b(forbidden_paths|deny_tools|allowed_?tools|trusted_authors|RequirePermission)\b",
     # destructive operations
     r"line \bprocess\.kill\b|\bkill(Tree|Orphans)?\(|\bfs\.rm\b|\b(rm|rmdir|unlink)Sync\(",
     r"line \brm -[a-zA-Z]*[rf]|\b(Directory|File)\.Delete\(|AssetDatabase\.DeleteAsset\(",
     r"line (reset --hard|clean -[a-z]*f|worktree remove|branch -D|push\b.*(--force|\s-f\b))",
+    # the same git commands with their arguments as a list: git(["clean", "-ffdxq"])
+    r"""line ["'](clean["']\s*,\s*["']-[a-zA-Z]*f|reset["']\s*,\s*["']--hard\b|branch["']\s*,"""
+    r"""\s*["']-D\b|worktree["']\s*,\s*["']remove\b)|["']push["']\s*,.*["'](--force\S*|-f)["']""",
+    r"line (?<![\w.])(rm|rmdir|unlink)\(|\.(rm|rmdir|unlink)\(|\bshutil\.rmtree\(|"
+    r"\bos\.(remove|removedirs)\(",
+    # secrets written into the code
+    r"""line (?i)\bsk-[a-z0-9_-]{20,}|\bAKIA[0-9A-Z]{16}\b|\bgh[pousr]_[a-z0-9]{30,}|"""
+    r"""\bxox[abpr]-[a-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"""
+    r"""\b\w{0,40}?(api_?key|secret|token|passw(or)?d)["']?\s{0,4}[:=]\s{0,4}["'][^"'\s]{12,}["']""",
     # build and module boundaries
-    "path *.asmdef", "path *.asmref", "path ProjectSettings/", "path Packages/manifest.json",
+    "path *.asmdef", "path *.asmref", "path **/ProjectSettings/", "path **/Packages/manifest.json",
     "path appsettings*.json", "path .github/workflows/",
     # what decides how this tour itself folds and shows the diff
     "path " + NOISE_FILE, "path " + RISK_FILE, "path .gitattributes",
@@ -75,7 +83,8 @@ DEFAULT_RISK = [
 RISK_KINDS = ("path", "line", "section")
 TEST_PATH = re.compile(r"(^|/)(?i:tests?|__tests__)/|\.Tests?(\.|/)|Tests?\.(cs|swift)$|"
                        r"\.(test|spec)\.[a-z]+$|(^|/)test_[^/]*\.py$|_test\.(py|go)$")
-TEST_DEF = re.compile(r"\[(Test|UnityTest|TestCase|Fact|Theory)\b|@Test\b|^\s*(test|it)\(|"
+TEST_DEF = re.compile(r"\[(Test|UnityTest|TestCase|TestCaseSource|Fact|Theory)\b|@Test\b|"
+                      r"^\s*(test|it)(\.each\b.*?)?[(`]|"
                       r"^\s*(async\s+)?def test_|\bfunc test\w*\(")
 ASSERT = re.compile(r"\bAssert\.|\bassert\w*\b|\bexpect\(|#require\(|\bXCTAssert|\bShould\b")
 SKIP = re.compile(r"\[(Ignore|Explicit)\b|@(unittest\.)?skip|pytest\.mark\.(skip|xfail)|"
@@ -159,7 +168,13 @@ def resolve(root, arg):
     A REF other than HEAD is compared from where HEAD's history meets it (the merge-base), so
     `main` shows the branch's own work, not main's newer commits reversed."""
     if arg and ".." in arg:
-        return {"mode": "range", "range": arg}
+        spec = {"mode": "range", "range": arg}
+        # Pin both ends: build must read the same base after the branch moves on.
+        for key, rev in (("base", base_of(root, spec)), ("new", new_of(spec))):
+            sha = git(root, "rev-parse", "--verify", "--quiet", rev, ok=(0, 1)).decode().strip()
+            if sha:
+                spec[key] = sha
+        return spec
     head = commit_of(root, "HEAD") or None
     if not arg:
         if head:
@@ -407,6 +422,8 @@ def base_of(root, spec):
     """The commit (or tree) the diff starts from — the state the change could not have edited."""
     if spec["mode"] == "worktree":
         return spec["sha"]
+    if spec.get("base"):  # pinned by collect, so build reads the same base after new commits
+        return spec["base"]
     a, dots, b = spec["range"].partition("...")
     if dots:
         base = git(root, "merge-base", a or "HEAD", b or "HEAD", ok=(0, 1)).decode().strip()
@@ -420,7 +437,7 @@ def new_of(spec):
     """The commit or tree of the diff's new side, or None for the working tree."""
     if spec["mode"] == "worktree":
         return None
-    return spec["range"].replace("...", "..").partition("..")[2] or "HEAD"
+    return spec.get("new") or spec["range"].replace("...", "..").partition("..")[2] or "HEAD"
 
 
 def base_patterns(root, spec, name):
@@ -510,6 +527,382 @@ def weakened_test(f, hunks):
     return out
 
 
+# --- checks that read the file ----------------------------------------------------------
+# The file at the base comes from git; the new side is the base with the hunks applied, so build
+# gets the same answer as collect from the same patch.diff.
+
+BRACE_EXT = {"cs", "java", "kt", "ts", "tsx", "js", "mjs", "swift", "c", "h", "cc", "cpp", "hpp",
+             "rs", "proto", "fbs", "thrift"}
+JSON_EXT = {"json", "asmdef", "asmref"}
+COMMENT = re.compile(r"^\s*(//|/\*|\*|#(?!\[)|$)")
+ENUM_DECL = re.compile(r"^(?!\s*(import|from)\b).*\benum\b(\s+class)?(\s+\w+|\s*\{|\s*$)")
+PY_ENUM = re.compile(r"^\s*class\s+\w+\s*\([^)]*\b(Int|Str)?(Enum|Flag)\b")
+ENUM_MEMBER = {
+    "swift": re.compile(r"^\s*(indirect\s+)?case\b"),
+    "py": re.compile(r"^\s*[A-Za-z_]\w*\s*(:[^=]+)?=(?!=)"),
+    "": re.compile(r"^\s*(\[[^\]]*\]\s*|@\w+\s*)*{m}(\s*,\s*{m})*\s*([,;]\s*)?(//.*|/\*.*)?$"
+                   .replace("{m}", r"[A-Za-z_]\w*(\([^)]*\)|\{[^}]*\})?(\s*=\s*[^=,;\s]([^=,;]*[^=,;\s])?)?")),
+}
+MP_ORDER = re.compile(r"\bMemoryPackOrder\(\s*(\d+)\s*\)")
+MP_UNION = re.compile(r"\bMemoryPackUnion\(\s*(\d+)")
+MP_TYPE = re.compile(r"\b(class|struct|record|interface)\s+(\w+)")
+MP_ATTR = re.compile(r"\[MemoryPack(Ignore|Include|Constructor|Formatter|AllowSerialize)\b")
+MP_FIELD = re.compile(r"^\s*(\[[^\]]*\]\s*)*((public|internal|protected|private|readonly|"
+                      r"required|new|volatile)\s+)+[\w<>\[\],.?]+(\s*<[^>]*>)?\s+\w+\s*"
+                      r"(;|=(?!>)|\{\s*(get|init|set)\b)")
+CHECKS_OFF = re.compile(r"Il2CppSetOption\(\s*Option\.(\w+)\s*,\s*false\s*\)|"
+                        r"\b(unsafe)\s+(partial\s+)?(class|struct)\b|\[(SkipLocalsInit)\b")
+
+
+def read_blobs(root, rev, paths):
+    """{path: text} of the files that exist at rev, through one `git cat-file --batch`."""
+    paths = [p for p in dict.fromkeys(paths) if "\n" not in p]
+    if not paths:
+        return {}
+    out = git(root, "cat-file", "--batch", stdin="".join(f"{rev}:{p}\n" for p in paths).encode())
+    texts, pos = {}, 0
+    for p in paths:
+        end = out.index(b"\n", pos)
+        head = out[pos:end].split()
+        pos = end + 1
+        if head[-1:] == [b"missing"]:  # the object name may hold spaces: test the end first
+            continue
+        if len(head) == 3 and head[1] == b"blob":
+            size = int(head[2])
+            texts[p] = out[pos:pos + size].decode("utf-8", "replace")
+            pos += size + 1
+        elif len(head) == 3:  # a tree or a submodule: no content
+            pos += int(head[2]) + 1
+    return texts
+
+
+def ext_of(path):
+    return path.rpartition(".")[2].lower() if "." in path.rpartition("/")[2] else ""
+
+
+def wants_base(f):
+    """Whether a check reads this file's content: brace languages and Python for enums,
+    MemoryPack and switched-off checks, JSON for "only reformatted"."""
+    path = f["new"] or f["old"]
+    return bool(f["old"]) and not f["binary"] and bool(f["hunks"]) and \
+        ext_of(path) in BRACE_EXT | JSON_EXT | {"py"}
+
+
+def base_texts(root, spec, files):
+    """{old path: text at the base} for the files a check reads."""
+    return read_blobs(root, base_of(root, spec), [f["old"] for f in files if wants_base(f)])
+
+
+def text_lines(text):
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def apply_hunks(old, hunks):
+    """The new side's lines: the base's with the hunks applied, or None if they do not fit."""
+    out, pos = [], 0
+    try:
+        for h in hunks:
+            n_old = sum(1 for t, _ in h["lines"] if t in " -")
+            start = h["old_start"] - (1 if n_old else 0)
+            if start < pos:
+                return None
+            out += old[pos:start]
+            pos = start
+            for t, body in h["lines"]:
+                if t in " -":
+                    if old[pos] != body:
+                        return None
+                    pos += 1
+                if t in " +":
+                    out.append(body)
+        return out + old[pos:]
+    except IndexError:
+        return None
+
+
+def line_positions(h):
+    """(tag, text, old index, new index) per changed line; an added line's old index is the
+    base line it goes before, a removed line's new index the new line it was before."""
+    n_old = sum(1 for t, _ in h["lines"] if t in " -")
+    n_new = sum(1 for t, _ in h["lines"] if t in " +")
+    o = h["old_start"] - (1 if n_old else 0)
+    n = h["new_start"] - (1 if n_new else 0)
+    out = []
+    for t, body in h["lines"]:
+        if t in "+-":
+            out.append((t, body, o, n))
+        o += t in " -"
+        n += t in " +"
+    return out
+
+
+def brace_scopes(lines):
+    """For each position 0..len(lines), the index of the line opening the innermost {} block
+    the position is in (-1: none). Strings and comments are skipped roughly."""
+    stack, out = [], []
+    for i, line in enumerate(lines):
+        out.append(stack[-1] if stack else -1)
+        code = re.sub(r'"(\\.|[^"\\])*"|\'(\\.|[^\'\\])*\'|//.*', "", line)
+        for ch in code:
+            if ch == "{":
+                stack.append(i)
+            elif ch == "}" and stack:
+                stack.pop()
+    out.append(stack[-1] if stack else -1)
+    return out
+
+
+def header_at(lines, i):
+    """The declaration a block opened on line i belongs to, with the attribute lines above it:
+    (declaration line, attribute text)."""
+    if i < 0:
+        return "", ""
+    k = i
+    if lines[k].strip().startswith("{") and k > 0:
+        k -= 1
+        while k > 0 and (not lines[k].strip() or re.match(r"^\s*(:|,|where\b)", lines[k])):
+            k -= 1
+    attrs, a = [], k - 1
+    while a >= 0 and re.match(r"^\s*(\[|@)", lines[a]) and len(attrs) < 8:
+        attrs.append(lines[a])
+        a -= 1
+    return lines[k], " ".join(attrs) + " " + lines[k]
+
+
+def py_header(lines, pos, indent):
+    """The innermost Python block a line with this indent at this position is in."""
+    for k in range(min(pos, len(lines)) - 1, -1, -1):
+        line = lines[k]
+        if line.strip() and not line.lstrip().startswith("#") and \
+                len(line) - len(line.lstrip()) < indent:
+            return k, line
+    return -1, ""
+
+
+def moved_pairs(changed):
+    """The changed lines that only gained or lost a trailing comma or whitespace in place (the
+    comma an append puts after the old last member): not changes. Lines pair up in order within
+    one run of removed lines and the added lines right after it, so a reorder is still a change.
+    A line that gained members at its end (`A;` -> `A, B;`) pairs only its removed half: the added
+    one is still checked as an insertion."""
+    def norm(body):
+        return re.sub(r"[\s,;]+$", "", body).strip()
+    out, i = set(), 0
+    while i < len(changed):
+        gone, came = [], []
+        while i < len(changed) and changed[i][0] == "-" and \
+                (not gone or changed[i][2] == changed[gone[-1]][2] + 1):
+            gone.append(i)
+            i += 1
+        while i < len(changed) and changed[i][0] == "+" and (
+                changed[i][3] == changed[came[-1]][3] + 1 if came else
+                not gone or changed[i][2:] == (changed[gone[-1]][2] + 1, changed[gone[-1]][3])):
+            came.append(i)
+            i += 1
+        for g, c in zip(gone, came):
+            a, b = norm(changed[g][1]), norm(changed[c][1])
+            if a == b:
+                out |= {g, c}
+            elif b.startswith(a + ","):
+                out.add(g)
+    return out
+
+
+def one_line_append(body, changed):
+    """Whether a one-line enum only gained members at its end in an added line of the hunk
+    (or any members, for Swift's CodingKeys)."""
+    head, _, rest = body.partition("{")
+
+    def members(text):
+        text = re.sub(r"\bcase\b", "", text.partition("}")[0])
+        return [m.strip() for m in text.split(",") if m.strip()]
+    old = members(rest)
+    for t, b, *_ in changed:
+        if t == "+" and b.partition("{")[0].strip() == head.strip():
+            new = members(b.partition("{")[2])
+            keys = re.search(r"\bCodingKeys\b", head)
+            return new[:len(old)] == old or bool(keys) and set(old) <= set(new)
+    return False
+
+
+def next_code(lines, i):
+    """The first line from index i on that is not blank or a comment, or None."""
+    while i < len(lines):
+        if not COMMENT.match(lines[i]):
+            return lines[i]
+        i += 1
+    return None
+
+
+def memo(ctx, key, make):
+    """ctx[key], made once per file: the checks run per hunk and must not rescan the file."""
+    if key not in ctx:
+        ctx[key] = make()
+    return ctx[key]
+
+
+def enum_risk(f, hunks, old, new, ctx):
+    """Enum members removed, changed, reordered or inserted anywhere but the end, and a changed
+    declaration (name, underlying type): what renumbers values that saves, packets and other
+    builds still hold. Appending, an enum that is only a namespace (no `case` in Swift) and keys
+    added to `CodingKeys` are not raised."""
+    path = f["new"] or f["old"]
+    ext = ext_of(path)
+    if ext not in BRACE_EXT and ext != "py":
+        return []
+    lang = "py" if ext == "py" else "swift" if ext == "swift" else ""
+    member = ENUM_MEMBER[lang]
+    scopes = memo(ctx, "old_scopes", lambda: brace_scopes(old)) if lang != "py" else None
+
+    def enum_of(line, pos):
+        if lang == "py":
+            k, head = py_header(old, pos, len(line) - len(line.lstrip()))
+            return (k, head) if PY_ENUM.match(head) else None
+        k = scopes[min(pos, len(old))]
+        head, _ = header_at(old, k)
+        return (k, head) if ENUM_DECL.match(head) else None
+
+    for h in hunks:
+        changed = line_positions(h)
+        same = moved_pairs(changed)
+        for j, (t, body, o, n) in enumerate(changed):
+            if COMMENT.match(body) or j in same:
+                continue
+            if t == "-" and ENUM_DECL.match(body):
+                if "{" in body and "}" in body:  # a one-line enum
+                    if (lang != "swift" or "case" in body) and not one_line_append(body, changed):
+                        return [("enum", short(body))]
+                    continue
+                if lang != "swift" or ":" in body:  # renamed, or another underlying type
+                    return [("enum", short(body))]
+            e = enum_of(body, o)
+            if not e or not member.match(body) or body.strip() in ("{", "}"):
+                continue
+            name = re.search(r"\b(enum|class)\s+(\w+)", e[1])
+            if t == "-":
+                return [("enum", short(e[1]))]
+            if name and name.group(2) == "CodingKeys":
+                continue
+            # What follows the insertion once the lines this hunk adds are skipped: the end of
+            # the members, or an old member it went in front of.
+            added = {x[3] for x in changed if x[0] == "+"}
+            x, prev = n + 1, body
+            while x < len(new) and (x in added or COMMENT.match(new[x])):
+                prev = new[x] if not COMMENT.match(new[x]) else prev
+                x += 1
+            after = new[x] if x < len(new) else None
+            if lang == "py":
+                ends = after is None or \
+                    len(after) - len(after.lstrip()) <= len(e[1]) - len(e[1].lstrip()) or \
+                    re.match(r"^\s*(def|@|class)\b", after)
+            else:
+                ends = after is None or after.strip().startswith("}") or \
+                    lang == "swift" and not member.match(after) or \
+                    re.sub(r"\s*(//.*|/\*.*)$", "", prev).endswith(";")  # Java: members end
+            if not ends:
+                return [("enum", short(e[1]))]
+    return []
+
+
+def union_owner(lines, i):
+    """The name of the type a `[MemoryPackUnion]` on line i is attached to: the first
+    declaration from that line on, past attribute and comment lines."""
+    for line in lines[i:i + 40]:
+        m = MP_TYPE.search(line)
+        if m:
+            return m.group(2)
+        if not (MP_UNION.search(line) or COMMENT.match(line) or line.lstrip().startswith("[")):
+            return None
+    return None
+
+
+def memorypack_risk(f, hunks, old, new, ctx):
+    """MemoryPack layout of an existing type changed: a member removed, rewritten or reordered
+    (order, type, name), one inserted before the last, an order or union tag of that type reused,
+    `[MemoryPackable]` itself changed. A new type and edits in comments are not raised."""
+    if ext_of(f["new"] or f["old"]) != "cs" or \
+            not memo(ctx, "has_mp", lambda: any("MemoryPack" in x for x in old)):
+        return []
+    scopes = memo(ctx, "old_scopes", lambda: brace_scopes(old))
+    new_scopes = memo(ctx, "new_scopes", lambda: brace_scopes(new))
+
+    def packable(pos):
+        k = scopes[min(pos, len(old))]
+        head, full = header_at(old, k)
+        return (k, head) if "MemoryPackable" in full and \
+            re.search(r"\b(class|struct|record|interface)\b", head) else None
+
+    def tags():
+        orders, unions = {}, {}
+        for i, line in enumerate(old):
+            m = MP_ORDER.search(line)
+            if m:
+                orders.setdefault(scopes[i], []).append(int(m.group(1)))
+            m = MP_UNION.search(line)
+            if m:
+                unions.setdefault(union_owner(old, i), []).append(int(m.group(1)))
+        return orders, unions
+    orders, unions = memo(ctx, "mp_tags", tags)
+    for h in hunks:
+        changed = line_positions(h)
+        same = moved_pairs(changed)
+        for j, (t, body, o, n) in enumerate(changed):
+            if COMMENT.match(body) or body.strip() in ("{", "}") or j in same:
+                continue
+            m = MP_UNION.search(body)
+            if t == "-" and (m or re.search(r"\bMemoryPackable\b", body)):
+                return [("memorypack", short(body))]
+            if m:
+                owner = union_owner(new, n)
+                if int(m.group(1)) <= max(unions.get(owner, []) if owner else [], default=-1):
+                    return [("memorypack", short(body))]
+            cls = packable(o)
+            if not cls:
+                continue
+            if t == "-" and (MP_ORDER.search(body) or MP_ATTR.search(body) or MP_FIELD.match(body)):
+                return [("memorypack", short(body))]
+            if t == "-":
+                continue
+            m = MP_ORDER.search(body)
+            if m and int(m.group(1)) <= max(orders.get(cls[0], []), default=-1):
+                return [("memorypack", short(body))]
+            if MP_ATTR.search(body):
+                return [("memorypack", short(body))]
+            if not orders.get(cls[0]) and MP_FIELD.match(body):
+                k = new_scopes[n]  # the type's block in the new side; its own fields only
+                for x in range(n + 1, len(new)):
+                    if new_scopes[x] < k:
+                        break
+                    if new_scopes[x] == k and MP_FIELD.match(new[x]) and not COMMENT.match(new[x]):
+                        return [("memorypack", short(body))]
+    return []
+
+
+def same_json(old, new):
+    """Whether two JSON texts hold the same value, keys in the same order: only reformatted."""
+    def load(lines):  # numbers kept as text: in Python true == 1 == 1.0
+        return json.loads("\n".join(lines), object_pairs_hook=list,
+                          parse_int=lambda s: ("int", s), parse_float=lambda s: ("float", s))
+    try:
+        return new is not None and load(old) == load(new)
+    except (ValueError, RecursionError):
+        return False
+
+
+def checks_off(lines):
+    """The safety checks the file switches off for a class or the whole file, as text."""
+    found = []
+    for line in lines:
+        for m in CHECKS_OFF.finditer(line):
+            what = m.group(1) or m.group(2) or m.group(5)
+            if what not in found:
+                found.append(what)
+    return found
+
+
 def is_noise(path, patterns):
     """gitignore-like globs: a pattern without `/` matches a file name at any depth; one with `/`
     (or a leading `/`) matches from the repository root; a leading `**/` lets it start at any
@@ -532,26 +925,42 @@ def is_noise(path, patterns):
     return False
 
 
-def make_units(files, patterns, risk=()):
+def make_units(files, patterns, risk=(), base=None):
     """One unit per hunk, or per file without hunks; a noise file is one unit, and the risk
-    rules still read all of it."""
+    rules still read all of it. `base` ({old path: text}) feeds the checks that read the file;
+    without it they are skipped."""
     rules, _ = risk_rules(risk)
     units, h, n = [], 0, 0
     for fi, f in enumerate(files):
         f["noise"] = is_noise(f["new"] or f["old"], patterns)
+        old = text_lines(base[f["old"]]) if base and f["old"] in base else None
+        new = apply_hunks(old, f["hunks"]) if old is not None else \
+            [b for hk in f["hunks"] for t, b in hk["lines"] if t == "+"] \
+            if f["status"] == "A" else None
+        f["checks_off"] = checks_off(new) if new and ext_of(f["new"] or "") == "cs" else []
+        f["format_only"] = old is not None and ext_of(f["new"] or "") in JSON_EXT and \
+            f["new"] == f["old"] and same_json(old, new)
+
+        ctx = {}
+
+        def risk_of(hunks):
+            if f["format_only"]:
+                return []
+            out = unit_risk(f, hunks, rules)
+            if old is not None and new is not None:  # None: the hunks do not fit this base
+                out += [x for x in enum_risk(f, hunks, old, new, ctx) +
+                        memorypack_risk(f, hunks, old, new, ctx) if x not in out]
+            return out
         if f["noise"]:
             n += 1
-            units.append({"id": f"n{n}", "file": fi, "hunk": None,
-                          "risk": unit_risk(f, f["hunks"], rules)})
+            units.append({"id": f"n{n}", "file": fi, "hunk": None, "risk": risk_of(f["hunks"])})
         elif not f["hunks"]:
             h += 1
-            units.append({"id": f"h{h}", "file": fi, "hunk": None,
-                          "risk": unit_risk(f, [], rules)})
+            units.append({"id": f"h{h}", "file": fi, "hunk": None, "risk": risk_of([])})
         else:
             for hi, hunk in enumerate(f["hunks"]):
                 h += 1
-                units.append({"id": f"h{h}", "file": fi, "hunk": hi,
-                              "risk": unit_risk(f, [hunk], rules)})
+                units.append({"id": f"h{h}", "file": fi, "hunk": hi, "risk": risk_of([hunk])})
     return units
 
 
@@ -570,9 +979,10 @@ def load_snapshot(run_dir):
     files = parse(patch.decode("utf-8", "replace"))
     try:
         patterns, risk = rules_at_base(meta["root"], meta["spec"])
+        base = base_texts(meta["root"], meta["spec"], files)
     except (Fail, OSError) as e:
         raise Fail(f"cannot re-read the noise and risk rules at the base: {e}") from None
-    return meta, files, make_units(files, patterns, risk)
+    return meta, files, make_units(files, patterns, risk, base)
 
 
 # --- unit descriptions -------------------------------------------------------------------
@@ -594,6 +1004,10 @@ def facts(f):
         out.append(("binary", {}))
     elif not f["hunks"] and f["status"] in ("A", "D"):
         out.append(("empty", {}))
+    if f.get("format_only"):
+        out.append(("format_only", {}))
+    if f.get("checks_off"):
+        out.append(("checks_off", {"what": ", ".join(f["checks_off"])}))
     return out
 
 
@@ -608,7 +1022,9 @@ def unit_src(files, u):
 
 INDEX_FACTS = {"noise": "noise", "new": "new file", "deleted": "deleted",
                "renamed": "renamed from {old} ({pct}%)", "mode": "mode {a} -> {b}",
-               "binary": "binary", "empty": "empty file"}
+               "binary": "binary", "empty": "empty file",
+               "format_only": "only reformatted: the same JSON",
+               "checks_off": "checks switched off in this file: {what}"}
 
 
 def index_entry(files, u):
@@ -703,7 +1119,7 @@ def collect(arg, out_root):
         raise Fail(f"git printed a diff diff-tour cannot read (it starts with {first!r})")
     patterns, risk = rules_at_base(root, spec)
     _, bad_rules = risk_rules(risk)
-    units = make_units(files, patterns, risk)
+    units = make_units(files, patterns, risk, base_texts(root, spec, files))
     repo = os.path.basename(root)
     run_dir = new_run_dir(out_root, repo)
     with open(os.path.join(run_dir, "patch.diff"), "wb") as fh:
@@ -716,6 +1132,12 @@ def collect(arg, out_root):
     index = [index_entry(files, u) for u in units]
     with open(os.path.join(run_dir, "hunks.json"), "w", encoding="utf-8") as fh:
         json.dump({"version": 1, "meta": meta, "units": index}, fh, ensure_ascii=False, indent=1)
+    # index.txt: hunks.json in a form a reviewer can read whole on a diff of thousands of units
+    table = index_table(index)
+    with open(os.path.join(run_dir, "index.txt"), "w", encoding="utf-8") as fh:
+        fh.write(f"root: {root}\nold_rev: {meta['old_rev']}\n"
+                 f"new_rev: {meta['new_rev'] or '(working tree)'}\nunits: {len(index)}\n\n")
+        fh.write("".join(line + "\n" for line in table))
     prune(os.path.dirname(run_dir))
 
     noisy = [f for f in files if f["noise"]]
@@ -743,15 +1165,24 @@ def collect(arg, out_root):
         print(f"WARNING: {plain_lines} changed lines outside noise — consider a narrower ref "
               f"or noise patterns in {NOISE_FILE}")
     print()
+    for line in table:
+        print(line)
+    return 0
+
+
+def index_table(index):
+    """One line per unit: id, status, path, where, facts, risk, size and its line in
+    patch.diff — what collect prints and index.txt holds."""
     width = max(len(e["path"]) for e in index)
+    out = []
     for e in index:
         tags = f"[{e['facts']}]" if e["facts"] else ""
         if e["risk"]:
             tags += f" [risk {'; '.join(e['risk'])}]"
         text = " ".join(x for x in (e["where"], tags) if x)
-        print(f"{e['id']:<5} {e['status']}  {e['path']:<{width}}  {text}  "
-              f"+{e['added']} -{e['removed']}  L{e['line']}")
-    return 0
+        out.append(f"{e['id']:<5} {e['status']}  {e['path']:<{width}}  {text}  "
+                   f"+{e['added']} -{e['removed']}  L{e['line']}")
+    return out
 
 
 # --- notes.json --------------------------------------------------------------------------
@@ -923,17 +1354,18 @@ def validate(notes, files, units):
 
 # --- triage ------------------------------------------------------------------------------
 
-TRIAGE_KEYS = {"units_seen", "suspects", "risks"}
-TRIAGE_ITEMS = (("suspects", "text"), ("risks", "check"))
+TRIAGE_KEYS = {"units_seen", "suspects", "risks", "cleared"}
+TRIAGE_ITEMS = (("suspects", "text"), ("risks", "check"), ("cleared", "why"))
 
 
 TRIAGE_MIN = 2  # reviewers the triage step runs; build waits for all of them
 
 
 def load_triage(run_dir, units):
-    """Every triage-<name>.json a fresh reviewer wrote, as [{name, units_seen, suspects, risks}],
+    """Every triage-<name>.json a fresh reviewer wrote, as [{name, units_seen, suspects, risks, cleared}],
     and the problems in them. Each reviewer has a file of its own; nothing is merged away."""
     ids = {u["id"] for u in units}
+    ruled = {u["id"] for u in units if u["risk"]}
     reviews, errs = [], []
     names = sorted(fn for fn in os.listdir(run_dir)
                    if fn.startswith("triage-") and fn.endswith(".json"))
@@ -964,22 +1396,27 @@ def load_triage(run_dir, units):
             for i, it in enumerate(items):
                 if not isinstance(it, dict) or not isinstance(it.get("unit"), str) \
                         or it["unit"] not in ids:
-                    errs.append(f"{fn}: {key}[{i}]: unit must be an id from hunks.json")
+                    errs.append(f"{fn}: {key}[{i}]: unit must be an id from index.txt")
                 elif not text_ok(it.get(field)):
                     errs.append(f"{fn}: {key}[{i}]: {field} must be non-empty text")
+                elif key == "cleared" and it["unit"] not in ruled:
+                    errs.append(f"{fn}: cleared[{i}]: {it['unit']} was not raised by a risk "
+                                f"rule — cleared is only for those")
         reviews.append({"name": fn[len("triage-"):-len(".json")], "units_seen": seen,
-                        "suspects": t.get("suspects", []), "risks": t.get("risks", [])})
+                        "suspects": t.get("suspects", []), "risks": t.get("risks", []),
+                        "cleared": t.get("cleared", [])})
     return reviews, errs
 
 
 def queue(units, notes, reviews):
     """(suspects, reasons): suspects are units a reviewer named a concrete failure in, as
     {unit id: [(reviewer, text)]}; reasons are why any unit is worth a look whatever the
-    reviewers think — the script's risk rules, a reviewer's risk list, the author's own flags —
-    as {unit id: [(source, key, text)]}. Only the script folds: a unit leaves the queue when
-    nobody and no rule raised it; nothing raised can be dropped here. Having a note or not
-    moves no unit either way: on a big diff most units have none, and a note is the author's
-    word, not a check."""
+    reviewers think — the script's risk rules, a reviewer's risk list, the author's own flags,
+    and a reviewer's word on why a rule's hit is safe — as {unit id: [(source, key, text)]}, the
+    same text from several reviewers once with their names joined. Only the script folds: a
+    unit leaves the queue when nobody and no rule raised it; nothing raised can be dropped here,
+    a `cleared` line included. Having a note or not moves no unit either way: on a big diff
+    most units have none, and a note is the author's word, not a check."""
     suspects, reasons = {}, {}
     for r in reviews:
         for s in r["suspects"]:
@@ -987,12 +1424,17 @@ def queue(units, notes, reviews):
     for u in units:
         for k, d in u["risk"]:
             reasons.setdefault(u["id"], []).append(("script", k, d))
-    for r in reviews:
-        for it in r["risks"]:
-            reasons.setdefault(it["unit"], []).append(("reviewer", r["name"], it["check"]))
+    for src, key, field in (("cleared", "cleared", "why"), ("reviewer", "risks", "check")):
+        said = {}
+        for r in reviews:
+            for it in r.get(key, []):
+                said.setdefault((it["unit"], it[field]), []).append(r["name"])
+        for (uid, text), who in said.items():
+            reasons.setdefault(uid, []).append((src, ", ".join(who), text))
     for n in notes["notes"]:
-        if n.get("kind"):
-            reasons.setdefault(n["unit"], []).append(("author", n["kind"], ""))
+        flag = ("author", n.get("kind"), "")
+        if n.get("kind") and flag not in reasons.get(n["unit"], []):
+            reasons.setdefault(n["unit"], []).append(flag)
     return suspects, reasons
 
 
@@ -1066,7 +1508,8 @@ LABELS = {
         "fact": {"noise": "noise",
                  "new": "new file", "deleted": "deleted",
                  "renamed": "renamed from {old} ({pct}%)", "mode": "mode {a} → {b}",
-                 "binary": "binary", "empty": "empty file"},
+                 "binary": "binary", "empty": "empty file",
+                 "format_only": "only reformatted", "checks_off": "checks off: {what}"},
         "body": {"binary": "Binary content changed — not shown.",
                  "renamed": "Renamed without content changes.",
                  "mode": "Only the file mode changed.", "empty": "Empty file."},
@@ -1083,8 +1526,9 @@ LABELS = {
                              "they are listed in the Self-check panel and marked in the whole "
                              "diff.",
               "why": {"path": "path", "line": "line", "section": "inside",
-                      "test": "test weakened"},
-              "author": "author: {flag}"},
+                      "test": "test weakened", "enum": "enum members",
+                      "memorypack": "MemoryPack layout"},
+              "author": "author: {flag}", "cleared": "why safe"},
     },
     "ru": {
         "unexplained": "Не объяснено", "no_what": "без описания", "selfcheck": "Самопроверка",
@@ -1113,7 +1557,9 @@ LABELS = {
         "fact": {"noise": "шум",
                  "new": "новый файл", "deleted": "удалён",
                  "renamed": "переименован из {old} ({pct}%)", "mode": "режим {a} → {b}",
-                 "binary": "бинарный", "empty": "пустой файл"},
+                 "binary": "бинарный", "empty": "пустой файл",
+                 "format_only": "только форматирование",
+                 "checks_off": "проверки отключены: {what}"},
         "body": {"binary": "Бинарное содержимое изменено — не показано.",
                  "renamed": "Переименование без изменений содержимого.",
                  "mode": "Изменился только режим файла.", "empty": "Пустой файл."},
@@ -1131,8 +1577,9 @@ LABELS = {
                              "поднимаются — список в «Самопроверке», во всём диффе они "
                              "помечены.",
               "why": {"path": "путь", "line": "строка", "section": "внутри",
-                      "test": "тест ослаблен"},
-              "author": "автор: {flag}"},
+                      "test": "тест ослаблен", "enum": "члены enum",
+                      "memorypack": "раскладка MemoryPack"},
+              "author": "автор: {flag}", "cleared": "почему безопасно"},
     },
 }
 
@@ -1394,15 +1841,21 @@ class Page:
         if src == "script":
             return (f'<li><span class="pill warn">{esc(Q["why"][key])}</span>'
                     f'<span><code>{esc(text)}</code></span></li>')
-        if src == "reviewer":
-            return (f'<li><span class="pill warn">?</span><span>{prose(text)} '
-                    f'<span class="by">{esc(Q["by"].format(name=key))}</span></span></li>')
+        if src in ("reviewer", "cleared"):
+            who = key.split(", ")
+            label = Q["by_all"] if len(self.reviewers) > 1 and set(who) == set(self.reviewers) \
+                else Q["by"].format(name=key)
+            pill = '<span class="pill warn">?</span>' if src == "reviewer" else \
+                f'<span class="pill muted">{esc(Q["cleared"])}</span>'
+            return (f'<li>{pill}<span>{prose(text)} '
+                    f'<span class="by">{esc(label)}</span></span></li>')
         flag = Q["author"].format(flag=self.L["flag"][key])
         return f'<li><span class="pill warn">{esc(flag)}</span><span></span></li>'
 
     def queue(self, reviews):
         Q = self.L["q"]
         suspects, reasons = queue(self.units, {"notes": self.notes}, reviews)
+        self.reviewers = [r["name"] for r in reviews]
         sus = [u for u in self.units if u["id"] in suspects]
         risk = [u for u in self.units if u["id"] in reasons and u["id"] not in suspects]
         folded = len(self.units) - len(sus) - len(risk)
@@ -1708,11 +2161,27 @@ def build(run_dir, open_page, whole=False):
     return 0
 
 
+def collect_target(words):
+    """The one ref or range among collect's arguments. `all` comes from the skill's
+    `/diff-tour all [ref]` and only skips the triage step, so it is dropped — unless the
+    repository has a ref of that name and nothing else was given."""
+    if words and words[0] == "all":
+        named = git(toplevel(os.getcwd()), "rev-parse", "--verify", "-q", "all^{commit}",
+                    ok=(0, 1)).strip()
+        if len(words) > 1 or not named:
+            words = words[1:]
+    if len(words) > 1:
+        raise Fail(f"collect takes one ref or range, got: {' '.join(words)}")
+    return words[0] if words else None
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog="difftour.py", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("collect", help="snapshot the diff and print the unit index")
-    c.add_argument("target", nargs="?", help="REF, or a range A..B (commits or trees) / A...B")
+    c.add_argument("target", nargs="*", metavar="target",
+                   help="REF, or a range A..B (commits or trees) / A...B; a leading `all` (the "
+                        "skill's own switch) is dropped unless it names a ref")
     c.add_argument("--out-root", default=OUT_ROOT,
                    help="where run directories go (default ~/.cache/kensei-diff)")
     b = sub.add_parser("build", help="check notes.json and render index.html")
@@ -1723,7 +2192,7 @@ def main(argv):
     args = ap.parse_args(argv)
     try:
         if args.cmd == "collect":
-            return collect(args.target, args.out_root)
+            return collect(collect_target(args.target), args.out_root)
         return build(args.run_dir, args.open, args.whole)
     except Fail as e:
         print(f"diff-tour: {e}", file=sys.stderr)

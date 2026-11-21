@@ -229,13 +229,17 @@ class Collect(unittest.TestCase):
         write(path, "a.txt", "2\n")
         git(path, "commit", "-qam", "two")
         write(path, "a.txt", "3\n")
-        for args, new in (((), None), (("HEAD~1..HEAD",), "HEAD"), (("HEAD~1..",), "HEAD")):
+        head, base = (subprocess.run(["git", "rev-parse", r], cwd=path, check=True, capture_output=True,
+                                     text=True).stdout.strip() for r in ("HEAD", "HEAD~1"))
+        for args, new, old in (((), None, head), (("HEAD~1..HEAD",), head, base),
+                               (("HEAD~1..",), head, base)):
             with self.subTest(args=args):
                 run_dir, _ = collect(path, *args)
                 with open(os.path.join(run_dir, "hunks.json"), encoding="utf-8") as fh:
                     meta = json.load(fh)["meta"]
+                # pinned: build and the reviewers read these commits after the branch moves on
                 self.assertEqual(meta["new_rev"], new)
-                self.assertTrue(meta["old_rev"])
+                self.assertEqual(meta["old_rev"], old)
 
     def test_nested_repository_is_reported_not_diffed(self):
         path = repo({"a.txt": "a\n"})
@@ -600,9 +604,26 @@ class Risk(unittest.TestCase):
         write(r, "Game.asmdef", '{"name": "Game"}\n')
         risk = [(u["path"], u["risk"]) for u in index(collect(r)[0])]
         self.assertEqual([v for p, v in risk if p == "Net.cs"],
-                         [["line: enum Kind { A }"], []])  # the far hunk is not raised
+                         [[], []])  # B appended to a one-line enum; the far hunk is not raised
         self.assertEqual([v for p, v in risk if p == "tool.js"], [["line: process.kill(pid)"]])
         self.assertEqual([v for p, v in risk if p == "Game.asmdef"], [["path: *.asmdef"]])
+
+    def test_collect_drops_the_skills_all(self):
+        r = repo({"a.py": "1\n"})
+        write(r, "a.py", "2\n")
+        self.assertIn("1 files", collect(r, "all")[1])
+        git(r, "commit", "-qam", "two")
+        self.assertIn("Base: HEAD~1..HEAD", collect(r, "all", "HEAD~1..HEAD")[1])
+        code, _, err = run(r, "collect", "a", "b", "--out-root", OUT)
+        self.assertEqual(code, 2)
+        self.assertIn("one ref or range", err)
+
+    def test_parametrized_tests_are_counted(self):
+        old = "test.each([1, 2])('a %i', (n) => {\n  expect(f(n)).toBe(1)\n})\n"
+        r = repo({"src/a.test.ts": old + "it('b', () => {\n  expect(g()).toBe(1)\n})\n"})
+        write(r, "src/a.test.ts", old)
+        self.assertEqual(self.path_risk(collect(r)[0])["src/a.test.ts"],
+                         ["test: tests −1 +0, asserts −1 +0"])
 
     def test_weakened_test_is_risky_a_new_test_is_not(self):
         old = "def test_a():\n    assert f() == 1\n\ndef test_b():\n    assert g()\n"
@@ -630,8 +651,169 @@ class Risk(unittest.TestCase):
     def test_enum_members_raised_by_the_code_around_them(self):
         r = repo({"Kind.cs": "public enum Kind\n{\n    A = 0,\n    B = 1,\n}\n"})
         write(r, "Kind.cs", "public enum Kind\n{\n    A = 0,\n    X = 1,\n    B = 2,\n}\n")
-        self.assertEqual(self.path_risk(collect(r)[0])["Kind.cs"],
-                         ["section: public enum Kind"])
+        self.assertEqual(self.path_risk(collect(r)[0])["Kind.cs"], ["enum: public enum Kind"])
+
+    def enum_risk(self, path, old, new):
+        r = repo({path: old})
+        write(r, path, new)
+        return self.path_risk(collect(r)[0])[path]
+
+    def test_enum_member_appended_is_not_raised(self):
+        old = "public enum Kind\n{\n    A = 0,\n    B = 1,\n}\n"
+        self.assertEqual(self.enum_risk("Kind.cs", old, old.replace("B = 1,\n", "B = 1,\n    C = 2,\n")), [])
+        self.assertEqual(self.enum_risk("Kind.cs", old, old.replace("B = 1", "B = 3")),
+                         ["enum: public enum Kind"])
+        self.assertEqual(self.enum_risk("Kind.cs", old, old.replace("    B = 1,\n", "")),
+                         ["enum: public enum Kind"])
+
+    def test_enum_without_cases_or_imported_is_not_raised(self):
+        ns = "enum Paths {\n    static let a = 1\n}\n"
+        self.assertEqual(self.enum_risk("P.swift", ns, ns.replace("a = 1\n", "b = 0\n    static let a = 1\n")), [])
+        self.assertEqual(self.enum_risk("a.py", "import os\n", "from enum import Enum\nimport os\n"), [])
+        swift = "enum K {\n    case a\n    case b\n}\n"
+        self.assertEqual(self.enum_risk("K.swift", swift, swift.replace("case a\n", "case a\n    case x\n")),
+                         ["enum: enum K {"])
+
+    def test_one_line_enum(self):
+        old = "enum Kind { A, B }\n"
+        self.assertEqual(self.enum_risk("K.cs", old, "enum Kind { A, X, B }\n"), ["enum: enum Kind { A, B }"])
+        keys = "    enum CodingKeys: String, CodingKey { case a, b }\n"
+        self.assertEqual(self.enum_risk("M.swift", keys, keys.replace("a, b", "x, a, b")), [])
+
+    def test_enum_reorder_and_gaps(self):
+        old = "public enum Kind\n{\n    A,\n    B,\n    C,\n}\n"
+        raised = ["enum: public enum Kind"]
+        self.assertEqual(self.enum_risk("K.cs", old, old.replace("A,\n    B,", "B,\n    A,")), raised)
+        self.assertEqual(self.enum_risk("K.cs", old, old.replace("A,\n", "A,\n    X,\n\n")), raised)
+        self.assertEqual(self.enum_risk("K.cs", old, old.replace("A,\n", "A,\n    X,\n    // legacy\n")), raised)
+        self.assertEqual(self.enum_risk("K.cs", old, old.replace("C,\n", "C,\n\n    // new\n    D,\n")), [])
+
+    def test_enum_declaration_and_member_lines(self):
+        allman = "public enum Kind : byte\n{\n    A,\n}\n"
+        self.assertEqual(self.enum_risk("K.cs", allman, allman.replace("byte", "int")),
+                         ["enum: public enum Kind : byte"])
+        many = "enum Dir\n{\n    North, East,\n    South,\n}\n"
+        self.assertEqual(self.enum_risk("D.cs", many, many.replace("North, East", "North, NorthEast, East")),
+                         ["enum: enum Dir"])
+        java = "enum Color {\n    RED,\n    GREEN;\n\n    private int x;\n}\n"
+        self.assertEqual(self.enum_risk("C.java", java, java.replace("GREEN;", "GREEN, BLUE;")), [])
+        self.assertEqual(self.enum_risk("C.java", java, java.replace("GREEN;", "GREEN,\n    BLUE;")), [])
+        swift = "enum K {\n    case a\n    case b\n\n    var label: String { \"\" }\n}\n"
+        self.assertEqual(self.enum_risk("K.swift", swift, swift.replace("case b\n", "case b\n    case c\n")), [])
+
+    def test_coding_keys_raised_only_on_removal(self):
+        old = "enum CodingKeys: String, CodingKey {\n    case a\n    case b\n}\n"
+        self.assertEqual(self.enum_risk("M.swift", old, old.replace("case a\n", "case a\n    case x\n")), [])
+        self.assertEqual(self.enum_risk("M.swift", old, old.replace("    case a\n", "")),
+                         ["enum: enum CodingKeys: String, CodingKey {"])
+
+    def test_python_int_enum_insert_is_raised(self):
+        old = "class Kind(IntEnum):\n    A = 1\n    B = 2\n\n\ndef f():\n    pass\n"
+        self.assertEqual(self.enum_risk("k.py", old, old.replace("A = 1\n", "A = 1\n    X = 3\n")),
+                         ["enum: class Kind(IntEnum):"])
+        self.assertEqual(self.enum_risk("k.py", old, old.replace("B = 2\n", "B = 2\n    C = 3\n")), [])
+
+    def test_memorypack_layout(self):
+        old = ("[MemoryPackable]\npublic partial class Save\n{\n    [MemoryPackOrder(0)] public int A;\n"
+               "    [MemoryPackOrder(1)] public int B;\n}\n")
+        append = old.replace("int B;\n", "int B;\n    [MemoryPackOrder(2)] public int C;\n")
+        reuse = old.replace("int B;\n", "int B;\n    [MemoryPackOrder(1)] public int C;\n")
+        retype = old.replace("public int B", "public long B")
+        comment = old.replace("{\n", "{\n    // the player's save\n")
+        fresh = old + "\n[MemoryPackable(GenerateType.VersionTolerant)]\npublic partial class New\n{\n    public int X;\n}\n"
+        self.assertEqual(self.enum_risk("Save.cs", old, append), [])
+        self.assertEqual(self.enum_risk("Save.cs", old, comment), [])
+        self.assertEqual(self.enum_risk("Save.cs", old, fresh), [])
+        self.assertEqual(self.enum_risk("Save.cs", old, reuse),
+                         ["memorypack: [MemoryPackOrder(1)] public int C;"])
+        self.assertEqual(self.enum_risk("Save.cs", old, retype),
+                         ["memorypack: [MemoryPackOrder(1)] public int B;"])
+
+    def test_memorypack_field_inserted_before_others(self):
+        old = "[MemoryPackable]\npublic partial class S\n{\n    public int A;\n    public int B;\n}\n"
+        self.assertEqual(self.enum_risk("S.cs", old, old.replace("int A;\n", "int A;\n    public int X;\n")),
+                         ["memorypack: public int X;"])
+        self.assertEqual(self.enum_risk("S.cs", old, old.replace("int B;\n", "int B;\n    public int X;\n")), [])
+        method = old.replace("int A;\n", "int A;\n    void F()\n    {\n    }\n")
+        self.assertEqual(self.enum_risk("S.cs", method, method.replace("int A;\n", "int A;\n    public int X;\n")),
+                         ["memorypack: public int X;"])
+
+    def test_memorypack_packable_and_base_list(self):
+        old = "[MemoryPackable]\npublic partial class S\n    : IBase\n{\n    public int A;\n    public int B;\n}\n"
+        self.assertEqual(self.enum_risk("S.cs", old, old.replace("int A;\n", "int A;\n    public int X;\n")),
+                         ["memorypack: public int X;"])
+        self.assertEqual(len(self.enum_risk("S.cs", old, old.replace("int A;\n    public int B;",
+                                                                     "int B;\n    public int A;"))), 1)
+        self.assertEqual(self.enum_risk("S.cs", old, old.replace("[MemoryPackable]",
+                                                                 "[MemoryPackable(GenerateType.VersionTolerant)]")),
+                         ["memorypack: [MemoryPackable]"])
+
+    def test_memorypack_union_tags_are_per_type(self):
+        old = ("[MemoryPackable]\n[MemoryPackUnion(0, typeof(A))]\n[MemoryPackUnion(1, typeof(B))]\n"
+               "public partial interface IShape\n{\n}\n")
+        other = old + "\n[MemoryPackable]\n[MemoryPackUnion(0, typeof(C))]\npublic partial interface IOther\n{\n}\n"
+        added = old.replace("typeof(B))]\n", "typeof(B))]\n[MemoryPackUnion(2, typeof(C))]\n")
+        reused = old.replace("typeof(B))]\n", "typeof(B))]\n[MemoryPackUnion(1, typeof(C))]\n")
+        self.assertEqual(self.enum_risk("U.cs", old, other), [])
+        self.assertEqual(self.enum_risk("U.cs", old, added), [])
+        self.assertEqual(self.enum_risk("U.cs", old, reused),
+                         ["memorypack: [MemoryPackUnion(1, typeof(C))]"])
+
+    def test_anonymous_c_enum(self):
+        old = "typedef enum\n{\n    A,\n    B,\n} kind_t;\n"
+        self.assertEqual(self.enum_risk("k.h", old, old.replace("A,\n", "A,\n    X,\n")),
+                         ["enum: typedef enum"])
+        self.assertEqual(self.enum_risk("k.h", old, old.replace("B,\n", "B,\n    C,\n")), [])
+
+    def test_json_number_or_bool_retyped_is_not_reformatting(self):
+        r = repo({"Packages/manifest.json": '{"testables": false, "port": 8080}\n'})
+        write(r, "Packages/manifest.json", '{\n  "testables": 0,\n  "port": 8080.0\n}\n')
+        u = by_path(collect(r)[0])["Packages/manifest.json"]
+        self.assertNotIn("only reformatted", u["facts"])
+        self.assertNotEqual(u["risk"], [])
+
+    def test_json_only_reformatted_drops_the_path_rule(self):
+        r = repo({"Game.asmdef": '{"name": "Game", "references": []}\n'})
+        write(r, "Game.asmdef", '{\n    "name": "Game",\n    "references": []\n}\n')
+        u = by_path(collect(r)[0])["Game.asmdef"]
+        self.assertEqual(u["risk"], [])
+        self.assertIn("only reformatted", u["facts"])
+
+    def test_nested_manifest_and_unity_field(self):
+        r = repo({"Client/Packages/manifest.json": "{}\n", "pkg/package.json": '{\n  "unity": "2022.3"\n}\n'})
+        write(r, "Client/Packages/manifest.json", '{"a": 1}\n')
+        write(r, "pkg/package.json", '{\n  "unity": "6000.0"\n}\n')
+        risk = self.path_risk(collect(r)[0])
+        self.assertEqual(risk["Client/Packages/manifest.json"], ["path: **/Packages/manifest.json"])
+        self.assertEqual(risk["pkg/package.json"], ['line: "unity": "2022.3"'])
+
+    def test_destructive_calls_and_secrets(self):
+        cases = {
+            "a.ts": 'await git(["clean", "-ffdxq"])\n',
+            "b.py": "shutil.rmtree(work)\n",
+            "c.js": "await rm(dir, {recursive: true})\n",
+            "d.py": 'API_KEY = "abcd1234efgh5678"\n',
+            "e.ts": 'run("git", ["push", "origin", "--force-with-lease"])\n',
+        }
+        r = repo({p: "x\n" for p in cases})
+        for p, body in cases.items():
+            write(r, p, body)
+        risk = self.path_risk(collect(r)[0])
+        for p in cases:
+            with self.subTest(path=p):
+                self.assertEqual(len(risk[p]), 1, risk[p])
+        r = repo({"f.py": "x\n"})
+        write(r, "f.py", 'token = os.environ["TOKEN"]\nform.remove(item)\ntokenizer = "bert-base-uncased"\n'
+                         'API_KEY_ENV = "MYAPP_API_KEY_VAR"\nx = {"tokenUrl": "https://example.com/t"}\n')
+        self.assertEqual(self.path_risk(collect(r)[0])["f.py"], [])
+
+    def test_checks_switched_off_is_a_fact(self):
+        top = "[Il2CppSetOption(Option.ArrayBoundsChecks, false)]\npublic unsafe class Buf\n{\n"
+        far = "".join(f"    int x{i};\n" for i in range(30))
+        r = repo({"Buf.cs": top + far + "    void W() { a[i] = 1; }\n}\n"})
+        write(r, "Buf.cs", top + far + "    void W() { a[i + 1] = 1; }\n}\n")
+        u = by_path(collect(r)[0])["Buf.cs"]
+        self.assertIn("ArrayBoundsChecks, unsafe", u["facts"])
 
     def test_rewritten_assert_is_left_to_the_reviewers(self):
         r = repo({"Tests/ATests.cs": "Assert.That(x, Is.EqualTo(new[] { 1, 2 }));\n"})
@@ -640,10 +822,10 @@ class Risk(unittest.TestCase):
 
     def test_noise_is_still_read_by_the_rules(self):
         r = repo({".claude/diff-tour-noise": "gen/\n", "gen/Net.cs": "int a;\n"})
-        write(r, "gen/Net.cs", "[MemoryPackOrder(3)] int a;\n")
+        write(r, "gen/Net.cs", "process.kill(pid);\n")
         u = by_path(collect(r)[0])["gen/Net.cs"]
         self.assertEqual(u["id"], "n1")
-        self.assertEqual(u["risk"], ["line: [MemoryPackOrder(3)] int a;"])
+        self.assertEqual(u["risk"], ["line: process.kill(pid);"])
 
     def test_build_reads_the_rules_again(self):
         r = repo({".claude/review-risk": "path src/pay/\n", "src/pay/a.py": "1\n"})
@@ -774,15 +956,57 @@ class Triage(unittest.TestCase):
         code, out, err = self.build()
         self.assertEqual(code, 1, err)
         for msg in ("triage-1.json: unknown key 'extra'",
-                    "triage-1.json: suspects[0]: unit must be an id from hunks.json",
+                    "triage-1.json: suspects[0]: unit must be an id from index.txt",
                     "triage-1.json: risks[0]: check must be non-empty text",
                     "triage-2.json: units_seen must be",
                     "triage-3.json: not valid JSON",
                     "triage-4.json: units_seen must be the number of units the reviewer read "
                     "(0–4)",
-                    "triage-4.json: suspects[0]: unit must be an id from hunks.json",
+                    "triage-4.json: suspects[0]: unit must be an id from index.txt",
                     "triage-5.json: not valid JSON"):
             self.assertIn(msg, out)
+
+    def test_cleared_and_merged_reasons(self):
+        why = {"unit": "h4", "why": "removes only its own temp dir"}
+        triage(self.run_dir, "1", suspects=[], risks=[{"unit": "h3", "check": "callers?"}],
+               cleared=[why])
+        triage(self.run_dir, "2", suspects=[], risks=[{"unit": "h3", "check": "callers?"}],
+               cleared=[why])
+        code, out, err = self.build()
+        self.assertEqual(code, 0, err)
+        q = self.queue()
+        self.assertIn('data-unit="h4"', q)  # cleared, but still in the queue
+        self.assertIn("why safe</span><span>removes only its own temp dir "
+                      '<span class="by">all reviewers</span>', q)
+        self.assertEqual(q.count("callers?"), 1)
+        self.assertIn("queue: 0 suspected · 3 worth a look · 1 folded", out)
+
+    def test_cleared_only_for_rule_hits(self):
+        triage(self.run_dir, "1", cleared=[{"unit": "h1", "why": "fine"}])
+        triage(self.run_dir, "2")
+        code, out, _ = self.build()
+        self.assertEqual(code, 1)
+        self.assertIn("triage-1.json: cleared[0]: h1 was not raised by a risk rule", out)
+
+    def test_author_flag_once(self):
+        with open(os.path.join(self.run_dir, "notes.json"), encoding="utf-8") as fh:
+            notes = json.load(fh)
+        notes["notes"].append({"unit": "h2", "after": "TWO", "source": "session",
+                               "kind": "untested", "text": "again"})
+        with open(os.path.join(self.run_dir, "notes.json"), "w", encoding="utf-8") as fh:
+            json.dump(notes, fh)
+        triage(self.run_dir, "1")
+        triage(self.run_dir, "2")
+        code, _, err = self.build()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.queue().count("author: Untested"), 1)
+
+    def test_index_txt(self):
+        with open(os.path.join(self.run_dir, "index.txt"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("old_rev: ", text)
+        self.assertIn("new_rev: (working tree)", text)
+        self.assertRegex(text, r"h4 +M  d\.js .*\[risk line: fs\.rm\(dir\)\]  \+1 -1  L\d+")
 
     def test_page_without_triage_matches_the_old_page(self):
         meta, files, units = difftour.load_snapshot(self.run_dir)

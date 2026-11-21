@@ -13,9 +13,11 @@ a stray edit, work from an earlier session.
 
 The page opens on the **queue** — what is worth the user's attention, so the rest can stay out
 of sight: *suspected failures* that a fresh reviewer can state concretely, then units *worth a
-look* — raised by a reviewer with a question to check, by the script's risk rules (serialized
-format, destructive commands, build settings, weakened tests, the project's own
-`.claude/review-risk`), or by the author's own flags. Everything else is folded.
+look* — raised by a reviewer with a question to check, by the script's risk rules (enum
+members and MemoryPack fields inserted or removed, other serialized format, destructive
+commands, secrets in code, build settings, weakened tests, the project's own
+`.claude/review-risk`), or by the author's own flags. Under a rule's hit a reviewer may add
+why it is safe; that does not take it out. Everything else is folded.
 **Only the script folds; nobody can take a unit out of the queue** — the model and the
 reviewers can only add to it. Notes do not move units either way: a unit without a note is
 counted under the queue and marked Unexplained in the whole diff, but not raised for that
@@ -34,7 +36,7 @@ Design rationale (the owner's notes, not shipped with the plugin):
 
 1. **Code reaches the page only through the script.** notes.json refers to units by id and
    quotes at most a piece of one line to anchor a note. Do not write or edit `index.html`,
-   `patch.diff` or `hunks.json` by hand.
+   `patch.diff`, `hunks.json` or `index.txt` by hand.
 2. **Unexplained is a result, not a failure.** A unit is explained when at least one note is
    about it. Write a note only when the change is part of something done on purpose. Never
    write a vague note to reach full coverage — a unit you cannot account for stays
@@ -66,7 +68,8 @@ Design rationale (the owner's notes, not shipped with the plugin):
    python3 "${CLAUDE_SKILL_DIR}/difftour.py" collect $ARGUMENTS
    ```
 
-   Pass the arguments without the word `all`: that one only skips the triage step.
+   A leading `all` is dropped by collect itself (unless it is the only argument and a ref named
+   `all` exists): it only skips the triage step.
 
    - No argument: HEAD against the working tree, untracked included. When nothing is
      uncommitted (the work was just committed), collect compares HEAD with its upstream
@@ -82,7 +85,8 @@ Design rationale (the owner's notes, not shipped with the plugin):
 
    It prints the run directory, the base, the totals, the length of patch.diff, then one line
    per unit:
-   `id  status  path  @@ header [facts]  +added -removed  L<line in patch.diff>`.
+   `id  status  path  @@ header [facts] [risk …]  +added -removed  L<line in patch.diff>` — the same
+   table is saved as `<run dir>/index.txt` for the reviewers.
    `hN` is one hunk, or a whole file that has no hunks (binary, pure rename, mode change).
    `nN` is a whole file matching a noise pattern: lock files, minified, source maps, and the
    repository's optional `.claude/diff-tour-noise` (syntax in `${CLAUDE_SKILL_DIR}/README.md`). Noise
@@ -97,14 +101,14 @@ Design rationale (the owner's notes, not shipped with the plugin):
    - A size `WARNING` → mention it to the user and carry on with the tour. Collect again with a
      narrower ref only if the user asks for one.
 
-2. **Triage** — skip it when the argument has `all`. Launch two
+2. **Triage** — skip it when the argument starts with `all`. Launch two
    fresh reviewers at once, in the background, with the Agent tool: `general-purpose`, effort
    `xhigh`, the model not overridden (this is the safety net — do not save on it). Their
    prompt names only the brief, the run directory, their name (`1`, `2`) and the user's
    language:
 
    > Follow `${CLAUDE_SKILL_DIR}/triage.md`. Run directory: `<run dir>`. Your name: `1`.
-   > Write `text` and `check` in Russian.
+   > Write `text`, `check` and `why` in Russian.
 
    Nothing about the change, its purpose or your own view — an independent read is the point.
    While they work, go on with steps 3–4; build refuses to run on fewer than two triage files.
@@ -171,7 +175,7 @@ Design rationale (the owner's notes, not shipped with the plugin):
      is shown as text. Panel titles, pills, roles and the link label are plain text.
 
 5. **Build**, once both reviewers have finished (`--all` instead of triage when the argument
-   has `all`):
+   starts with `all`):
 
    ```
    python3 "${CLAUDE_SKILL_DIR}/difftour.py" build "<run dir>" --open
@@ -179,7 +183,7 @@ Design rationale (the owner's notes, not shipped with the plugin):
 
    Exit 1 lists every problem in notes.json and the triage files — fix the notes yourself; for
    a triage file, send the problem back to the reviewer that wrote it (SendMessage) rather
-   than editing it. Start a fresh reviewer in its place only when that one cannot be reached,
+   than editing it. Start a fresh reviewer with the same name in its place only when that one cannot be reached,
    and only over a problem build reported — never because of what it found or left out. Without triage files and without `--all`, build stops and says so. Never
    rerun collect to get past a problem: it takes a new snapshot with new ids.
    `--open` shows the page in the system browser. Never open it with a bare `open`: terminals
@@ -201,12 +205,14 @@ steps are the same, with these differences:
   even if the working tree moved on.
 - `--out-root` puts the tour under `<its run dir>/<repo>/`, so the page lives as long as the
   caller's record that links to it. The default cache keeps only the newest 20 runs per
-  repository.
+  repository. That root must be outside the work tree or git-ignored, or the tour shows up as
+  untracked files in the next `collect`.
 - The calling skill's agreed criteria, test runs and review findings in this conversation
   are reasons you can point to, so notes built on them are `session`; the rules above still
   apply unchanged.
 - The triage step runs as usual unless the caller asks for `all`.
-- Hand back the `Page:` path, the queue line and the counts line from build's output instead
-  of the full report; the caller decides what to show.
+- Hand back the `Page:` path, the queue line, every `!` line (suspected failures), any
+  `WARNING` and the counts line from build's output instead of the full report; the caller
+  decides what to show.
 
 Run directories are private to the user (mode 0700).

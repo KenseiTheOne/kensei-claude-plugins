@@ -3,6 +3,37 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.5.0 — 2026-11-21
+
+### diff-tour
+- **Enum and MemoryPack checks read the file.** The script reads each changed file at the base
+  and rebuilds the new side from patch.diff, so it can tell an append from an insertion. Enum
+  members removed, changed, reordered or inserted before the end, and a changed declaration
+  (name, underlying type), are raised; appending, Swift enums with no `case`, keys added to
+  `CodingKeys` and `import enum` are not. In a type that is `[MemoryPackable]` at the base, a
+  removed, rewritten or reordered field, an order or union tag not above that type's highest,
+  an implicit-order field inserted before the type's other fields and a changed
+  `[MemoryPackable]` are raised; a new type, comments and methods are not. These replace the
+  `enum` and `MemoryPack` regex rules. A range's ends are pinned to commits at collect, so
+  build reads the same base after the branch moves on.
+- **More built-in rules**: git commands with their arguments as a list (`"clean", "-fdx"`),
+  `rm(`, `shutil.rmtree`, `os.remove`; secrets written into code (API keys, tokens, private
+  keys); `ProjectSettings/` and `Packages/manifest.json` at any depth; a `"unity"` or
+  `"unityRelease"` key (Unity's version in a `package.json`).
+- **New facts**: a JSON file (`.json`, `.asmdef`, `.asmref`) whose value did not change (key
+  order, number and literal types included) is *only reformatted* and loses its rule hits; a C# file that switches off IL2CPP checks, has an
+  `unsafe` type or `[SkipLocalsInit]` says so on every unit.
+- **Reviewers can say why a rule's hit is safe** (`cleared` in the triage file). The line shows
+  under the hit; the unit stays in the queue. The same risk or `cleared` text from both
+  reviewers, and an author flag repeated in several notes, are shown once.
+- **`index.txt`** in the run directory: one line per unit, for reviewers of a big diff, who now
+  read patch.diff in pieces — rule hits first, then code, then tests — the second reviewer from
+  the end.
+- **The triage brief** adds: a new step added on one path and missing on its siblings; fold
+  tests deleted together with a feature removed whole.
+- `collect` drops a leading `all` (the skill's switch for skipping triage) instead of failing on
+  it; parametrized tests (`[TestCaseSource]`, `test.each`) count as tests.
+
 ## kensei-toolkit 2.4.0 — 2026-11-20
 
 ### diff-tour
