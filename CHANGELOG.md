@@ -3,6 +3,24 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.5.1 — 2026-11-21
+
+### diff-tour
+- The secrets rule raises `secretKey`, `privateKey` and `AWS_SECRET_ACCESS_KEY` again: 2.5.0
+  narrowed it to names ending in the keyword and lost the names ending in `…key`. It also reads
+  typed declarations (`apiKey: string = …`), `:=` and `=>`, and skips placeholders (`"${VAR}"`,
+  `"<your-token>"`, `"access_token"`).
+- enum: `enum` in a string, a comment, a variable or a parameter is no longer taken for a
+  declaration; a member put under `#if` or into a block comment is raised; a Python enum's base
+  changed is raised; an append after a member with a trailing comment is not; `@available`
+  before a Swift `case`.
+- MemoryPack: a field put under `#if` or into a block comment is raised; a base list wrapped
+  onto the next line is read; several fields or a nested type added at the end, and private
+  fields, are not raised; union tags of `record struct`s are kept per type; more member forms
+  (nested generics, tuples, `virtual`/`override`, `global::`, `int A, B;`, Allman properties).
+- JSON reformat check: `[1]` no longer equals `{"int": "1"}`.
+- A Python file whose top-level lines all changed is checked in linear time.
+
 ## kensei-toolkit 2.5.0 — 2026-11-21
 
 ### diff-tour

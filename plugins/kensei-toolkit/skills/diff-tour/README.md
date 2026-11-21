@@ -38,7 +38,8 @@ list (`DEFAULT_RISK`) covers networked attributes (RPC, Ghost, Meta methods), ve
 schema fields, a `"unity"` or `"unityRelease"` key in any file (Unity's version in
 `package.json`), tool permissions, destructive
 commands (also git arguments passed as a list, `rm(`, `shutil.rmtree`, `os.remove`), secrets
-written into code (API keys, tokens, private keys), assembly definitions, project settings and
+written into code (API keys, tokens, private keys; a placeholder like `"${VAR}"`, `"<your-token>"`
+or `"access_token"` is not one), assembly definitions, project settings and
 package manifests at any depth, and the files that steer the tour itself
 (`.claude/diff-tour-noise`, `.claude/review-risk`, `.gitattributes`). An existing test file is
 raised when it checks less: fewer tests or asserts than before, a skip added, or the file
@@ -54,12 +55,16 @@ Some checks need the file, not just the hunk, so the script reads it at the base
   `enum {` too), Rust, Protobuf, FlatBuffers, Thrift, Swift `case`s, Python
   `Enum`/`IntEnum`/`StrEnum`/`Flag`/`IntFlag` classes. Appending is not raised — after the last
   member, or before Java's `;` that ends them — nor is a Swift enum with no `case` (a
-  namespace), nor a key added to `CodingKeys`.
+  namespace), nor a key added to `CodingKeys`. A member put under `#if` or into a block comment
+  counts as removed. Not seen: Rust struct variants and Java constants with a body spread over
+  several lines.
 - **memorypack** — in a type that is `[MemoryPackable]` at the base: a field or its order
   removed, rewritten or reordered; a `MemoryPackOrder` not above the type's highest, a
   `MemoryPackUnion` tag not above the highest that type already has; an implicit-order field
   inserted before the type's other fields; a MemoryPack attribute added, `[MemoryPackable]`
-  itself changed. A new type, comments and methods are not raised.
+  itself changed; a field put under `#if` or into a block comment. A new type, fields added at
+  the end, private fields without `[MemoryPackInclude]`, comments and methods are not raised.
+  Not seen: positional records (`record Save(int A, int B)`), whose members have no block.
 - **only reformatted** — a JSON file (`.json`, `.asmdef`, `.asmref`) whose parsed value, key
   order and number and literal types included, did not change gets that fact and loses its rule
   hits.

@@ -73,7 +73,9 @@ DEFAULT_RISK = [
     # secrets written into the code
     r"""line (?i)\bsk-[a-z0-9_-]{20,}|\bAKIA[0-9A-Z]{16}\b|\bgh[pousr]_[a-z0-9]{30,}|"""
     r"""\bxox[abpr]-[a-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"""
-    r"""\b\w{0,40}?(api_?key|secret|token|passw(or)?d)["']?\s{0,4}[:=]\s{0,4}["'][^"'\s]{12,}["']""",
+    r"""\b\w{0,40}?(api_?key|(secret|access|private)_?(access_?)?key|secret|token|passw(or)?d)["']?"""
+    r"""(\s{0,4}:\s{0,4}[\w&'<>\[\]?]{1,30})?\s{0,4}(:=|=>|[:=])\s{0,4}["'](?!\$\{|<|process\.env|[a-z]+(_[a-z]+)+["'])"""
+    r"""[^"'\s]{12,}["']""",
     # build and module boundaries
     "path *.asmdef", "path *.asmref", "path **/ProjectSettings/", "path **/Packages/manifest.json",
     "path appsettings*.json", "path .github/workflows/",
@@ -535,21 +537,24 @@ BRACE_EXT = {"cs", "java", "kt", "ts", "tsx", "js", "mjs", "swift", "c", "h", "c
              "rs", "proto", "fbs", "thrift"}
 JSON_EXT = {"json", "asmdef", "asmref"}
 COMMENT = re.compile(r"^\s*(//|/\*|\*|#(?!\[)|$)")
-ENUM_DECL = re.compile(r"^(?!\s*(import|from)\b).*\benum\b(\s+class)?(\s+\w+|\s*\{|\s*$)")
+ENUM_DECL = re.compile(r"^(?!\s*(import|from)\b)\s*(@\w+(\([^)]*\))?\s+|\w+\s+)*enum\b(\s+(class|struct))?"
+                       r"(\s+\w+(<[^>]*>|\([^)]*\))?)?\s*((:|\bimplements\b|\bwhere\b)[^{;=]*)?(\{.*)?$")
+PREPROC = re.compile(r"\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b")
 PY_ENUM = re.compile(r"^\s*class\s+\w+\s*\([^)]*\b(Int|Str)?(Enum|Flag)\b")
 ENUM_MEMBER = {
-    "swift": re.compile(r"^\s*(indirect\s+)?case\b"),
+    "swift": re.compile(r"^\s*(@\w+(\([^)]*\))?\s*)*(indirect\s+)?case\b"),
     "py": re.compile(r"^\s*[A-Za-z_]\w*\s*(:[^=]+)?=(?!=)"),
     "": re.compile(r"^\s*(\[[^\]]*\]\s*|@\w+\s*)*{m}(\s*,\s*{m})*\s*([,;]\s*)?(//.*|/\*.*)?$"
                    .replace("{m}", r"[A-Za-z_]\w*(\([^)]*\)|\{[^}]*\})?(\s*=\s*[^=,;\s]([^=,;]*[^=,;\s])?)?")),
 }
 MP_ORDER = re.compile(r"\bMemoryPackOrder\(\s*(\d+)\s*\)")
 MP_UNION = re.compile(r"\bMemoryPackUnion\(\s*(\d+)")
-MP_TYPE = re.compile(r"\b(class|struct|record|interface)\s+(\w+)")
+MP_TYPE = re.compile(r"\b(class|struct|record|interface)\s+(?!(class|struct)\b)(\w+)")
 MP_ATTR = re.compile(r"\[MemoryPack(Ignore|Include|Constructor|Formatter|AllowSerialize)\b")
-MP_FIELD = re.compile(r"^\s*(\[[^\]]*\]\s*)*((public|internal|protected|private|readonly|"
-                      r"required|new|volatile)\s+)+[\w<>\[\],.?]+(\s*<[^>]*>)?\s+\w+\s*"
-                      r"(;|=(?!>)|\{\s*(get|init|set)\b)")
+MP_FIELD = re.compile(r"^\s*(\[[^\]]*\]\s*)*((public|internal|protected|private|readonly|required|new|"
+                      r"volatile|virtual|override|abstract|sealed)\s+)+"
+                      r"(\([^)]*\)|[\w.:]+(<[^;={}]*>)?)(\[[,\s]*\]|\?)*\s+\w+(\s*,\s*\w+)*\s*"
+                      r"(;|=(?!>)|\{\s*(get|init|set)\b|$)")
 CHECKS_OFF = re.compile(r"Il2CppSetOption\(\s*Option\.(\w+)\s*,\s*false\s*\)|"
                         r"\b(unsafe)\s+(partial\s+)?(class|struct)\b|\[(SkipLocalsInit)\b")
 
@@ -639,6 +644,15 @@ def line_positions(h):
     return out
 
 
+def hides(line):
+    """Whether a line hides the members after it from the build: #if and its kin, or a block
+    comment left open or closed here."""
+    if PREPROC.match(line):
+        return True
+    first_open, first_close = line.find("/*"), line.find("*/")
+    return line.rfind("/*") > line.rfind("*/") or first_close >= 0 and not 0 <= first_open < first_close
+
+
 def brace_scopes(lines):
     """For each position 0..len(lines), the index of the line opening the innermost {} block
     the position is in (-1: none). Strings and comments are skipped roughly."""
@@ -663,7 +677,8 @@ def header_at(lines, i):
     k = i
     if lines[k].strip().startswith("{") and k > 0:
         k -= 1
-        while k > 0 and (not lines[k].strip() or re.match(r"^\s*(:|,|where\b)", lines[k])):
+        while k > 0 and (not lines[k].strip() or re.match(r"^\s*(:|,|where\b)", lines[k]) or
+                         lines[k - 1].rstrip().endswith((":", ","))):
             k -= 1
     attrs, a = [], k - 1
     while a >= 0 and re.match(r"^\s*(\[|@)", lines[a]) and len(attrs) < 8:
@@ -674,6 +689,8 @@ def header_at(lines, i):
 
 def py_header(lines, pos, indent):
     """The innermost Python block a line with this indent at this position is in."""
+    if indent == 0:
+        return -1, ""
     for k in range(min(pos, len(lines)) - 1, -1, -1):
         line = lines[k]
         if line.strip() and not line.lstrip().startswith("#") and \
@@ -689,7 +706,7 @@ def moved_pairs(changed):
     A line that gained members at its end (`A;` -> `A, B;`) pairs only its removed half: the added
     one is still checked as an insertion."""
     def norm(body):
-        return re.sub(r"[\s,;]+$", "", body).strip()
+        return re.sub(r"[\s,;]+$", "", re.sub(r"\s*(//.*|/\*.*\*/\s*)$", "", body)).strip()
     out, i = set(), 0
     while i < len(changed):
         gone, came = [], []
@@ -769,8 +786,12 @@ def enum_risk(f, hunks, old, new, ctx):
         changed = line_positions(h)
         same = moved_pairs(changed)
         for j, (t, body, o, n) in enumerate(changed):
+            if lang != "py" and hides(body) and enum_of(body, o):
+                return [("enum", short(enum_of(body, o)[1]))]
             if COMMENT.match(body) or j in same:
                 continue
+            if t == "-" and lang == "py" and PY_ENUM.match(body):  # renamed, or another base
+                return [("enum", short(body))]
             if t == "-" and ENUM_DECL.match(body):
                 if "{" in body and "}" in body:  # a one-line enum
                     if (lang != "swift" or "case" in body) and not one_line_append(body, changed):
@@ -813,7 +834,7 @@ def union_owner(lines, i):
     for line in lines[i:i + 40]:
         m = MP_TYPE.search(line)
         if m:
-            return m.group(2)
+            return m.group(3)
         if not (MP_UNION.search(line) or COMMENT.match(line) or line.lstrip().startswith("[")):
             return None
     return None
@@ -849,7 +870,10 @@ def memorypack_risk(f, hunks, old, new, ctx):
     for h in hunks:
         changed = line_positions(h)
         same = moved_pairs(changed)
+        added = {x[3] for x in changed if x[0] == "+"}
         for j, (t, body, o, n) in enumerate(changed):
+            if hides(body) and packable(o):
+                return [("memorypack", short(body))]
             if COMMENT.match(body) or body.strip() in ("{", "}") or j in same:
                 continue
             m = MP_UNION.search(body)
@@ -860,8 +884,10 @@ def memorypack_risk(f, hunks, old, new, ctx):
                 if int(m.group(1)) <= max(unions.get(owner, []) if owner else [], default=-1):
                     return [("memorypack", short(body))]
             cls = packable(o)
-            if not cls:
+            if not cls or t == "+" and new_scopes[n] in added:  # inside a type this hunk adds
                 continue
+            if re.search(r"\bprivate\b", body) and not MP_ATTR.search(body):
+                continue  # not serialized without [MemoryPackInclude]
             if t == "-" and (MP_ORDER.search(body) or MP_ATTR.search(body) or MP_FIELD.match(body)):
                 return [("memorypack", short(body))]
             if t == "-":
@@ -876,7 +902,8 @@ def memorypack_risk(f, hunks, old, new, ctx):
                 for x in range(n + 1, len(new)):
                     if new_scopes[x] < k:
                         break
-                    if new_scopes[x] == k and MP_FIELD.match(new[x]) and not COMMENT.match(new[x]):
+                    if new_scopes[x] == k and x not in added and MP_FIELD.match(new[x]) and \
+                            not COMMENT.match(new[x]):
                         return [("memorypack", short(body))]
     return []
 
@@ -885,7 +912,7 @@ def same_json(old, new):
     """Whether two JSON texts hold the same value, keys in the same order: only reformatted."""
     def load(lines):  # numbers kept as text: in Python true == 1 == 1.0
         return json.loads("\n".join(lines), object_pairs_hook=list,
-                          parse_int=lambda s: ("int", s), parse_float=lambda s: ("float", s))
+                          parse_int=lambda s: (int, s), parse_float=lambda s: (float, s))
     try:
         return new is not None and load(old) == load(new)
     except (ValueError, RecursionError):

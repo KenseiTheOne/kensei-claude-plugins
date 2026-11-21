@@ -759,6 +759,31 @@ class Risk(unittest.TestCase):
         self.assertEqual(self.enum_risk("U.cs", old, reused),
                          ["memorypack: [MemoryPackUnion(1, typeof(C))]"])
 
+    def test_review_3_cases(self):
+        enum = "public enum K\n{\n    A,\n    B,\n}\n"
+        self.assertEqual(self.enum_risk("K.cs", enum, enum.replace("    B,\n", "#if DEBUG\n    B,\n#endif\n")),
+                         ["enum: public enum K"])
+        self.assertEqual(self.enum_risk("K.cs", enum, enum.replace("    B,\n", "    B, // last\n    C,\n")), [])
+        for line in ('throw new ArgumentException("Unknown enum value");', "enum color c = RED;",
+                     "void paint(enum color c);"):
+            self.assertEqual(self.enum_risk("x.c", line + "\n", "\n"), [], line)
+        py = "class Kind(IntEnum):\n    A = 1\n"
+        self.assertEqual(self.enum_risk("k.py", py, py.replace("IntEnum", "StrEnum")),
+                         ["enum: class Kind(IntEnum):"])
+        mp = "[MemoryPackable]\npublic partial class S :\n    IBase\n{\n    public int A;\n    public int B;\n}\n"
+        self.assertEqual(self.enum_risk("S.cs", mp, mp.replace("int A;\n", "int A;\n    public int X;\n")),
+                         ["memorypack: public int X;"])
+        self.assertEqual(self.enum_risk("S.cs", mp, mp.replace("int B;\n", "int B;\n    public int C;\n"
+                                                               "    public string D { get; set; }\n")), [])
+        self.assertEqual(self.enum_risk("S.cs", mp, mp.replace("int A;\n", "int A;\n    private int cache;\n")), [])
+        self.assertEqual(self.enum_risk("S.cs", mp, mp.replace("    public int B;\n", "#if UNITY_EDITOR\n"
+                                                               "    public int B;\n#endif\n")),
+                         ["memorypack: #if UNITY_EDITOR"])
+        tuple_ = mp.replace("int B;", "List<(int, string)> B;")
+        self.assertEqual(self.enum_risk("S.cs", tuple_, tuple_.replace("    public List<(int, string)> B;\n", "")),
+                         ["memorypack: public List<(int, string)> B;"])
+        self.assertFalse(difftour.same_json(["[1]"], ['{"int": "1"}']))
+
     def test_anonymous_c_enum(self):
         old = "typedef enum\n{\n    A,\n    B,\n} kind_t;\n"
         self.assertEqual(self.enum_risk("k.h", old, old.replace("A,\n", "A,\n    X,\n")),
@@ -794,6 +819,13 @@ class Risk(unittest.TestCase):
             "c.js": "await rm(dir, {recursive: true})\n",
             "d.py": 'API_KEY = "abcd1234efgh5678"\n',
             "e.ts": 'run("git", ["push", "origin", "--force-with-lease"])\n',
+            "f.env": 'AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMIK7MDENGbPxRfiCY"\n',
+            "g.ts": 'const c = {secretKey: "abcdefghijklmnop"}\n',
+            "h.cs": 'string privateKey = "abcdefghijklmnop";\n',
+            "i.py": 'client_secret = "abcdefghijklmnop"\n',
+            "j.ts": 'const apiKey: string = "abcdefghijklmnop";\n',
+            "k.go": 'apiKey := "abcdefghijklmnop"\n',
+            "l.php": "'password' => 'hunter2hunter2'\n",
         }
         r = repo({p: "x\n" for p in cases})
         for p, body in cases.items():
@@ -804,7 +836,8 @@ class Risk(unittest.TestCase):
                 self.assertEqual(len(risk[p]), 1, risk[p])
         r = repo({"f.py": "x\n"})
         write(r, "f.py", 'token = os.environ["TOKEN"]\nform.remove(item)\ntokenizer = "bert-base-uncased"\n'
-                         'API_KEY_ENV = "MYAPP_API_KEY_VAR"\nx = {"tokenUrl": "https://example.com/t"}\n')
+                         'API_KEY_ENV = "MYAPP_API_KEY_VAR"\nx = {"tokenUrl": "https://example.com/t"}\n'
+                         'ACCESS_TOKEN = "access_token"\ntoken = "<your-token-here>"\n')
         self.assertEqual(self.path_risk(collect(r)[0])["f.py"], [])
 
     def test_checks_switched_off_is_a_fact(self):
