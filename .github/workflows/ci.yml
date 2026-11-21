@@ -25,7 +25,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.12"]
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04  # Ubuntu 26.04 (ubuntu-latest) has no Python 3.9 build
             python: "3.9"  # the oldest Python the README promises
     steps:
       - uses: actions/checkout@v4
