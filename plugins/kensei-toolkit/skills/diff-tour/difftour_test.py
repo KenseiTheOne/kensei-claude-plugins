@@ -831,6 +831,11 @@ class Risk(unittest.TestCase):
         flags = "enum Flags {\n    A = FLAG(1, 0),\n    B = FLAG(2, 0),\n    C = FLAG(3, 0),\n};\n"
         self.assertNotEqual(self.enum_risk("f.h", flags, flags.replace(
             "    B = FLAG(2, 0),\n", "#if FEATURE_X\n    B = FLAG(2, 0),\n#endif\n")), [])
+        self.assertNotEqual(self.enum_risk("f.h", flags, flags.replace("    B = FLAG(2, 0),\n", "")), [])
+        planets = "public enum Planet {\n    MERCURY(mass(3.303e+23), 2.4397e6),\n" \
+                  "    VENUS(mass(4.869e+24), 6.0518e6),\n    EARTH(mass(5.976e+24), 6.37814e6);\n}\n"
+        self.assertNotEqual(self.enum_risk("P.java", planets, planets.replace(
+            "    VENUS(mass(4.869e+24), 6.0518e6),\n", "")), [])
         for added in ("    // generated from Assets/*.json\n", "    X, // see defs/*.json\n"):
             self.assertEqual(self.enum_risk("K.cs", enum("public enum Kind"), enum("public enum Kind").replace(
                 "    C,\n", "    C,\n" + added)), [], added)

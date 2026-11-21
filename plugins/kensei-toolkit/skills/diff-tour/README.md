@@ -56,8 +56,7 @@ Some checks need the file, not just the hunk, so the script reads it at the base
   `Enum`/`IntEnum`/`StrEnum`/`Flag`/`IntFlag` classes. Appending is not raised — after the last
   member, or before Java's `;` that ends them — nor is a Swift enum with no `case` (a
   namespace), nor a key added to `CodingKeys`. A member put under `#if` or into a block comment
-  counts as removed; a doc comment over a member does not. Not seen: a member removed whose
-  value is a call with commas (`B = FLAG(2, 0),`). Not seen: Rust struct variants and Java constants with a body spread over
+  counts as removed; a doc comment over a member does not. Not seen: Rust struct variants and Java constants with a body spread over
   several lines.
 - **memorypack** — in a type that is `[MemoryPackable]` at the base: a field or its order
   removed, rewritten or reordered; a `MemoryPackOrder` not above the type's highest, a

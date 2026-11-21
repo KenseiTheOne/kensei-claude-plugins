@@ -547,7 +547,8 @@ ENUM_MEMBER = {
     "swift": re.compile(r"^\s*(@\w+(\([^)]*\))?\s*)*(indirect\s+)?case\b"),
     "py": re.compile(r"^\s*[A-Za-z_]\w*\s*(:[^=]+)?=(?!=)"),
     "": re.compile(r"^\s*(\[[^\]]*\]\s*|@\w+\s*)*{m}(\s*,\s*{m})*\s*([,;]\s*)?(//.*|/\*.*)?$"
-                   .replace("{m}", r"[A-Za-z_]\w*(\([^)]*\)|\{[^}]*\})?(\s*=\s*[^=,;\s]([^=,;]*[^=,;\s])?)?")),
+                   .replace("{m}", r"[A-Za-z_]\w*({p}|\{[^}]*\})?(\s*=\s*([^=,;()\s]|{p})(([^=,;()]|{p})*([^=,;()\s]|{p}))?)?")
+                   .replace("{p}", r"\(([^()]|\([^()]*\))*\)")),  # (a, b) and one level inside
 }
 MP_ORDER = re.compile(r"\bMemoryPackOrder\(\s*(\d+)\s*\)")
 MP_UNION = re.compile(r"\bMemoryPackUnion\(\s*(\d+)")

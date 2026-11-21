@@ -3,6 +3,12 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.5.3 — 2026-11-21
+
+### diff-tour
+- enum members whose value is a call with commas or nested calls (`B = FLAG(2, 0),`,
+  `VENUS(mass(4.869e+24), 6.0518e6),`) are read: removing or reordering one is raised.
+
 ## kensei-toolkit 2.5.2 — 2026-11-21
 
 ### diff-tour
