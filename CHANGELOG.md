@@ -3,6 +3,33 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.5.2 — 2026-11-21
+
+### diff-tour
+- MemoryPack: only a member declared `private` is skipped, so `{ get; private set; }` properties
+  are checked again, and `[MemoryPackInclude]` on the line above a private field counts. Nested
+  types and computed properties (`=> ...` on the next line) are not taken for fields; a type
+  whose header line changed in the same hunk is not taken for a new one. A field whose
+  initializer is wrapped onto the next line is still a field.
+- `#if` and block comments are raised only around members: a doc comment, an `#if` around a
+  method and `/*` inside a string or a `//` comment are not.
+- enum declarations: `pub(crate)`, `#[repr(u8)]` and `[Flags]` on the same line, a trailing
+  comment, nested parentheses and generics, `[[nodiscard]]`, `UENUM(...)`. A comment or a
+  C++ `public:` ending in a colon above a declaration no longer hides it.
+- A value changed inside a string after `//` (`"https://..."`) is a change again; a comment
+  added to a Python enum's class line is not, and Python's `//` is division, not a comment.
+- Secrets: `"YOUR_API_KEY_HERE"` is a placeholder too; mixed-case values are not.
+- Long lines are read in linear time, also with runs of escaped quotes (2.5.1 took 12 s on a
+  500 KB minified line).
+
+### ticket
+- guard reads long commands in linear time: shlex copies a word for each character it adds, so
+  long words go through it as short markers. The `.gitattributes` and pipe-into-a-shell patterns
+  no longer scan on from every `>` or `|`. The speed test compares n against 4n instead of a
+  wall-clock limit, which failed on a loaded machine.
+- guard stops itself after 10 s and fails closed, as on any error: a hook that runs past its
+  15 s timeout does not block, so a command built to keep the checks busy got through.
+
 ## kensei-toolkit 2.5.1 — 2026-11-21
 
 ### diff-tour

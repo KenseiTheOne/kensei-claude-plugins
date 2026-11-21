@@ -298,6 +298,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import tarfile
 import sys
@@ -1043,10 +1044,7 @@ def error_is_own(command):
     if "`" in command or "$(" in command or "\n" in command.strip():
         return False
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
+        tokens = lex(command)
     except ValueError:
         return False
     segments, segment = [], []
@@ -1268,12 +1266,59 @@ def strip_heredocs(command):
     return "\n".join(out), fed, bodies
 
 
-def split_segments(command):
-    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=";&|()<>")
+def lex(command):
+    """The shell words and operators of a command, as shlex reads them. shlex grows a word one
+    character at a time by copying it, so a long word goes in as a short marker holding what
+    shlex would make of it (quotes and escapes resolved) and comes back in the words: the same
+    result in linear time."""
+    runs, out, i, n = [], [], 0, len(command)
+    if "\0" in command:  # no room for markers: shlex reads it as is
+        i = n
+    while i < n:
+        start, text, quote = i, [], None
+        while i < n:
+            stop = "'" if quote == "'" else '"\\' if quote == '"' else " \t\r\n'\"\\;&|()<>"
+            j = i
+            while j < n and command[j] not in stop:
+                j += 1
+            text.append(command[i:j])
+            i = j
+            if i >= n:
+                break
+            ch = command[i]
+            if ch == "\\" and i + 1 < n:
+                # an escape: the next character as is; in double quotes only " and \ lose it
+                keep = quote == '"' and command[i + 1] not in '"\\'
+                text.append(command[i:i + 2] if keep else command[i + 1])
+                i += 2
+            elif quote is None and ch in "'\"":
+                quote, i = ch, i + 1
+            elif ch == quote:
+                quote, i = None, i + 1
+            else:
+                break  # the word ends: whitespace or an operator (or a lone trailing backslash)
+        if i - start >= 256 and quote is None:
+            runs.append("".join(text))
+            out.append(f"\0{len(runs) - 1}\0")
+        else:
+            out.append(command[start:i])
+        if i < n:
+            out.append(command[i])
+            i += 1
+    if runs:
+        command = "".join(out)
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
     lexer.whitespace_split = True
     lexer.commenters = ""
+    tokens = list(lexer)
+    if runs:
+        tokens = [re.sub(r"\0(\d+)\0", lambda m: runs[int(m.group(1))], t) for t in tokens]
+    return tokens
+
+
+def split_segments(command):
     segment, segments = [], []
-    for token in lexer:
+    for token in lex(command.replace("\n", " ; ")):
         if token and set(token) <= set(";&|()<>"):
             if segment:
                 segments.append(segment)
@@ -2430,8 +2475,9 @@ def classify_shell(command, cwd, depth=0, state=None):
         found += classify_shell(body, cwd, depth + 1)
     for inner in re.findall(r"\$\(([^()]*)\)|`([^`]*)`", command):
         found += classify_shell(inner[0] or inner[1], cwd, depth + 1)
-    if "<<<" in command or re.search(r"\|\s*(?:\S*/)?(?:sh|bash|zsh|dash|ksh)\b(?!\s+-\w*c)",
-                                     command) or re.search(r"\beval\b|\$\(", command):
+    shell_pipe = re.search(r"(sh|bash|zsh|dash|ksh)\b", command) and \
+        re.search(r"\|\s*(?:\S*/)?(?:sh|bash|zsh|dash|ksh)\b(?!\s+-\w*c)", command)
+    if "<<<" in command or shell_pipe or re.search(r"\beval\b|\$\(", command):
         found += raw_scan(command, cwd, depth)
         for body in bodies:  # a heredoc piped into a shell or captured runs as commands
             found += raw_scan(body, cwd, depth)
@@ -3580,10 +3626,7 @@ def ancestors(path):
 
 
 def shell_tokens(command):
-    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=";&|()<>")
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    return list(lexer)
+    return lex(command.replace("\n", " ; "))
 
 
 def copy_parts(args, prog="cp"):
@@ -3966,7 +4009,8 @@ GIT_ATTR_COPY = re.compile(r"(?i)\b(?:cp|mv|install|ln|rsync|ditto|copy-item|mov
 def attributes_write(command):
     """A shell or PowerShell write to a .gitattributes that names a filter / diff / merge driver
     (`echo '* filter=x' >> .gitattributes`), or a copy over one whose text it cannot see."""
-    if not GIT_ATTR_WRITE.search(command):
+    lower = command.lower()  # the pattern scans on from every `>`: only run it when it can match
+    if "attributes" not in lower or not GIT_ATTR_WRITE.search(command):
         return False
     return bool(GIT_ATTR_DRIVER.search(command) or GIT_ATTR_COPY.search(command))
 
@@ -4458,8 +4502,26 @@ ASK_KINDS = {
 }
 
 
+class Overtime(Exception):
+    """The guard ran past its own deadline."""
+
+
+# The hook's timeout is 15 s and a hook that times out does not block the call, so a command
+# built to keep the checks busy would get through. The guard stops itself first and fails closed.
+DEADLINE = float(os.environ.get("KENSEI_GUARD_DEADLINE") or 10)  # lowered by the tests
+
+
+def overtime(signum, frame):
+    raise Overtime(f"no answer within {DEADLINE:g} s")
+
+
+def arm(seconds):
+    if hasattr(signal, "setitimer"):  # not on Windows
+        signal.signal(signal.SIGALRM, overtime)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+
+
 def main():
-    global RUN_DIR
     mode = sys.argv[1] if len(sys.argv) > 1 else "--main"
     if mode == "--post":  # PostToolUse: the call ran, so its RUN.md is this session's run
         try:  # it only notes the run: whatever goes wrong, it says nothing and blocks nothing
@@ -4472,32 +4534,11 @@ def main():
         return 0
     raw = sys.stdin.read()
     try:
-        data = json.loads(raw)
-        tool_name = data.get("tool_name", "")
-        session, agent = data.get("session_id"), data.get("agent_id")
-        if mode == "--subagent":
-            path = marker(session)
-            if not agent or not path or not os.path.exists(path):
-                return 0
-        else:
-            activate(session)
-        cwd = data.get("cwd")
-        RUN_DIR = marked_run(session)
-        gated = classify(tool_name, data.get("tool_input") or {}, cwd, data)
-        if not gated:
-            return 0
-        if agent:
-            reason = subagent_reason(gated)
-        else:
-            gated = [g for g in gated if g[0] not in SUBAGENT_ONLY]
-            if not gated:
-                return 0
-            if {g[0] for g in gated} <= set(ASK_KINDS):
-                deny(" ".join(ASK_KINDS[k] for k in sorted({g[0] for g in gated})), "ask")
-                return 0  # not refused: the user decides at the prompt
-            text, actions, approved, used, unseen, failure = read_authorization(
-                data.get("transcript_path"), cwd)
-            reason = decide(gated, text, actions, approved, used, unseen, failure, STATUS_LEFT)
+        try:  # disarmed before the handler below, so the deadline cannot cut a refusal short
+            arm(DEADLINE)
+            answer = decide_call(mode, raw)
+        finally:
+            arm(0)
     except Exception as exc:  # fail closed for anything that looks gated
         if not re.search(r"\bgit\b|\bgh\b|commit|push|merge|rebase|comment|status|mcp__|curl|"
                          r"\.guard|SendMessage|--comment|--post|settings|hooks|PowerShell|RemoteTrigger|"
@@ -4505,11 +4546,40 @@ def main():
             return 0
         if mode == "--subagent" and '"agent_id"' not in raw:
             return 0
-        reason = f"[ticket guard] Blocked: the guard failed ({type(exc).__name__}: {exc}); " \
-                 "it fails closed. Tell the user."
-    if reason:
-        deny(reason)
+        answer = f"[ticket guard] Blocked: the guard failed ({type(exc).__name__}: {exc}); " \
+                 "it fails closed. Tell the user.", "deny"
+    if answer and answer[0]:
+        deny(*answer)
     return 0
+
+
+def decide_call(mode, raw):
+    """What to answer for one call: (reason, decision), or None to let it through."""
+    global RUN_DIR
+    data = json.loads(raw)
+    tool_name = data.get("tool_name", "")
+    session, agent = data.get("session_id"), data.get("agent_id")
+    if mode == "--subagent":
+        path = marker(session)
+        if not agent or not path or not os.path.exists(path):
+            return None
+    else:
+        activate(session)
+    cwd = data.get("cwd")
+    RUN_DIR = marked_run(session)
+    gated = classify(tool_name, data.get("tool_input") or {}, cwd, data)
+    if not gated:
+        return None
+    if agent:
+        return subagent_reason(gated), "deny"
+    gated = [g for g in gated if g[0] not in SUBAGENT_ONLY]
+    if not gated:
+        return None
+    if {g[0] for g in gated} <= set(ASK_KINDS):  # not refused: the user decides at the prompt
+        return " ".join(ASK_KINDS[k] for k in sorted({g[0] for g in gated})), "ask"
+    text, actions, approved, used, unseen, failure = read_authorization(
+        data.get("transcript_path"), cwd)
+    return decide(gated, text, actions, approved, used, unseen, failure, STATUS_LEFT), "deny"
 
 
 if __name__ == "__main__":

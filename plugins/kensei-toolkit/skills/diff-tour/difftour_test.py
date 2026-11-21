@@ -784,6 +784,62 @@ class Risk(unittest.TestCase):
                          ["memorypack: public List<(int, string)> B;"])
         self.assertFalse(difftour.same_json(["[1]"], ['{"int": "1"}']))
 
+    def test_review_4_cases(self):
+        def enum(head, body="    A,\n    B,\n    C,\n", allman=True):
+            return head + ("\n{\n" if allman else " {\n") + body + "}\n"
+        ins = lambda s: s.replace("    A,\n", "    A,\n    X,\n")
+        for head in ("[Flags] public enum Kind", "public enum Kind // saved in profiles",
+                     "// Values are saved, do not reorder:\npublic enum Kind"):
+            self.assertNotEqual(self.enum_risk("K.cs", enum(head), ins(enum(head))), [], head)
+        for head in ("pub(crate) enum Op", "#[repr(u8)] pub enum Op", "pub enum Msg<T: Into<String>>",
+                     "enum class [[nodiscard]] Err", "UENUM(BlueprintType) enum class EFoo : uint8",
+                     "enum class Op(val apply: (Int, Int) -> Int)"):
+            path = "x.rs" if "pub" in head else "x.kt" if "val" in head else "x.h"
+            self.assertNotEqual(self.enum_risk(path, enum(head, allman=False), ins(enum(head, allman=False))),
+                                [], head)
+        cpp = "class Foo\n{\npublic:\n    enum class State : uint8_t\n    {\n        A,\n        B,\n    };\n};\n"
+        self.assertEqual(self.enum_risk("F.h", cpp, cpp.replace("        B,\n", "")), ["enum: enum class State : uint8_t"])
+        ts = 'export enum Endpoint {\n    Api = "https://api.example.com",\n    Cdn = "https://cdn.example.com",\n}\n'
+        self.assertNotEqual(self.enum_risk("e.ts", ts, ts.replace("api.example", "api2.example")), [])
+        java = "public enum Kind {\n    /**\n     * The first.\n     */\n    A,\n    B;\n}\n"
+        self.assertEqual(self.enum_risk("K.java", java.replace("    /**\n     * The first.\n     */\n", ""), java), [])
+        self.assertEqual(self.enum_risk("K.cs", enum("public enum Kind"), enum("public enum Kind").replace(
+            "    B,\n", "    /* B,\n    */\n")), ["enum: public enum Kind"])
+        py = "class Color(Enum):\n    RED = 1\n"
+        self.assertEqual(self.enum_risk("c.py", py, py.replace("(Enum):", "(Enum):  # persisted")), [])
+
+        mp = "[MemoryPackable]\npublic partial class S\n{\n    public int A;\n    public int Hp { get; private set; }\n" \
+             "    [MemoryPackInclude]\n    private int _b;\n    public int Z;\n}\n"
+        self.assertNotEqual(self.enum_risk("S.cs", mp, mp.replace("int Hp", "long Hp")), [])
+        self.assertNotEqual(self.enum_risk("S.cs", mp, mp.replace("int _b", "long _b")), [])
+        self.assertEqual(self.enum_risk("S.cs", mp, mp.replace("int Z;\n", "int Z;\n    private int _cache;\n")), [])
+        nested = mp.replace("    public int Z;\n", "    public int Z;\n    public bool HasA\n        => A != 0;\n"
+                            "    public struct Enumerator\n    {\n    }\n")
+        self.assertEqual(self.enum_risk("S.cs", nested, nested.replace("int Z;\n", "int Z;\n    public int Y;\n")), [])
+        self.assertEqual(self.enum_risk("S.cs", nested, nested.replace("struct Enumerator", "struct Walker")), [])
+        self.assertEqual(self.enum_risk("S.cs", mp, mp.replace("int Z;\n", "int Z;\n#if UNITY_EDITOR\n"
+                                                               "    void Check() { }\n#endif\n")), [])
+        self.assertEqual(self.enum_risk("S.cs", mp, mp.replace("int Z;\n", 'int Z;\n    public string Mask = "Assets/*.png";\n')), [])
+        wrapped = mp.replace("    public int Z;\n", "    public Dictionary<string, int> Items\n"
+                             "        = new Dictionary<string, int>();\n    public int Z;\n")
+        self.assertNotEqual(self.enum_risk("S.cs", wrapped, mp), [])
+        boxed = "[MemoryPackable]\npublic partial class Box<T> :\n    IBox<T> where T : class\n{\n" \
+                "    public int A;\n    public int B;\n}\n"
+        self.assertNotEqual(self.enum_risk("S.cs", boxed, boxed.replace("    public int A;\n", "")), [])
+        based = "public enum Kind :\n    byte // same size as the struct header\n{\n    A,\n    B,\n}\n"
+        self.assertNotEqual(self.enum_risk("K.cs", based, ins(based)), [])
+        flags = "enum Flags {\n    A = FLAG(1, 0),\n    B = FLAG(2, 0),\n    C = FLAG(3, 0),\n};\n"
+        self.assertNotEqual(self.enum_risk("f.h", flags, flags.replace(
+            "    B = FLAG(2, 0),\n", "#if FEATURE_X\n    B = FLAG(2, 0),\n#endif\n")), [])
+        for added in ("    // generated from Assets/*.json\n", "    X, // see defs/*.json\n"):
+            self.assertEqual(self.enum_risk("K.cs", enum("public enum Kind"), enum("public enum Kind").replace(
+                "    C,\n", "    C,\n" + added)), [], added)
+        div = "class Size(IntEnum):\n    A = 10 // 3\n    B = 2\n"
+        self.assertNotEqual(self.enum_risk("s.py", div, div.replace("// 3", "// 4")), [])
+        knr = "[MemoryPackable]\npublic partial class Save {\n    public int A;\n    public int B;\n}\n"
+        self.assertNotEqual(self.enum_risk("S.cs", knr, knr.replace(
+            "class Save {\n", "class Save : IVersioned {\n    public int Version;\n")), [])
+
     def test_anonymous_c_enum(self):
         old = "typedef enum\n{\n    A,\n    B,\n} kind_t;\n"
         self.assertEqual(self.enum_risk("k.h", old, old.replace("A,\n", "A,\n    X,\n")),

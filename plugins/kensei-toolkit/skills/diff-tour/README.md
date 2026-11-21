@@ -56,14 +56,16 @@ Some checks need the file, not just the hunk, so the script reads it at the base
   `Enum`/`IntEnum`/`StrEnum`/`Flag`/`IntFlag` classes. Appending is not raised — after the last
   member, or before Java's `;` that ends them — nor is a Swift enum with no `case` (a
   namespace), nor a key added to `CodingKeys`. A member put under `#if` or into a block comment
-  counts as removed. Not seen: Rust struct variants and Java constants with a body spread over
+  counts as removed; a doc comment over a member does not. Not seen: a member removed whose
+  value is a call with commas (`B = FLAG(2, 0),`). Not seen: Rust struct variants and Java constants with a body spread over
   several lines.
 - **memorypack** — in a type that is `[MemoryPackable]` at the base: a field or its order
   removed, rewritten or reordered; a `MemoryPackOrder` not above the type's highest, a
   `MemoryPackUnion` tag not above the highest that type already has; an implicit-order field
   inserted before the type's other fields; a MemoryPack attribute added, `[MemoryPackable]`
   itself changed; a field put under `#if` or into a block comment. A new type, fields added at
-  the end, private fields without `[MemoryPackInclude]`, comments and methods are not raised.
+  the end, private fields without `[MemoryPackInclude]`, nested types, computed properties,
+  comments and methods (an `#if` around them too) are not raised.
   Not seen: positional records (`record Save(int A, int B)`), whose members have no block.
 - **only reformatted** — a JSON file (`.json`, `.asmdef`, `.asmref`) whose parsed value, key
   order and number and literal types included, did not change gets that fact and loses its rule

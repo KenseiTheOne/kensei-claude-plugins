@@ -74,7 +74,7 @@ DEFAULT_RISK = [
     r"""line (?i)\bsk-[a-z0-9_-]{20,}|\bAKIA[0-9A-Z]{16}\b|\bgh[pousr]_[a-z0-9]{30,}|"""
     r"""\bxox[abpr]-[a-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"""
     r"""\b\w{0,40}?(api_?key|(secret|access|private)_?(access_?)?key|secret|token|passw(or)?d)["']?"""
-    r"""(\s{0,4}:\s{0,4}[\w&'<>\[\]?]{1,30})?\s{0,4}(:=|=>|[:=])\s{0,4}["'](?!\$\{|<|process\.env|[a-z]+(_[a-z]+)+["'])"""
+    r"""(\s{0,4}:\s{0,4}[\w&'<>\[\]?]{1,30})?\s{0,4}(:=|=>|[:=])\s{0,4}["'](?!\$\{|<|process\.env|(?-i:[a-z]+(_[a-z]+)+|[A-Z]+(_[A-Z]+)+)["'])"""
     r"""[^"'\s]{12,}["']""",
     # build and module boundaries
     "path *.asmdef", "path *.asmref", "path **/ProjectSettings/", "path **/Packages/manifest.json",
@@ -537,8 +537,10 @@ BRACE_EXT = {"cs", "java", "kt", "ts", "tsx", "js", "mjs", "swift", "c", "h", "c
              "rs", "proto", "fbs", "thrift"}
 JSON_EXT = {"json", "asmdef", "asmref"}
 COMMENT = re.compile(r"^\s*(//|/\*|\*|#(?!\[)|$)")
-ENUM_DECL = re.compile(r"^(?!\s*(import|from)\b)\s*(@\w+(\([^)]*\))?\s+|\w+\s+)*enum\b(\s+(class|struct))?"
-                       r"(\s+\w+(<[^>]*>|\([^)]*\))?)?\s*((:|\bimplements\b|\bwhere\b)[^{;=]*)?(\{.*)?$")
+ENUM_DECL = re.compile(r"^(?!\s*(import|from)\b)\s*(#?\[[^\]]*\]+\s*|@?\w+(\([^)]*\))?\s+)*enum\b"
+                       r"(\s+(class|struct))?(\s*\[\[[^\]]*\]\])?"
+                       r"(\s+\w+(<([^<>]|<[^<>]*>)*>|\(([^()]|\([^()]*\))*\))?)?"
+                       r"\s*((:|\bimplements\b|\bwhere\b)[^{;=]*)?(\{.*|//.*|/\*.*)?$")
 PREPROC = re.compile(r"\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b")
 PY_ENUM = re.compile(r"^\s*class\s+\w+\s*\([^)]*\b(Int|Str)?(Enum|Flag)\b")
 ENUM_MEMBER = {
@@ -553,8 +555,10 @@ MP_TYPE = re.compile(r"\b(class|struct|record|interface)\s+(?!(class|struct)\b)(
 MP_ATTR = re.compile(r"\[MemoryPack(Ignore|Include|Constructor|Formatter|AllowSerialize)\b")
 MP_FIELD = re.compile(r"^\s*(\[[^\]]*\]\s*)*((public|internal|protected|private|readonly|required|new|"
                       r"volatile|virtual|override|abstract|sealed)\s+)+"
+                      r"(?!(class|struct|record|interface|enum|delegate|event)\b)"
                       r"(\([^)]*\)|[\w.:]+(<[^;={}]*>)?)(\[[,\s]*\]|\?)*\s+\w+(\s*,\s*\w+)*\s*"
-                      r"(;|=(?!>)|\{\s*(get|init|set)\b|$)")
+                      r"(;|=(?!>)|\{\s*(get|init|set)\b|(?P<open>$))")
+MP_PRIVATE = re.compile(r"^\s*(\[[^\]]*\]\s*)*((static|readonly|new|volatile|required|unsafe)\s+)*private\b")
 CHECKS_OFF = re.compile(r"Il2CppSetOption\(\s*Option\.(\w+)\s*,\s*false\s*\)|"
                         r"\b(unsafe)\s+(partial\s+)?(class|struct)\b|\[(SkipLocalsInit)\b")
 
@@ -644,13 +648,91 @@ def line_positions(h):
     return out
 
 
-def hides(line):
-    """Whether a line hides the members after it from the build: #if and its kin, or a block
-    comment left open or closed here."""
-    if PREPROC.match(line):
-        return True
-    first_open, first_close = line.find("/*"), line.find("*/")
-    return line.rfind("/*") > line.rfind("*/") or first_close >= 0 and not 0 <= first_open < first_close
+def code_of(body, hash_comments=False, strings=True):
+    """A line without its comments, strings kept as they are (or dropped). Linear: a quote that
+    never closes is an ordinary character (a Rust lifetime, an apostrophe)."""
+    out, i, n = [], 0, len(body)
+    special = re.compile(r"[\"'\\#]" if hash_comments else r"[\"'\\/]")
+    while i < n:
+        m = special.search(body, i)
+        if not m:
+            out.append(body[i:])
+            break
+        out.append(body[i:m.start()])
+        i, c = m.start(), m.group()
+        if c == "\\":
+            out.append(body[i:i + 2])
+            i += 2
+        elif c in "\"'":
+            j = i + 1
+            while j < n and body[j] != c:
+                j += 2 if body[j] == "\\" else 1
+            if j < n:
+                out.append(body[i:j + 1] if strings else "")
+                i = j + 1
+            else:
+                out.append(c)
+                i += 1
+        elif hash_comments:
+            if c == "#":
+                break
+            out.append(c)
+            i += 1
+        elif body.startswith("//", i):
+            break
+        elif body.startswith("/*", i):
+            j = body.find("*/", i + 2)
+            if j < 0:
+                break
+            out.append(" ")
+            i = j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def hides(lines, i, member):
+    """Whether line i hides members from the build or brings them back: an #if (or its kin) or
+    a block comment opened or closed here, around at least one line `member(lines, x)` takes for
+    a member. A doc comment or an #if around methods hides nothing that is checked."""
+    line = lines[i]
+    pp = PREPROC.match(line)
+    if pp:
+        kind = pp.group(1)
+        ways = (1,) if kind.startswith("if") else (-1,) if kind == "endif" else (1, -1)
+        for step in ways:
+            depth, x = 0, i + step
+            while 0 <= x < len(lines) and abs(x - i) <= 400:
+                k = PREPROC.match(lines[x])
+                k = k and k.group(1)
+                if k and (k.startswith("if") if step > 0 else k == "endif"):
+                    depth += 1
+                elif k and (k == "endif" if step > 0 else k.startswith("if")):
+                    if not depth:
+                        break
+                    depth -= 1
+                elif not k and member(lines, x):
+                    return True
+                x += step
+        return False
+    code = re.sub(r'"(?:\\.|[^"\\])*(?:"|\\?$)', "", line)
+    cut = code.find("//")
+    if cut >= 0 and not 0 <= code.find("/*") < cut:
+        code = code[:cut]
+    first_open, first_close = code.find("/*"), code.find("*/")
+    if code.rfind("/*") > code.rfind("*/"):
+        step, end = 1, "*/"
+    elif first_close >= 0 and not 0 <= first_open < first_close:
+        step, end = -1, "/*"
+    else:
+        return False
+    x = i + step
+    while 0 <= x < len(lines) and end not in lines[x]:
+        if member(lines, x) or abs(x - i) > 400:
+            return True
+        x += step
+    return False
 
 
 def brace_scopes(lines):
@@ -659,7 +741,7 @@ def brace_scopes(lines):
     stack, out = [], []
     for i, line in enumerate(lines):
         out.append(stack[-1] if stack else -1)
-        code = re.sub(r'"(\\.|[^"\\])*"|\'(\\.|[^\'\\])*\'|//.*', "", line)
+        code = code_of(line, strings=False)
         for ch in code:
             if ch == "{":
                 stack.append(i)
@@ -678,7 +760,10 @@ def header_at(lines, i):
     if lines[k].strip().startswith("{") and k > 0:
         k -= 1
         while k > 0 and (not lines[k].strip() or re.match(r"^\s*(:|,|where\b)", lines[k]) or
-                         lines[k - 1].rstrip().endswith((":", ","))):
+                         lines[k - 1].rstrip().endswith((":", ",")) and not COMMENT.match(lines[k - 1])
+                         and not re.match(r"^\s*(public|private|protected)(\s+(slots|Q_SLOTS))?\s*:\s*$", lines[k - 1])
+                         and not re.search(r"\b(enum|class|struct|record|interface|union)\s+\w",
+                                           code_of(lines[k]))):
             k -= 1
     attrs, a = [], k - 1
     while a >= 0 and re.match(r"^\s*(\[|@)", lines[a]) and len(attrs) < 8:
@@ -699,14 +784,14 @@ def py_header(lines, pos, indent):
     return -1, ""
 
 
-def moved_pairs(changed):
+def moved_pairs(changed, py=False):
     """The changed lines that only gained or lost a trailing comma or whitespace in place (the
     comma an append puts after the old last member): not changes. Lines pair up in order within
     one run of removed lines and the added lines right after it, so a reorder is still a change.
     A line that gained members at its end (`A;` -> `A, B;`) pairs only its removed half: the added
     one is still checked as an insertion."""
     def norm(body):
-        return re.sub(r"[\s,;]+$", "", re.sub(r"\s*(//.*|/\*.*\*/\s*)$", "", body)).strip()
+        return code_of(body, py).rstrip(string.whitespace + ",;").strip()
     out, i = set(), 0
     while i < len(changed):
         gone, came = [], []
@@ -782,11 +867,17 @@ def enum_risk(f, hunks, old, new, ctx):
         head, _ = header_at(old, k)
         return (k, head) if ENUM_DECL.match(head) else None
 
+    def is_member(lines, x):  # also members ENUM_MEMBER cannot read: `B = FLAG(2, 0),`
+        line = lines[x]
+        return line.strip() not in ("{", "}", "};") and (bool(member.match(line)) or lang != "swift" and
+                                                        re.match(r"^\s*[A-Za-z_]\w*\s*([(=,;]|$)", line) is not None)
+
     for h in hunks:
         changed = line_positions(h)
-        same = moved_pairs(changed)
+        same = moved_pairs(changed, lang == "py")
         for j, (t, body, o, n) in enumerate(changed):
-            if lang != "py" and hides(body) and enum_of(body, o):
+            if lang != "py" and enum_of(body, o) and \
+                    hides(*((new, n) if t == "+" else (old, o)), is_member):
                 return [("enum", short(enum_of(body, o)[1]))]
             if COMMENT.match(body) or j in same:
                 continue
@@ -828,6 +919,27 @@ def enum_risk(f, hunks, old, new, ctx):
     return []
 
 
+def field_at(lines, i):
+    """Whether line i declares a field or a property. A declaration the line leaves open counts
+    when an accessor block or an initializer follows, not `=> ...` (computed, not stored)."""
+    m = MP_FIELD.match(lines[i])
+    if not m or m.group("open") is None:
+        return bool(m)
+    after = next_code(lines, i + 1)
+    return after is not None and re.match(r"\s*(\{|;|=(?!>))", after) is not None
+
+
+def included(lines, i):
+    """Whether the member on line i carries a MemoryPack attribute (`[MemoryPackInclude]`) on
+    its line or the attribute lines right above it."""
+    a = i
+    while a >= 0 and (a == i or lines[a].lstrip().startswith("[")):
+        if MP_ATTR.search(lines[a]):
+            return True
+        a -= 1
+    return False
+
+
 def union_owner(lines, i):
     """The name of the type a `[MemoryPackUnion]` on line i is attached to: the first
     declaration from that line on, past attribute and comment lines."""
@@ -867,12 +979,22 @@ def memorypack_risk(f, hunks, old, new, ctx):
                 unions.setdefault(union_owner(old, i), []).append(int(m.group(1)))
         return orders, unions
     orders, unions = memo(ctx, "mp_tags", tags)
+    old_types = memo(ctx, "mp_types", lambda: {m.group(3) for m in map(MP_TYPE.search, old) if m})
+
+    def is_member(lines, x):
+        return field_at(lines, x) or bool(MP_ORDER.search(lines[x]) or MP_ATTR.search(lines[x]))
+
+    def is_new_type(k):  # a block this hunk opens for a type the base side does not have
+        m = k in added and MP_TYPE.search(new[k])
+        return k in added and not (m and m.group(3) in old_types)
+
     for h in hunks:
         changed = line_positions(h)
         same = moved_pairs(changed)
         added = {x[3] for x in changed if x[0] == "+"}
         for j, (t, body, o, n) in enumerate(changed):
-            if hides(body) and packable(o):
+            side, at = (new, n) if t == "+" else (old, o)
+            if packable(o) and hides(side, at, is_member):
                 return [("memorypack", short(body))]
             if COMMENT.match(body) or body.strip() in ("{", "}") or j in same:
                 continue
@@ -884,11 +1006,11 @@ def memorypack_risk(f, hunks, old, new, ctx):
                 if int(m.group(1)) <= max(unions.get(owner, []) if owner else [], default=-1):
                     return [("memorypack", short(body))]
             cls = packable(o)
-            if not cls or t == "+" and new_scopes[n] in added:  # inside a type this hunk adds
+            if not cls or t == "+" and is_new_type(new_scopes[n]):  # inside a type this hunk adds
                 continue
-            if re.search(r"\bprivate\b", body) and not MP_ATTR.search(body):
+            if MP_PRIVATE.match(body) and not included(side, at):
                 continue  # not serialized without [MemoryPackInclude]
-            if t == "-" and (MP_ORDER.search(body) or MP_ATTR.search(body) or MP_FIELD.match(body)):
+            if t == "-" and (MP_ORDER.search(body) or MP_ATTR.search(body) or field_at(old, o)):
                 return [("memorypack", short(body))]
             if t == "-":
                 continue
@@ -897,12 +1019,12 @@ def memorypack_risk(f, hunks, old, new, ctx):
                 return [("memorypack", short(body))]
             if MP_ATTR.search(body):
                 return [("memorypack", short(body))]
-            if not orders.get(cls[0]) and MP_FIELD.match(body):
+            if not orders.get(cls[0]) and field_at(new, n):
                 k = new_scopes[n]  # the type's block in the new side; its own fields only
                 for x in range(n + 1, len(new)):
                     if new_scopes[x] < k:
                         break
-                    if new_scopes[x] == k and x not in added and MP_FIELD.match(new[x]) and \
+                    if new_scopes[x] == k and x not in added and field_at(new, x) and \
                             not COMMENT.match(new[x]):
                         return [("memorypack", short(body))]
     return []

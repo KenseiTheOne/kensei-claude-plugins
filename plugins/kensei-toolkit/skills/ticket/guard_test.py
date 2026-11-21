@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import random
 import subprocess
 import sys
 import re
@@ -419,11 +420,38 @@ class SpeedTest(unittest.TestCase):
         self.assertLess(time.time() - start, 5.0)
 
     def test_shell_is_linear(self):
-        for cmd in ["echo $(" + "a" * 200_000 + ")", "x " + "b/" * 50_000 + "git push",
-                    "echo " + "a" * 300_000]:
-            start = time.time()
-            guard.classify("Bash", {"command": cmd}, TASKREPO, {"session_id": "speed-test-1"})
-            self.assertLess(time.time() - start, 5.0, cmd[:40])
+        # four times the command takes about four times as long; a ratio, not a limit, holds on a busy machine
+        def took(cmd):
+            best = float("inf")
+            for _ in range(3):
+                start = time.perf_counter()
+                guard.classify("Bash", {"command": cmd}, TASKREPO, {"session_id": "speed-test-1"})
+                best = min(best, time.perf_counter() - start)
+            return best
+        for make in [lambda n: "echo $(" + "a" * n + ")", lambda n: "x " + "b/" * (n // 2) + "git push",
+                     lambda n: "echo " + "a" * n, lambda n: "echo '" + "a " * (n // 2) + "'",
+                     lambda n: "echo " + "\\a" * (n // 2), lambda n: "echo " + "'a'" * (n // 3)]:
+            took(make(1000))  # warm the caches
+            small, big = took(make(50_000)), took(make(200_000))
+            self.assertLess(big, 6 * small + 0.02, make(20))  # 4x the input: linear ~4x, quadratic ~16x
+
+    def test_lex_reads_as_shlex(self):
+        def plain(command):
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            return list(lexer)
+        rnd = random.Random(5)
+        for _ in range(3000):
+            command = "".join(rnd.choice("ab /$\\'\" ;&|()<>\t#-=.") for _ in range(rnd.randint(0, 30)))
+            command = command.replace("a", "a" * rnd.choice([1, 300])).replace("'", "'" * rnd.choice([1, 101]))
+            results = []
+            for read in (plain, guard.lex):
+                try:
+                    results.append(read(command))
+                except ValueError:
+                    results.append("error")
+            self.assertEqual(results[0], results[1], command[:60])
 
 
 class SplitMultiTest(unittest.TestCase):
@@ -1439,6 +1467,19 @@ class HookTest(unittest.TestCase):
                                   ' "transcript_path": "/nonexistent.jsonl"}'))
         self.assertIn("deny", run("not json but git commit"))
         self.assertEqual(run("not json at all").strip(), "")
+
+    def test_overtime_fails_closed(self):
+        # a command that keeps the checks busy past the hook's timeout must not get through: with
+        # a deadline of a microsecond every call runs past it, and the gated one is refused once
+        def run(cmd):
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": TASKREPO})
+            return subprocess.run([sys.executable, os.path.join(HERE, "guard.py")], input=payload,
+                                  capture_output=True, text=True,
+                                  env=dict(os.environ, HOME=HOME, KENSEI_GUARD_DEADLINE="0.000001"))
+        done = run("git push --force origin main")
+        self.assertEqual(done.stdout.count("permissionDecision\""), 1, done.stdout + done.stderr)
+        self.assertIn("Overtime", done.stdout)
+        self.assertEqual(run("ls").stdout, "")
 
     def test_unrecognized_format(self):
         old = {"type": "user", "message": {"role": "user", "content": "закоммить"}}
