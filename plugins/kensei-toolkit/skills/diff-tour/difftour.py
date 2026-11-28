@@ -1979,7 +1979,7 @@ class Page:
             h = f["hunks"][u["hunk"]]
             lang = lang_of(unit_path(f)) if self.highlight else None
             attr = f' data-lang="{lang}"' if lang else ""
-            out.append(f'<details class="qcode"><summary>{esc(self.L["q"]["code"])}</summary>'
+            out.append(f'<details class="qcode" open><summary>{esc(self.L["q"]["code"])}</summary>'
                        f'<div class="scroll"><table class="diff unified solo"{attr}>'
                        f'{"".join(self.unified_rows(u["file"], u["hunk"], h))}</table></div>'
                        f'</details>')

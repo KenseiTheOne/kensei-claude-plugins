@@ -999,6 +999,16 @@ class Triage(unittest.TestCase):
         self.assertIn(difftour.QUEUE_JS, html)
         self.assertIn("<main>", html)  # the whole diff is still there
 
+    def test_queue_code_is_open(self):
+        # The queue is what the user came to read: the code shows without a click.
+        triage(self.run_dir, "1", suspects=[{"unit": "h1", "text": "breaks"}], risks=[])
+        triage(self.run_dir, "2", suspects=[], risks=[])
+        code, _, err = self.build()
+        self.assertEqual(code, 0, err)
+        q = self.queue()
+        self.assertIn('<details class="qcode" open>', q)
+        self.assertNotIn('<details class="qcode">', q)
+
     def test_what_nobody_raised_is_folded(self):
         with open(os.path.join(self.run_dir, "notes.json"), "w", encoding="utf-8") as fh:
             json.dump({"title": "t", "lede": "l", "notes": [

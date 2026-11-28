@@ -3,6 +3,12 @@
 Versions are per plugin and live in each plugin's `.claude-plugin/plugin.json`. Release tags are
 `<plugin>--v<version>` (`claude plugin tag`).
 
+## kensei-toolkit 2.5.4 — 2026-11-28
+
+### diff-tour
+- the code of every unit in the queue is shown at once: it no longer starts collapsed behind a
+  "code" click. It can still be collapsed by hand.
+
 ## kensei-toolkit 2.5.3 — 2026-11-21
 
 ### diff-tour
